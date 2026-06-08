@@ -666,11 +666,19 @@ impl WeightAccel for RocmWeightAccel {
         // NPU hybrid: stash ffn_up raw Q4 bytes for offload (repacked at configure).
         #[cfg(feature = "npu")]
         if std::env::var("STRIX_NPU").is_ok() {
-            // STRIX_NPU_SKIP=up,down,o,q disables those offloads (they run on the
-            // iGPU instead) — for the speed/power sweep (hybrid is NPU-bound, so
-            // some offloads are power-wins but speed-losses; see STATUS §NPU).
+            // STRIX_NPU_MODE: "speed" (DEFAULT) offloads only ffn_up (the gate∥up
+            // pair has free iGPU/NPU parallelism → robustly ≥ pure-iGPU); "power"
+            // offloads everything (down/o/q too — more iGPU work moved to the NPU,
+            // but they put the NPU on the critical path so prefill can be slower
+            // than pure-iGPU at high iGPU clock). MEASURED (thermal-gated bench):
+            // up-only 136 > pure-iGPU 125 > all-offloads 122 tok/s. STRIX_NPU_SKIP
+            // is a fine override (comma list of up,down,o,q to force-disable).
+            let power = std::env::var("STRIX_NPU_MODE").map(|m| m == "power").unwrap_or(false);
             let skipv = std::env::var("STRIX_NPU_SKIP").unwrap_or_default();
-            let skip = |n: &str| skipv.split(',').any(|s| s.trim() == n);
+            let skip = |n: &str| {
+                skipv.split(',').any(|s| s.trim() == n)
+                    || (!power && matches!(n, "down" | "o" | "q"))
+            };
             if let Some(l) = key
                 .strip_prefix("blk.")
                 .and_then(|s| s.strip_suffix(".ffn_up.weight"))
