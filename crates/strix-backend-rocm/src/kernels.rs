@@ -14,6 +14,26 @@ __device__ __forceinline__ float h2f(unsigned short h) {
     return c.f;
 }
 
+// f32 -> f16 (IEEE half), round-to-nearest. KV-cache values are post-norm/RoPE
+// (~O(1)) so the normal-exponent path dominates; tiny values flush to subnormal/0.
+__device__ __forceinline__ unsigned short f2h(float f) {
+    union { unsigned u; float fv; } c; c.fv = f;
+    unsigned x = c.u, sign = (x >> 16) & 0x8000u, m = x & 0x7fffffu;
+    int e = (int)((x >> 23) & 0xffu) - 112;          // unbias 127, rebias 15
+    if (e >= 31) return (unsigned short)(sign | 0x7c00u);   // overflow -> inf
+    if (e <= 0) {                                            // subnormal/underflow
+        if (e < -10) return (unsigned short)sign;
+        m |= 0x800000u;
+        int sh = 14 - e;
+        unsigned h = m >> sh;
+        if ((m >> (sh - 1)) & 1u) h += 1u;           // round to nearest
+        return (unsigned short)(sign | h);
+    }
+    unsigned h = ((unsigned)e << 10) | (m >> 13);
+    if (m & 0x1000u) h += 1u;                        // round to nearest (carry into exp ok)
+    return (unsigned short)(sign | h);
+}
+
 typedef int v4i __attribute__((ext_vector_type(4)));
 typedef int v8i __attribute__((ext_vector_type(8)));
 
@@ -598,8 +618,8 @@ extern "C" __global__ void rope(float* __restrict__ v, const float* __restrict__
 extern "C" __global__ void qkv_post(const float* __restrict__ q, const float* __restrict__ k,
                                     const float* __restrict__ v, const float* __restrict__ qw,
                                     const float* __restrict__ kw, const float* __restrict__ ff,
-                                    float* __restrict__ qout, float* __restrict__ kdst,
-                                    float* __restrict__ vdst, int hd, int n_heads, int n_kv,
+                                    float* __restrict__ qout, unsigned short* __restrict__ kdst,
+                                    unsigned short* __restrict__ vdst, int hd, int n_heads, int n_kv,
                                     int pos, float theta, float eps, int norm_v) {
     int b = blockIdx.x, t = threadIdx.x, half = hd / 2;
     __shared__ float red[256];
@@ -631,8 +651,8 @@ extern "C" __global__ void qkv_post(const float* __restrict__ q, const float* __
             float ang = pos * inv, sn = sinf(ang), cs = cosf(ang);
             float x1 = k[base + j] * rs * kw[j];
             float x2 = k[base + j + half] * rs * kw[j + half];
-            kdst[base + j] = x1 * cs - x2 * sn;
-            kdst[base + j + half] = x2 * cs + x1 * sn;
+            kdst[base + j] = f2h(x1 * cs - x2 * sn);
+            kdst[base + j + half] = f2h(x2 * cs + x1 * sn);
         }
         if (norm_v) {
             ss = 0.f;
@@ -640,9 +660,9 @@ extern "C" __global__ void qkv_post(const float* __restrict__ q, const float* __
             red[t] = ss; __syncthreads();
             for (int s = 128; s > 0; s >>= 1) { if (t < s) red[t] += red[t + s]; __syncthreads(); }
             float vrs = rsqrtf(red[0] / hd + eps);
-            for (int i = t; i < hd; i += 256) vdst[base + i] = v[base + i] * vrs;
+            for (int i = t; i < hd; i += 256) vdst[base + i] = f2h(v[base + i] * vrs);
         } else {
-            for (int i = t; i < hd; i += 256) vdst[base + i] = v[base + i];
+            for (int i = t; i < hd; i += 256) vdst[base + i] = f2h(v[base + i]);
         }
     }
 }
@@ -665,15 +685,15 @@ extern "C" __global__ void softcap(float* __restrict__ x, int n, float cap) {
 }
 
 // Single-query causal SDPA with GQA. grid=n_heads, block=256, scores in shared.
-extern "C" __global__ void sdpa(const float* __restrict__ q, const float* __restrict__ k,
-                                const float* __restrict__ v, float* __restrict__ out,
+extern "C" __global__ void sdpa(const float* __restrict__ q, const unsigned short* __restrict__ k,
+                                const unsigned short* __restrict__ v, float* __restrict__ out,
                                 int hd, int len, int groups, int n_kv, float scale) {
     int h = blockIdx.x, t = threadIdx.x, kvh = h / groups, qbase = h * hd;
     __shared__ float scores[2048];
     __shared__ float red[256];
     for (int i = t; i < len; i += 256) {
         float s = 0.f; int kb = (i * n_kv + kvh) * hd;
-        for (int d = 0; d < hd; d++) s += q[qbase + d] * k[kb + d];
+        for (int d = 0; d < hd; d++) s += q[qbase + d] * h2f(k[kb + d]);
         scores[i] = s * scale;
     }
     __syncthreads();
@@ -689,7 +709,7 @@ extern "C" __global__ void sdpa(const float* __restrict__ q, const float* __rest
     float inv = 1.f / red[0]; __syncthreads();
     for (int d = t; d < hd; d += 256) {
         float acc = 0.f;
-        for (int i = 0; i < len; i++) acc += scores[i] * v[(i * n_kv + kvh) * hd + d];
+        for (int i = 0; i < len; i++) acc += scores[i] * h2f(v[(i * n_kv + kvh) * hd + d]);
         out[qbase + d] = acc * inv;
     }
 }
@@ -699,8 +719,8 @@ extern "C" __global__ void sdpa(const float* __restrict__ q, const float* __rest
 // unnormalized weighted-V). grid=(n_heads, n_split), block=128. Far better
 // occupancy than one block/head (which leaves most CUs idle) and scales with
 // context length.
-extern "C" __global__ void sdpa_split(const float* __restrict__ q, const float* __restrict__ k,
-                                      const float* __restrict__ v, float* __restrict__ pout,
+extern "C" __global__ void sdpa_split(const float* __restrict__ q, const unsigned short* __restrict__ k,
+                                      const unsigned short* __restrict__ v, float* __restrict__ pout,
                                       float* __restrict__ pmax, float* __restrict__ psum,
                                       int hd, int len, int groups, int n_kv, float scale, int n_split) {
     int h = blockIdx.x, sp = blockIdx.y, t = threadIdx.x;
@@ -711,7 +731,7 @@ extern "C" __global__ void sdpa_split(const float* __restrict__ q, const float* 
     __shared__ float red[128];
     for (int i = t; i < n; i += 128) {
         float s = 0.f; int kb = ((t0 + i) * n_kv + kvh) * hd;
-        for (int d = 0; d < hd; d++) s += q[qbase + d] * k[kb + d];
+        for (int d = 0; d < hd; d++) s += q[qbase + d] * h2f(k[kb + d]);
         sc[i] = s * scale;
     }
     __syncthreads();
@@ -728,7 +748,7 @@ extern "C" __global__ void sdpa_split(const float* __restrict__ q, const float* 
     int base = (h * n_split + sp) * hd;
     for (int d = t; d < hd; d += 128) {
         float acc = 0.f;
-        for (int i = 0; i < n; i++) acc += sc[i] * v[((t0 + i) * n_kv + kvh) * hd + d];
+        for (int i = 0; i < n; i++) acc += sc[i] * h2f(v[((t0 + i) * n_kv + kvh) * hd + d]);
         pout[base + d] = acc;
     }
     if (t == 0) { pmax[h * n_split + sp] = (n > 0) ? M : -3.0e38f; psum[h * n_split + sp] = L; }
@@ -831,8 +851,8 @@ extern "C" __global__ void addnorm_batch(float* __restrict__ h, const float* __r
 // Causal SDPA for prefill: M query tokens (q laid out [M][n_heads][hd]), each at
 // position start_pos+m attends KV-cache positions 0..=start_pos+m. grid=M*n_heads,
 // block=256. (scores capped at 2048 → prompt length must be <= 2048.)
-extern "C" __global__ void sdpa_prefill(const float* __restrict__ q, const float* __restrict__ k,
-                                        const float* __restrict__ v, float* __restrict__ out,
+extern "C" __global__ void sdpa_prefill(const float* __restrict__ q, const unsigned short* __restrict__ k,
+                                        const unsigned short* __restrict__ v, float* __restrict__ out,
                                         int hd, int start_pos, int groups, int n_kv, float scale, int n_heads) {
     int blk = blockIdx.x, m = blk / n_heads, h = blk % n_heads, t = threadIdx.x;
     int kvh = h / groups, qbase = (m * n_heads + h) * hd, len = start_pos + m + 1;
@@ -840,7 +860,7 @@ extern "C" __global__ void sdpa_prefill(const float* __restrict__ q, const float
     __shared__ float red[256];
     for (int i = t; i < len; i += 256) {
         float s = 0.f; int kb = (i * n_kv + kvh) * hd;
-        for (int d = 0; d < hd; d++) s += q[qbase + d] * k[kb + d];
+        for (int d = 0; d < hd; d++) s += q[qbase + d] * h2f(k[kb + d]);
         scores[i] = s * scale;
     }
     __syncthreads();
@@ -856,7 +876,7 @@ extern "C" __global__ void sdpa_prefill(const float* __restrict__ q, const float
     float inv = 1.f / red[0]; __syncthreads();
     for (int d = t; d < hd; d += 256) {
         float acc = 0.f;
-        for (int i = 0; i < len; i++) acc += scores[i] * v[(i * n_kv + kvh) * hd + d];
+        for (int i = 0; i < len; i++) acc += scores[i] * h2f(v[(i * n_kv + kvh) * hd + d]);
         out[qbase + d] = acc * inv;
     }
 }
@@ -868,8 +888,8 @@ extern "C" __global__ void sdpa_prefill(const float* __restrict__ q, const float
 // cutting K/V global traffic ~TQ x vs the per-query kernel (the dominant cost,
 // especially on global layers where n_kv=1/groups=16). Online softmax, so no
 // score-length cap. q laid out [M][n_heads][hd]; grid=(n_heads, ceil(M/8)).
-extern "C" __global__ void sdpa_prefill_f(const float* __restrict__ q, const float* __restrict__ k,
-                                          const float* __restrict__ v, float* __restrict__ out,
+extern "C" __global__ void sdpa_prefill_f(const float* __restrict__ q, const unsigned short* __restrict__ k,
+                                          const unsigned short* __restrict__ v, float* __restrict__ out,
                                           int hd, int start_pos, int groups, int n_kv,
                                           float scale, int n_heads, int m_total, int n_swa) {
     const int TQ = 8;
@@ -899,7 +919,7 @@ extern "C" __global__ void sdpa_prefill_f(const float* __restrict__ q, const flo
     for (int i = i_lo; i < max_len; i++) {
         __syncthreads();
         int kb = (i * n_kv + kvh) * hd;
-        for (int d = t; d < hd; d += 256) { ks[d] = k[kb + d]; vs[d] = v[kb + d]; }
+        for (int d = t; d < hd; d += 256) { ks[d] = h2f(k[kb + d]); vs[d] = h2f(v[kb + d]); }
         __syncthreads();
         if (!active || i >= my_len || i < swa_lo) continue;  // whole wave skips together
         float part = 0.f;
@@ -922,5 +942,11 @@ extern "C" __global__ void sdpa_prefill_f(const float* __restrict__ q, const flo
 extern "C" __global__ void copyf(float* __restrict__ dst, const float* __restrict__ src, int n) {
     int i = blockIdx.x * 256 + threadIdx.x;
     if (i < n) dst[i] = src[i];
+}
+
+// f32 -> f16 copy (KV-cache append in half precision; dst pre-offset to the slot).
+extern "C" __global__ void copyf_h(unsigned short* __restrict__ dst, const float* __restrict__ src, int n) {
+    int i = blockIdx.x * 256 + threadIdx.x;
+    if (i < n) dst[i] = f2h(src[i]);
 }
 "#;
