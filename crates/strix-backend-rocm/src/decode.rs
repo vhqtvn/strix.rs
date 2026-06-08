@@ -164,8 +164,10 @@ struct Scratch {
     v_cache: Vec<Dbuf>,
 }
 
-/// Key-split factor for flash-decoding SDPA (n_heads × N_SPLIT blocks).
-const N_SPLIT: usize = 8;
+/// Default key-split factor for flash-decoding SDPA (n_heads × N_SPLIT blocks).
+/// 32 (was 8): more blocks → better occupancy → +14% decode at 2k ctx (measured,
+/// plateaus ~48). Only used when len>1024; tiny buffer cost. STRIX_N_SPLIT overrides.
+const N_SPLIT: usize = 32;
 /// Max prompt tokens per prefill call (bounds scratch; SDPA scores cap is 2048).
 const M_CHUNK: usize = 256;
 
@@ -182,6 +184,10 @@ pub struct RocmWeightAccel {
     /// small prefill cost (the prefill SDPA is occupancy-bound, so the h2f isn't
     /// free there). Default false (f32) — best for prefill-heavy workloads.
     kv_f16: bool,
+    /// Flash-decoding key-split factor (STRIX_N_SPLIT, default 8): more splits =
+    /// more blocks = better occupancy at long context. Only raised (chunk must fit
+    /// the kernel's sc[512] → n_split >= len/512).
+    n_split: usize,
     name: String,
     /// When set, `prefill` returns logits for ALL m tokens (m×vocab), not just
     /// the last — the speculative-decoding "verify" path. Reset after each call.
@@ -268,6 +274,7 @@ impl RocmWeightAccel {
             cfg: None,
             scratch: None,
             kv_f16: std::env::var("STRIX_F16_KV").is_ok(),
+            n_split: std::env::var("STRIX_N_SPLIT").ok().and_then(|s| s.parse().ok()).unwrap_or(N_SPLIT).clamp(1, 64),
             name,
             verify_all: false,
             #[cfg(feature = "npu")]
@@ -846,9 +853,9 @@ impl WeightAccel for RocmWeightAccel {
             xq_d: mk(nb_max),
             xq_sum: mk(nb_max),
 
-            attn_part: mk(n_heads * N_SPLIT * max_hd),
-            attn_pmax: mk(n_heads * N_SPLIT),
-            attn_psum: mk(n_heads * N_SPLIT),
+            attn_part: mk(n_heads * self.n_split * max_hd),
+            attn_pmax: mk(n_heads * self.n_split),
+            attn_psum: mk(n_heads * self.n_split),
             p_h: mk(M_CHUNK * hidden),
             p_xn: mk(M_CHUNK * hidden),
             p_q: mk(M_CHUNK * q_dim),
@@ -1109,7 +1116,7 @@ impl WeightAccel for RocmWeightAccel {
                     self.launch2(
                         "sdpa_split",
                         n_heads as u32,
-                        N_SPLIT as u32,
+                        self.n_split as u32,
                         128,
                         0,
                         Args::new()
@@ -1124,7 +1131,7 @@ impl WeightAccel for RocmWeightAccel {
                             .i(groups as i32)
                             .i(n_kv as i32)
                             .f(scale)
-                            .i(N_SPLIT as i32)
+                            .i(self.n_split as i32)
                             .i(if self.kv_f16 { 1 } else { 0 }),
                     );
                     self.launch(
@@ -1138,7 +1145,7 @@ impl WeightAccel for RocmWeightAccel {
                             .ptr(s.attn_psum.ptr)
                             .ptr(s.attn.ptr)
                             .i(hd as i32)
-                            .i(N_SPLIT as i32),
+                            .i(self.n_split as i32),
                     );
                 } else {
                     self.launch(
