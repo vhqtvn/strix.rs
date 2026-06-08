@@ -242,7 +242,6 @@ impl RocmWeightAccel {
             "sdpa_split",
             "sdpa_combine",
             "copyf",
-            "copyf_h",
             "q4_gemm",
             "q4_gemm_w",
             "q4_gemm_w_sk",
@@ -797,9 +796,6 @@ impl WeightAccel for RocmWeightAccel {
             .max()
             .unwrap_or(0);
         let mk = |n: usize| self.gpu.alloc((n.max(1)) * 4).expect("rocm scratch");
-        // f16 KV cache: 2 bytes/elem (half the f32 size → halves KV memory, halves
-        // SDPA KV traffic). Written via copyf_h, read via h2f in the sdpa kernels.
-        let mk16 = |n: usize| self.gpu.alloc((n.max(1)) * 2).expect("rocm kv16");
         // Largest matmul input (down-proj in=ffn) → max Q8 blocks.
         let max_in = cfg.ffn.max(hidden).max(q_dim);
         let nb_max = max_in.div_ceil(32);
@@ -808,12 +804,12 @@ impl WeightAccel for RocmWeightAccel {
         let k_cache = cfg
             .layers
             .iter()
-            .map(|l| mk16(l.n_kv * cfg.max_seq * l.head_dim))
+            .map(|l| mk(l.n_kv * cfg.max_seq * l.head_dim))
             .collect();
         let v_cache = cfg
             .layers
             .iter()
-            .map(|l| mk16(l.n_kv * cfg.max_seq * l.head_dim))
+            .map(|l| mk(l.n_kv * cfg.max_seq * l.head_dim))
             .collect();
         self.scratch = Some(Scratch {
             h: mk(hidden),
@@ -1049,7 +1045,7 @@ impl WeightAccel for RocmWeightAccel {
                     .map(|d| d.ptr)
                     .unwrap_or(s.ones.ptr)
             };
-            let off = pos * kv_dim * 2; // f16 KV (2 bytes/elem)
+            let off = pos * kv_dim * 4;
             let kdst = unsafe { (s.k_cache[l].ptr as *mut u8).add(off) as *mut c_void };
             let vdst = unsafe { (s.v_cache[l].ptr as *mut u8).add(off) as *mut c_void };
             self.launch(
@@ -1087,7 +1083,7 @@ impl WeightAccel for RocmWeightAccel {
             };
             let win_start = full_len.saturating_sub(win);
             let len = (full_len - win_start) as i32;
-            let koff = (win_start * kv_dim * 2) as usize; // f16 KV
+            let koff = (win_start * kv_dim * 4) as usize;
             let kbase = unsafe { (s.k_cache[l].ptr as *mut u8).add(koff) as *mut c_void };
             let vbase = unsafe { (s.v_cache[l].ptr as *mut u8).add(koff) as *mut c_void };
             if !skip_sdpa {
@@ -1623,18 +1619,18 @@ impl WeightAccel for RocmWeightAccel {
                     .i(m as i32),
             );
             // fill KV cache slots [start_pos .. start_pos+m]
-            let off = start_pos * kv_dim * 2; // f16 KV
+            let off = start_pos * kv_dim * 4;
             let kdst = unsafe { (s.k_cache[l].ptr as *mut u8).add(off) as *mut c_void };
             let vdst = unsafe { (s.v_cache[l].ptr as *mut u8).add(off) as *mut c_void };
             self.launch(
-                "copyf_h", // f32 p_k2 -> f16 KV cache
+                "copyf",
                 (m * kv_dim).div_ceil(256) as u32,
                 256,
                 0,
                 Args::new().ptr(kdst).ptr(s.p_k2.ptr).i((m * kv_dim) as i32),
             );
             self.launch(
-                "copyf_h", // f32 p_v2 -> f16 KV cache
+                "copyf",
                 (m * kv_dim).div_ceil(256) as u32,
                 256,
                 0,
