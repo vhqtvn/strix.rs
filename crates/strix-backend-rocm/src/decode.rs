@@ -660,18 +660,23 @@ impl WeightAccel for RocmWeightAccel {
         // NPU hybrid: stash ffn_up raw Q4 bytes for offload (repacked at configure).
         #[cfg(feature = "npu")]
         if std::env::var("STRIX_NPU").is_ok() {
+            // STRIX_NPU_SKIP=up,down,o,q disables those offloads (they run on the
+            // iGPU instead) — for the speed/power sweep (hybrid is NPU-bound, so
+            // some offloads are power-wins but speed-losses; see STATUS §NPU).
+            let skipv = std::env::var("STRIX_NPU_SKIP").unwrap_or_default();
+            let skip = |n: &str| skipv.split(',').any(|s| s.trim() == n);
             if let Some(l) = key
                 .strip_prefix("blk.")
                 .and_then(|s| s.strip_suffix(".ffn_up.weight"))
             {
-                if let Ok(l) = l.parse::<usize>() {
+                if let (Ok(l), false) = (l.parse::<usize>(), skip("up")) {
                     self.npu_pending.insert(l, bytes.to_vec());
                 }
             } else if let Some(l) = key
                 .strip_prefix("blk.")
                 .and_then(|s| s.strip_suffix(".ffn_down.weight"))
             {
-                if let Ok(l) = l.parse::<usize>() {
+                if let (Ok(l), false) = (l.parse::<usize>(), skip("down")) {
                     self.npu_down_pending.insert(l, bytes.to_vec());
                 }
             } else if in_dim == 4096 || in_dim == 8192 {
@@ -680,7 +685,7 @@ impl WeightAccel for RocmWeightAccel {
                     .strip_prefix("blk.")
                     .and_then(|s| s.strip_suffix(".attn_output.weight"))
                 {
-                    if let Ok(l) = l.parse::<usize>() {
+                    if let (Ok(l), false) = (l.parse::<usize>(), skip("o")) {
                         if in_dim == 4096 {
                             self.npu_o_pending.insert(l, bytes.to_vec());
                         } else {
@@ -694,7 +699,7 @@ impl WeightAccel for RocmWeightAccel {
                     .strip_prefix("blk.")
                     .and_then(|s| s.strip_suffix(".attn_q.weight"))
                 {
-                    if let Ok(l) = l.parse::<usize>() {
+                    if let (Ok(l), false) = (l.parse::<usize>(), skip("q")) {
                         if out_dim == 4096 {
                             self.npu_q_pending.insert(l, bytes.to_vec());
                         } else {

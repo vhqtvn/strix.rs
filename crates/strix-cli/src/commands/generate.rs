@@ -186,6 +186,54 @@ fn run_gguf(path: &Path, prompt: &str, max_tokens: usize, chat: bool, gpu: bool)
     let load_secs = load_start.elapsed().as_secs_f64();
 
     let sampler = GreedySampler;
+
+    // In-process benchmark mode (STRIX_BENCH=<reps>): load ONCE, then time
+    // prefill+decode over N reps after a warmup — robust to GPU clock ramp and
+    // the ±few tok/s run-to-run noise that makes single-shot `generate` numbers
+    // unreliable. Reports median/min/max. (idea: decode-#21 / benchmark harness.)
+    if let Ok(bs) = std::env::var("STRIX_BENCH") {
+        let reps: usize = bs.parse().unwrap_or(5);
+        let dn = max_tokens.max(8); // decode steps to time per rep
+        eprintln!(
+            "[bench] {reps} timed reps (+1 warmup), prompt {} tok, {dn} decode steps/rep",
+            prompt_ids.len()
+        );
+        // 2 warmup reps: the iGPU clock ramps over ~30 s of sustained load, so a
+        // single warmup still measures a cold-ish clock (observed 80→88 tok/s).
+        let warm = 2usize;
+        let (mut pf, mut dc) = (Vec::new(), Vec::new());
+        for r in 0..(reps + warm) {
+            model.set_seq(0);
+            let t0 = Instant::now();
+            let mut logits = model.prefill(&prompt_ids).context("bench prefill")?;
+            let ps = t0.elapsed().as_secs_f64();
+            let t1 = Instant::now();
+            for _ in 0..dn {
+                let next = sampler.sample(&logits)?;
+                logits = model.decode_one(next)?;
+            }
+            let ds = t1.elapsed().as_secs_f64();
+            if r >= warm {
+                let (pr, dr) = (prompt_ids.len() as f64 / ps, dn as f64 / ds);
+                pf.push(pr);
+                dc.push(dr);
+                eprintln!("[bench] rep{}: prefill {pr:.1} tok/s | decode {dr:.2} tok/s", r - warm + 1);
+            } else {
+                eprintln!("[bench] warmup {} done (discarded)", r + 1);
+            }
+        }
+        let stat = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (v[v.len() / 2], v[0], v[v.len() - 1])
+        };
+        let (pm, plo, phi) = stat(&mut pf);
+        let (dm, dlo, dhi) = stat(&mut dc);
+        eprintln!(
+            "[bench RESULT] prefill median {pm:.1} (min {plo:.1} max {phi:.1}) | decode median {dm:.2} (min {dlo:.2} max {dhi:.2}) tok/s | load {load_secs:.1}s"
+        );
+        return Ok(());
+    }
+
     let prefill_start = Instant::now();
     let mut logits = model.prefill(&prompt_ids).context("prefill")?;
     let prefill_secs = prefill_start.elapsed().as_secs_f64();
