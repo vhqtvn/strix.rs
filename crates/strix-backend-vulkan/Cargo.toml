@@ -1,0 +1,29 @@
+[package]
+name = "strix-backend-vulkan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Vulkan / Radeon 890M iGPU backend for Strix (enumeration first, kernels later)."
+
+[dependencies]
+strix-core.workspace = true
+tracing.workspace = true
+wgpu = { workspace = true, optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { workspace = true, optional = true }
+# Raw Vulkan path: ash for the driver, naga to compile our existing WGSL kernels
+# to SPIR-V. ash records the whole decode as one command buffer with ~1µs
+# barriers — 22x cheaper per dispatch than wgpu's ~21µs/pass.
+ash = { version = "0.38", optional = true }
+naga = { version = "23", features = ["wgsl-in", "spv-out"], optional = true }
+
+[features]
+# Off by default: keeps the dependency graph light until the iGPU path is real.
+# Enable via the CLI's `vulkan` feature to pull in wgpu for compute on the iGPU.
+default = []
+vulkan = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+# Raw-Vulkan decode backend. Reuses the WGSL kernels (compiled via naga).
+# Pulls in `vulkan` for now so the kernel source constants are shared verbatim.
+ash = ["vulkan", "dep:ash", "dep:naga"]

@@ -1,0 +1,28 @@
+.claude
+.codex
+
+# Rust build artifacts
+/target
+# Reference clones' build artifacts (refs/ is for study only)
+refs/*
+!refs/*.md
+
+# Third-party clone (mlir-aie; nested git repo) + its built NPU xclbins.
+# Regenerable — see docs/STATUS.md for build commands. On persistent disk (not a
+# crash risk); kept out of git to avoid a broken gitlink + 1.8 GB bloat.
+/external
+
+# Docs & planning notes — kept as a local-only "DB" for now (persisted on disk,
+# intentionally not tracked; revisit later whether any belong in git).
+/docs
+
+# Editor / OS cruft
+*.swp
+.DS_Store
+
+# Local model files dropped into the repo for testing
+/models
+*.safetensors
+*.gguf
+
+# Note: Cargo.lock IS committed (this workspace ships a binary).

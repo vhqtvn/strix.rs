@@ -1,0 +1,35 @@
+[package]
+name = "strix-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Command-line interface for the Strix local LLM runner."
+
+[[bin]]
+name = "strix"
+path = "src/main.rs"
+
+[dependencies]
+strix-core.workspace = true
+strix-models.workspace = true
+strix-backend-cpu.workspace = true
+strix-backend-vulkan.workspace = true
+strix-backend-rocm.workspace = true
+strix-backend-npu.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[features]
+# Backend selection. `cpu` is always usable; the others light up real device
+# support as those backends mature (see docs/hx370-notes.md).
+default = ["cpu"]
+cpu = []
+vulkan = ["strix-backend-vulkan/vulkan", "strix-backend-vulkan/ash"]
+rocm = ["strix-backend-rocm/rocm"]  # ROCm/HIP backend (Radeon 890M, gfx1150)
+ryzen-ai = ["strix-backend-npu/ryzen-ai"]  # XDNA2 NPU via XRT
+npu-hybrid = ["rocm", "strix-backend-rocm/npu"]  # NPU+iGPU concurrent prefill

@@ -1,0 +1,24 @@
+[package]
+name = "strix-backend-npu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "AMD XDNA2 NPU backend for Strix (XRT access via FFI; kernels later)."
+
+[dependencies]
+strix-core.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+# Build-time only (never linked into any binary). The build script invokes it
+# solely under `ryzen-ai` to compile the XRT C++ shim (the NPU's hw_context flow
+# has no C API). Kept non-optional so the default build's build script compiles.
+cc = "1"
+
+[features]
+# Off by default: the `ryzen-ai` feature links the system XRT runtime
+# (libxrt_coreutil) + compiles the C++ shim to talk to the Ryzen AI NPU.
+default = []
+ryzen-ai = []

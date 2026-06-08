@@ -1,0 +1,51 @@
+#version 450
+// Q4_0 GEMV via hardware dp4a. Reuses the existing resident weights (f16 scales +
+// int4 nibbles, 4 u32/block) — nibbles are unpacked to int8 in-register (no extra
+// bandwidth), then `dotPacked4x8AccSatEXT` does 4 int8 MACs per instruction. The
+// activation x is pre-quantized to int8 (q8, per-32-block scale). 32 invocations
+// (one subgroup) per output row.
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 32) in;
+layout(std430, binding = 0) readonly buffer Sc { uint scales[]; }; // 2 f16 / uint
+layout(std430, binding = 1) readonly buffer Qn { uint quants[]; }; // 4 u32 / block (nibbles)
+layout(std430, binding = 2) readonly buffer Xq { int xq[]; };      // 8 int32 / block (int8)
+layout(std430, binding = 3) readonly buffer Xd { float xd[]; };    // f32 scale / block
+layout(std430, binding = 4) writeonly buffer Yb { float y[]; };
+layout(binding = 5) uniform P { uint in_dim; uint out_dim; uint gridx; uint pad_; };
+
+// Pack four (nibble-8) int8 values (from one u32's low or high nibbles) into an
+// int32 for dp4a. `sh` = 0 for low nibbles, 4 for high.
+int pack_nib(uint word, uint sh) {
+    int v0 = int((word >> sh) & 0xfu) - 8;
+    int v1 = int((word >> (sh + 8u)) & 0xfu) - 8;
+    int v2 = int((word >> (sh + 16u)) & 0xfu) - 8;
+    int v3 = int((word >> (sh + 24u)) & 0xfu) - 8;
+    return (v0 & 0xff) | ((v1 & 0xff) << 8) | ((v2 & 0xff) << 16) | ((v3 & 0xff) << 24);
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * gridx;
+    uint t = gl_LocalInvocationID.x;
+    uint nblocks = in_dim / 32u;
+    float acc = 0.0;
+    if (row < out_dim) {
+        for (uint b = t; b < nblocks; b += 32u) {
+            uint blk = row * nblocks + b;
+            uint qbase = blk * 4u;
+            uint xbase = b * 8u;
+            int isum = 0;
+            for (uint w = 0u; w < 4u; w++) {
+                uint word = quants[qbase + w];
+                // low nibbles → values 4w..4w+3 ; high nibbles → 4w+16..4w+19
+                isum = dotPacked4x8AccSatEXT(pack_nib(word, 0u), xq[xbase + w], isum);
+                isum = dotPacked4x8AccSatEXT(pack_nib(word, 4u), xq[xbase + w + 4u], isum);
+            }
+            float dw = unpackHalf2x16(scales[blk >> 1u])[blk & 1u];
+            acc += dw * xd[b] * float(isum);
+        }
+    }
+    acc = subgroupAdd(acc);
+    if (t == 0u && row < out_dim) { y[row] = acc; }
+}

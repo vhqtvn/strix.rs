@@ -1,0 +1,63 @@
+[workspace]
+members = [
+    "crates/strix-core",
+    "crates/strix-models",
+    "crates/strix-backend-cpu",
+    "crates/strix-backend-vulkan",
+    "crates/strix-backend-rocm",
+    "crates/strix-backend-npu",
+    "crates/strix-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/vhnvn/strix.rs"
+rust-version = "1.82"
+
+[workspace.dependencies]
+# Internal crates
+strix-core = { path = "crates/strix-core" }
+strix-models = { path = "crates/strix-models" }
+strix-backend-cpu = { path = "crates/strix-backend-cpu" }
+strix-backend-vulkan = { path = "crates/strix-backend-vulkan" }
+strix-backend-rocm = { path = "crates/strix-backend-rocm" }
+strix-backend-npu = { path = "crates/strix-backend-npu" }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "wrap_help"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serde
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Model / tensor utilities
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+safetensors = "0.4"
+memmap2 = "0.9"
+bytemuck = { version = "1.18", features = ["derive"] }
+half = { version = "2.4", features = ["bytemuck"] }
+rayon = "1.10"
+
+# GPU enumeration (vulkan backend, optional)
+wgpu = "23"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.bench-fast]
+inherits = "release"
+lto = false
+codegen-units = 16

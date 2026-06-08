@@ -1,0 +1,23 @@
+[package]
+name = "strix-backend-rocm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "AMD ROCm/HIP backend for Strix (Radeon 890M, gfx1150). Light: links the system HIP runtime + hiprtc, no heavy crates."
+
+[dependencies]
+strix-core.workspace = true
+tracing.workspace = true
+strix-backend-npu = { workspace = true, optional = true }
+
+[features]
+# Off by default: keeps the dependency graph light and the default build free of
+# any ROCm system dependency. The `rocm` feature links the system HIP runtime
+# (libamdhip64) + runtime compiler (libhiprtc) and enables the full decode path.
+default = []
+rocm = []
+# Hybrid NPU+iGPU prefill: offloads some prefill GEMMs to the XDNA2 NPU,
+# concurrent with the iGPU. Pulls in strix-backend-npu (links XRT).
+npu = ["rocm", "dep:strix-backend-npu", "strix-backend-npu/ryzen-ai"]
