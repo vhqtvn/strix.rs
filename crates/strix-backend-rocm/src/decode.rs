@@ -164,10 +164,11 @@ struct Scratch {
     v_cache: Vec<Dbuf>,
 }
 
-/// Default key-split factor for flash-decoding SDPA (n_heads × N_SPLIT blocks).
-/// 32 (was 8): more blocks → better occupancy → +14% decode at 2k ctx (measured,
-/// plateaus ~48). Only used when len>1024; tiny buffer cost. STRIX_N_SPLIT overrides.
-const N_SPLIT: usize = 32;
+/// Max flash-decoding key-split factor (buffer sizing cap). The actual split is
+/// context-ADAPTIVE: ~len/64 (constant ≈64 keys/chunk → steady occupancy at any
+/// context), clamped to [8, N_SPLIT_MAX]. Measured: 8→32 was +14% decode @2k,
+/// 64 a further +4% @6.5k; short ctx (len≤1024) doesn't split. STRIX_N_SPLIT pins it.
+const N_SPLIT_MAX: usize = 64;
 /// Max prompt tokens per prefill call (bounds scratch; SDPA scores cap is 2048).
 const M_CHUNK: usize = 256;
 
@@ -274,7 +275,8 @@ impl RocmWeightAccel {
             cfg: None,
             scratch: None,
             kv_f16: std::env::var("STRIX_F16_KV").is_ok(),
-            n_split: std::env::var("STRIX_N_SPLIT").ok().and_then(|s| s.parse().ok()).unwrap_or(N_SPLIT).clamp(1, 64),
+            // pinned split if STRIX_N_SPLIT set, else 0 = context-adaptive (~len/64).
+            n_split: std::env::var("STRIX_N_SPLIT").ok().and_then(|s| s.parse::<usize>().ok()).map(|v| v.clamp(1, N_SPLIT_MAX)).unwrap_or(0),
             name,
             verify_all: false,
             #[cfg(feature = "npu")]
@@ -853,9 +855,9 @@ impl WeightAccel for RocmWeightAccel {
             xq_d: mk(nb_max),
             xq_sum: mk(nb_max),
 
-            attn_part: mk(n_heads * self.n_split * max_hd),
-            attn_pmax: mk(n_heads * self.n_split),
-            attn_psum: mk(n_heads * self.n_split),
+            attn_part: mk(n_heads * N_SPLIT_MAX * max_hd),
+            attn_pmax: mk(n_heads * N_SPLIT_MAX),
+            attn_psum: mk(n_heads * N_SPLIT_MAX),
             p_h: mk(M_CHUNK * hidden),
             p_xn: mk(M_CHUNK * hidden),
             p_q: mk(M_CHUNK * q_dim),
@@ -1111,12 +1113,19 @@ impl WeightAccel for RocmWeightAccel {
             let koff = (win_start * kv_dim * if self.kv_f16 { 2 } else { 4 }) as usize;
             let kbase = unsafe { (s.k_cache[l].ptr as *mut u8).add(koff) as *mut c_void };
             let vbase = unsafe { (s.v_cache[l].ptr as *mut u8).add(koff) as *mut c_void };
+            // context-adaptive key-split: ~64 keys/chunk, clamped [8, N_SPLIT_MAX];
+            // pinned by STRIX_N_SPLIT (self.n_split>0). Buffers are sized for the cap.
+            let ns = if self.n_split > 0 {
+                self.n_split
+            } else {
+                (len as usize).div_ceil(64).clamp(8, N_SPLIT_MAX)
+            };
             if !skip_sdpa {
                 if len > 1024 {
                     self.launch2(
                         "sdpa_split",
                         n_heads as u32,
-                        self.n_split as u32,
+                        ns as u32,
                         128,
                         0,
                         Args::new()
@@ -1131,7 +1140,7 @@ impl WeightAccel for RocmWeightAccel {
                             .i(groups as i32)
                             .i(n_kv as i32)
                             .f(scale)
-                            .i(self.n_split as i32)
+                            .i(ns as i32)
                             .i(if self.kv_f16 { 1 } else { 0 }),
                     );
                     self.launch(
@@ -1145,7 +1154,7 @@ impl WeightAccel for RocmWeightAccel {
                             .ptr(s.attn_psum.ptr)
                             .ptr(s.attn.ptr)
                             .i(hd as i32)
-                            .i(self.n_split as i32),
+                            .i(ns as i32),
                     );
                 } else {
                     self.launch(
