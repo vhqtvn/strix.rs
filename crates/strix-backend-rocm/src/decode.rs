@@ -178,6 +178,10 @@ pub struct RocmWeightAccel {
     f32w: HashMap<String, Dbuf>,
     cfg: Option<GpuDecodeConfig>,
     scratch: Option<Scratch>,
+    /// f16 KV cache (STRIX_F16_KV=1): halves KV memory + decode KV traffic, at a
+    /// small prefill cost (the prefill SDPA is occupancy-bound, so the h2f isn't
+    /// free there). Default false (f32) — best for prefill-heavy workloads.
+    kv_f16: bool,
     name: String,
     /// When set, `prefill` returns logits for ALL m tokens (m×vocab), not just
     /// the last — the speculative-decoding "verify" path. Reset after each call.
@@ -242,6 +246,7 @@ impl RocmWeightAccel {
             "sdpa_split",
             "sdpa_combine",
             "copyf",
+            "copyf_h",
             "q4_gemm",
             "q4_gemm_w",
             "q4_gemm_w_sk",
@@ -262,6 +267,7 @@ impl RocmWeightAccel {
             f32w: HashMap::new(),
             cfg: None,
             scratch: None,
+            kv_f16: std::env::var("STRIX_F16_KV").is_ok(),
             name,
             verify_all: false,
             #[cfg(feature = "npu")]
@@ -796,6 +802,9 @@ impl WeightAccel for RocmWeightAccel {
             .max()
             .unwrap_or(0);
         let mk = |n: usize| self.gpu.alloc((n.max(1)) * 4).expect("rocm scratch");
+        // KV cache element size: 2 bytes (f16) when STRIX_F16_KV, else 4 (f32).
+        let kvb = if self.kv_f16 { 2 } else { 4 };
+        let mkkv = |n: usize| self.gpu.alloc((n.max(1)) * kvb).expect("rocm kv");
         // Largest matmul input (down-proj in=ffn) → max Q8 blocks.
         let max_in = cfg.ffn.max(hidden).max(q_dim);
         let nb_max = max_in.div_ceil(32);
@@ -804,12 +813,12 @@ impl WeightAccel for RocmWeightAccel {
         let k_cache = cfg
             .layers
             .iter()
-            .map(|l| mk(l.n_kv * cfg.max_seq * l.head_dim))
+            .map(|l| mkkv(l.n_kv * cfg.max_seq * l.head_dim))
             .collect();
         let v_cache = cfg
             .layers
             .iter()
-            .map(|l| mk(l.n_kv * cfg.max_seq * l.head_dim))
+            .map(|l| mkkv(l.n_kv * cfg.max_seq * l.head_dim))
             .collect();
         self.scratch = Some(Scratch {
             h: mk(hidden),
@@ -1045,7 +1054,7 @@ impl WeightAccel for RocmWeightAccel {
                     .map(|d| d.ptr)
                     .unwrap_or(s.ones.ptr)
             };
-            let off = pos * kv_dim * 4;
+            let off = pos * kv_dim * if self.kv_f16 { 2 } else { 4 };
             let kdst = unsafe { (s.k_cache[l].ptr as *mut u8).add(off) as *mut c_void };
             let vdst = unsafe { (s.v_cache[l].ptr as *mut u8).add(off) as *mut c_void };
             self.launch(
@@ -1069,7 +1078,8 @@ impl WeightAccel for RocmWeightAccel {
                     .i(pos as i32)
                     .f(lc.rope_theta)
                     .f(eps)
-                    .i(if cfg.norm_v { 1 } else { 0 }),
+                    .i(if cfg.norm_v { 1 } else { 0 })
+                    .i(if self.kv_f16 { 1 } else { 0 }),
             );
             // sdpa. Local (sliding-window) layers attend only the last `n_swa`
             // keys: offset the K/V base to the window start and shorten `len`
@@ -1083,7 +1093,7 @@ impl WeightAccel for RocmWeightAccel {
             };
             let win_start = full_len.saturating_sub(win);
             let len = (full_len - win_start) as i32;
-            let koff = (win_start * kv_dim * 4) as usize;
+            let koff = (win_start * kv_dim * if self.kv_f16 { 2 } else { 4 }) as usize;
             let kbase = unsafe { (s.k_cache[l].ptr as *mut u8).add(koff) as *mut c_void };
             let vbase = unsafe { (s.v_cache[l].ptr as *mut u8).add(koff) as *mut c_void };
             if !skip_sdpa {
@@ -1106,7 +1116,8 @@ impl WeightAccel for RocmWeightAccel {
                             .i(groups as i32)
                             .i(n_kv as i32)
                             .f(scale)
-                            .i(N_SPLIT as i32),
+                            .i(N_SPLIT as i32)
+                            .i(if self.kv_f16 { 1 } else { 0 }),
                     );
                     self.launch(
                         "sdpa_combine",
@@ -1136,7 +1147,8 @@ impl WeightAccel for RocmWeightAccel {
                             .i(len)
                             .i(groups as i32)
                             .i(n_kv as i32)
-                            .f(scale),
+                            .f(scale)
+                            .i(if self.kv_f16 { 1 } else { 0 }),
                     );
                 }
             }
@@ -1619,18 +1631,19 @@ impl WeightAccel for RocmWeightAccel {
                     .i(m as i32),
             );
             // fill KV cache slots [start_pos .. start_pos+m]
-            let off = start_pos * kv_dim * 4;
+            let off = start_pos * kv_dim * if self.kv_f16 { 2 } else { 4 };
             let kdst = unsafe { (s.k_cache[l].ptr as *mut u8).add(off) as *mut c_void };
             let vdst = unsafe { (s.v_cache[l].ptr as *mut u8).add(off) as *mut c_void };
+            let kvcopy = if self.kv_f16 { "copyf_h" } else { "copyf" };
             self.launch(
-                "copyf",
+                kvcopy,
                 (m * kv_dim).div_ceil(256) as u32,
                 256,
                 0,
                 Args::new().ptr(kdst).ptr(s.p_k2.ptr).i((m * kv_dim) as i32),
             );
             self.launch(
-                "copyf",
+                kvcopy,
                 (m * kv_dim).div_ceil(256) as u32,
                 256,
                 0,
@@ -1654,7 +1667,8 @@ impl WeightAccel for RocmWeightAccel {
                             .i(groups as i32)
                             .i(n_kv as i32)
                             .f(scale)
-                            .i(n_heads as i32),
+                            .i(n_heads as i32)
+                            .i(if self.kv_f16 { 1 } else { 0 }),
                     );
                 } else {
                     // flash-style: grid=(n_heads, ceil(m/8)), block=256, shared=2*hd floats.
@@ -1678,7 +1692,8 @@ impl WeightAccel for RocmWeightAccel {
                             .f(scale)
                             .i(n_heads as i32)
                             .i(m as i32)
-                            .i(n_swa),
+                            .i(n_swa)
+                            .i(if self.kv_f16 { 1 } else { 0 }),
                     );
                 }
             }

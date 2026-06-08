@@ -14,6 +14,26 @@ __device__ __forceinline__ float h2f(unsigned short h) {
     return c.f;
 }
 
+// f32 -> f16 (round to nearest). KV-cache values are post-norm/RoPE (~O(1)).
+__device__ __forceinline__ unsigned short f2h(float f) {
+    union { unsigned u; float fv; } c; c.fv = f;
+    unsigned x = c.u, sign = (x >> 16) & 0x8000u, m = x & 0x7fffffu;
+    int e = (int)((x >> 23) & 0xffu) - 112;
+    if (e >= 31) return (unsigned short)(sign | 0x7c00u);
+    if (e <= 0) {
+        if (e < -10) return (unsigned short)sign;
+        m |= 0x800000u; int sh = 14 - e; unsigned h = m >> sh;
+        if ((m >> (sh - 1)) & 1u) h += 1u;
+        return (unsigned short)(sign | h);
+    }
+    unsigned h = ((unsigned)e << 10) | (m >> 13);
+    if (m & 0x1000u) h += 1u;
+    return (unsigned short)(sign | h);
+}
+// Load a KV element that is f16 (kvf16!=0) or f32, from a base pointer passed as
+// const float* (reinterpreted). Lets the SDPA kernels serve either cache format.
+#define KVLD(p, i, kvf16) ((kvf16) ? h2f(((const unsigned short*)(p))[(i)]) : (p)[(i)])
+
 typedef int v4i __attribute__((ext_vector_type(4)));
 typedef int v8i __attribute__((ext_vector_type(8)));
 
@@ -600,7 +620,7 @@ extern "C" __global__ void qkv_post(const float* __restrict__ q, const float* __
                                     const float* __restrict__ kw, const float* __restrict__ ff,
                                     float* __restrict__ qout, float* __restrict__ kdst,
                                     float* __restrict__ vdst, int hd, int n_heads, int n_kv,
-                                    int pos, float theta, float eps, int norm_v) {
+                                    int pos, float theta, float eps, int norm_v, int kvf16) {
     int b = blockIdx.x, t = threadIdx.x, half = hd / 2;
     __shared__ float red[256];
     if (b < n_heads) {
@@ -631,8 +651,9 @@ extern "C" __global__ void qkv_post(const float* __restrict__ q, const float* __
             float ang = pos * inv, sn = sinf(ang), cs = cosf(ang);
             float x1 = k[base + j] * rs * kw[j];
             float x2 = k[base + j + half] * rs * kw[j + half];
-            kdst[base + j] = x1 * cs - x2 * sn;
-            kdst[base + j + half] = x2 * cs + x1 * sn;
+            float ka = x1 * cs - x2 * sn, kb2 = x2 * cs + x1 * sn;
+            if (kvf16) { ((unsigned short*)kdst)[base + j] = f2h(ka); ((unsigned short*)kdst)[base + j + half] = f2h(kb2); }
+            else { kdst[base + j] = ka; kdst[base + j + half] = kb2; }
         }
         if (norm_v) {
             ss = 0.f;
@@ -640,9 +661,9 @@ extern "C" __global__ void qkv_post(const float* __restrict__ q, const float* __
             red[t] = ss; __syncthreads();
             for (int s = 128; s > 0; s >>= 1) { if (t < s) red[t] += red[t + s]; __syncthreads(); }
             float vrs = rsqrtf(red[0] / hd + eps);
-            for (int i = t; i < hd; i += 256) vdst[base + i] = v[base + i] * vrs;
+            for (int i = t; i < hd; i += 256) { float vv = v[base + i] * vrs; if (kvf16) ((unsigned short*)vdst)[base + i] = f2h(vv); else vdst[base + i] = vv; }
         } else {
-            for (int i = t; i < hd; i += 256) vdst[base + i] = v[base + i];
+            for (int i = t; i < hd; i += 256) { float vv = v[base + i]; if (kvf16) ((unsigned short*)vdst)[base + i] = f2h(vv); else vdst[base + i] = vv; }
         }
     }
 }
@@ -667,13 +688,13 @@ extern "C" __global__ void softcap(float* __restrict__ x, int n, float cap) {
 // Single-query causal SDPA with GQA. grid=n_heads, block=256, scores in shared.
 extern "C" __global__ void sdpa(const float* __restrict__ q, const float* __restrict__ k,
                                 const float* __restrict__ v, float* __restrict__ out,
-                                int hd, int len, int groups, int n_kv, float scale) {
+                                int hd, int len, int groups, int n_kv, float scale, int kvf16) {
     int h = blockIdx.x, t = threadIdx.x, kvh = h / groups, qbase = h * hd;
     __shared__ float scores[2048];
     __shared__ float red[256];
     for (int i = t; i < len; i += 256) {
         float s = 0.f; int kb = (i * n_kv + kvh) * hd;
-        for (int d = 0; d < hd; d++) s += q[qbase + d] * k[kb + d];
+        for (int d = 0; d < hd; d++) s += q[qbase + d] * KVLD(k, kb + d, kvf16);
         scores[i] = s * scale;
     }
     __syncthreads();
@@ -689,7 +710,7 @@ extern "C" __global__ void sdpa(const float* __restrict__ q, const float* __rest
     float inv = 1.f / red[0]; __syncthreads();
     for (int d = t; d < hd; d += 256) {
         float acc = 0.f;
-        for (int i = 0; i < len; i++) acc += scores[i] * v[(i * n_kv + kvh) * hd + d];
+        for (int i = 0; i < len; i++) acc += scores[i] * KVLD(v, (i * n_kv + kvh) * hd + d, kvf16);
         out[qbase + d] = acc * inv;
     }
 }
@@ -702,7 +723,7 @@ extern "C" __global__ void sdpa(const float* __restrict__ q, const float* __rest
 extern "C" __global__ void sdpa_split(const float* __restrict__ q, const float* __restrict__ k,
                                       const float* __restrict__ v, float* __restrict__ pout,
                                       float* __restrict__ pmax, float* __restrict__ psum,
-                                      int hd, int len, int groups, int n_kv, float scale, int n_split) {
+                                      int hd, int len, int groups, int n_kv, float scale, int n_split, int kvf16) {
     int h = blockIdx.x, sp = blockIdx.y, t = threadIdx.x;
     int kvh = h / groups, qbase = h * hd;
     int chunk = (len + n_split - 1) / n_split, t0 = sp * chunk;
@@ -711,7 +732,7 @@ extern "C" __global__ void sdpa_split(const float* __restrict__ q, const float* 
     __shared__ float red[128];
     for (int i = t; i < n; i += 128) {
         float s = 0.f; int kb = ((t0 + i) * n_kv + kvh) * hd;
-        for (int d = 0; d < hd; d++) s += q[qbase + d] * k[kb + d];
+        for (int d = 0; d < hd; d++) s += q[qbase + d] * KVLD(k, kb + d, kvf16);
         sc[i] = s * scale;
     }
     __syncthreads();
@@ -728,7 +749,7 @@ extern "C" __global__ void sdpa_split(const float* __restrict__ q, const float* 
     int base = (h * n_split + sp) * hd;
     for (int d = t; d < hd; d += 128) {
         float acc = 0.f;
-        for (int i = 0; i < n; i++) acc += sc[i] * v[((t0 + i) * n_kv + kvh) * hd + d];
+        for (int i = 0; i < n; i++) acc += sc[i] * KVLD(v, ((t0 + i) * n_kv + kvh) * hd + d, kvf16);
         pout[base + d] = acc;
     }
     if (t == 0) { pmax[h * n_split + sp] = (n > 0) ? M : -3.0e38f; psum[h * n_split + sp] = L; }
@@ -833,14 +854,14 @@ extern "C" __global__ void addnorm_batch(float* __restrict__ h, const float* __r
 // block=256. (scores capped at 2048 → prompt length must be <= 2048.)
 extern "C" __global__ void sdpa_prefill(const float* __restrict__ q, const float* __restrict__ k,
                                         const float* __restrict__ v, float* __restrict__ out,
-                                        int hd, int start_pos, int groups, int n_kv, float scale, int n_heads) {
+                                        int hd, int start_pos, int groups, int n_kv, float scale, int n_heads, int kvf16) {
     int blk = blockIdx.x, m = blk / n_heads, h = blk % n_heads, t = threadIdx.x;
     int kvh = h / groups, qbase = (m * n_heads + h) * hd, len = start_pos + m + 1;
     __shared__ float scores[2048];
     __shared__ float red[256];
     for (int i = t; i < len; i += 256) {
         float s = 0.f; int kb = (i * n_kv + kvh) * hd;
-        for (int d = 0; d < hd; d++) s += q[qbase + d] * k[kb + d];
+        for (int d = 0; d < hd; d++) s += q[qbase + d] * KVLD(k, kb + d, kvf16);
         scores[i] = s * scale;
     }
     __syncthreads();
@@ -856,7 +877,7 @@ extern "C" __global__ void sdpa_prefill(const float* __restrict__ q, const float
     float inv = 1.f / red[0]; __syncthreads();
     for (int d = t; d < hd; d += 256) {
         float acc = 0.f;
-        for (int i = 0; i < len; i++) acc += scores[i] * v[(i * n_kv + kvh) * hd + d];
+        for (int i = 0; i < len; i++) acc += scores[i] * KVLD(v, (i * n_kv + kvh) * hd + d, kvf16);
         out[qbase + d] = acc * inv;
     }
 }
@@ -871,7 +892,7 @@ extern "C" __global__ void sdpa_prefill(const float* __restrict__ q, const float
 extern "C" __global__ void sdpa_prefill_f(const float* __restrict__ q, const float* __restrict__ k,
                                           const float* __restrict__ v, float* __restrict__ out,
                                           int hd, int start_pos, int groups, int n_kv,
-                                          float scale, int n_heads, int m_total, int n_swa) {
+                                          float scale, int n_heads, int m_total, int n_swa, int kvf16) {
     const int TQ = 8;
     int h = blockIdx.x, kvh = h / groups, q0 = blockIdx.y * TQ;
     int t = threadIdx.x, w = t >> 5, lane = t & 31;
@@ -899,7 +920,7 @@ extern "C" __global__ void sdpa_prefill_f(const float* __restrict__ q, const flo
     for (int i = i_lo; i < max_len; i++) {
         __syncthreads();
         int kb = (i * n_kv + kvh) * hd;
-        for (int d = t; d < hd; d += 256) { ks[d] = k[kb + d]; vs[d] = v[kb + d]; }
+        for (int d = t; d < hd; d += 256) { ks[d] = KVLD(k, kb + d, kvf16); vs[d] = KVLD(v, kb + d, kvf16); }
         __syncthreads();
         if (!active || i >= my_len || i < swa_lo) continue;  // whole wave skips together
         float part = 0.f;
@@ -922,5 +943,11 @@ extern "C" __global__ void sdpa_prefill_f(const float* __restrict__ q, const flo
 extern "C" __global__ void copyf(float* __restrict__ dst, const float* __restrict__ src, int n) {
     int i = blockIdx.x * 256 + threadIdx.x;
     if (i < n) dst[i] = src[i];
+}
+
+// f32 -> f16 copy (KV-cache append in half precision; STRIX_F16_KV path).
+extern "C" __global__ void copyf_h(unsigned short* __restrict__ dst, const float* __restrict__ src, int n) {
+    int i = blockIdx.x * 256 + threadIdx.x;
+    if (i < n) dst[i] = f2h(src[i]);
 }
 "#;
