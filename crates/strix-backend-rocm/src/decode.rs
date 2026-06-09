@@ -1550,12 +1550,13 @@ impl WeightAccel for RocmWeightAccel {
 
         // iGPU pacer (STRIX_GPU_PACE_MS): sync + sleep after each prefill layer so the
         // iGPU never SUSTAINS ~100% — the trigger for this box's SoC-reset HW fault.
-        // Trades the iGPU/NPU overlap (and ~pace_ms*n_layers wall time) for periodic
-        // GPU rests. Combine with max-NPU offload. 0 = off.
+        // DEFAULT 4ms (safe-by-default for this box, per "don't let the GPU hit 100%");
+        // set 0 to disable (when the HW is fixed) or higher for more rest/safety.
+        // Trades the iGPU/NPU overlap + ~pace_ms*n_layers wall time for periodic rests.
         let pace_ms = std::env::var("STRIX_GPU_PACE_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
+            .unwrap_or(4);
         for l in 0..n_layers {
             let lc = &cfg.layers[l];
             let hd = lc.head_dim;
