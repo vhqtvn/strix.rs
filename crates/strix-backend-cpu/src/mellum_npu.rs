@@ -17,6 +17,8 @@ use strix_core::error::{Result, StrixError};
 use strix_models::ggml_quant::{dequantize_into, GgmlType};
 
 pub const M_NPU: usize = 256;
+/// Below this row count CPU wins (per-call NPU latency dominates).
+pub const M_MIN: usize = 64;
 
 /// One fixed-shape NPU GEMM (K×N) with N staged weights (per layer / per expert).
 pub struct NpuShape {
@@ -76,6 +78,31 @@ impl NpuShape {
         Ok(())
     }
 
+    /// Stage two stacked Q8_0 weights (e.g. gate ‖ up, each n/2 rows of k) as one
+    /// [K, N] weight: output channels [0,n/2) from `a`, [n/2,n) from `b`.
+    pub fn stage_q8_pair(&mut self, slot: u64, a: &[u8], b: &[u8], ty: GgmlType) -> Result<()> {
+        let (k, n) = (self.k, self.n);
+        let half = n / 2;
+        let mut rowf = vec![0.0f32; k];
+        let bpr = (k / ty.block_elems()) * ty.block_bytes();
+        let mut b8 = vec![0i8; k * n];
+        let mut ws = vec![0.0f32; n];
+        for o in 0..n {
+            let (src, r) = if o < half { (a, o) } else { (b, o - half) };
+            dequantize_into(ty, &src[r * bpr..(r + 1) * bpr], &mut rowf)?;
+            let amax = rowf.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+            let s = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            ws[o] = s;
+            let inv = 1.0 / s;
+            for i in 0..k {
+                b8[i * n + o] = (rowf[i] * inv).round().clamp(-127.0, 127.0) as i8;
+            }
+        }
+        let wid = self.gemm.stage(&b8).map_err(StrixError::backend)?;
+        self.weights.insert(slot, (wid, ws));
+        Ok(())
+    }
+
     pub fn has(&self, slot: u64) -> bool {
         self.weights.contains_key(&slot)
     }
@@ -119,11 +146,11 @@ impl NpuShape {
     }
 }
 
-/// The Mellum NPU offload bundle: dense q + o shapes, expert gate/up + down shapes.
+/// The Mellum NPU offload bundle: dense q + o shapes, fused gate‖up + down shapes.
 pub struct MellumNpu {
     pub q: NpuShape,    // [2304 -> 4096]
     pub o: NpuShape,    // [4096 -> 2304]
-    pub gu: NpuShape,   // expert gate/up [2304 -> 896]
+    pub gu2: NpuShape,  // expert gate‖up fused [2304 -> 1792] (one call → both)
     pub down: NpuShape, // expert down [896 -> 2304]
 }
 
@@ -132,7 +159,7 @@ impl MellumNpu {
         Ok(MellumNpu {
             q: NpuShape::open(dir, 2304, 4096, 8)?,
             o: NpuShape::open(dir, 4096, 2304, 4)?,
-            gu: NpuShape::open(dir, 2304, 896, 2)?,
+            gu2: NpuShape::open(dir, 2304, 1792, 4)?,
             down: NpuShape::open(dir, 896, 2304, 4)?,
         })
     }

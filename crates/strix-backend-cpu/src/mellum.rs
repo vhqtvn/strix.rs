@@ -351,20 +351,37 @@ impl MellumModel {
             let eff = self.cfg.expert_ff;
             let hidden = self.cfg.hidden;
             for il in 0..nl.min(cap) {
-                for (tname, in_dim, out_dim, down) in [
-                    ("ffn_gate_exps", hidden, eff, false),
-                    ("ffn_up_exps", hidden, eff, false),
-                    ("ffn_down_exps", eff, hidden, true),
-                ] {
-                    let full = format!("blk.{il}.{tname}.weight");
-                    let (Some(ti), Ok(bytes)) = (self.gguf.tensors().get(&full), self.gguf.tensor_bytes(&full)) else { continue };
+                // gate‖up fused: one staged [hidden, 2*eff] weight per expert
+                let gname = format!("blk.{il}.ffn_gate_exps.weight");
+                let uname = format!("blk.{il}.ffn_up_exps.weight");
+                if let (Some(ti), Ok(gb), Ok(ub)) = (
+                    self.gguf.tensors().get(&gname),
+                    self.gguf.tensor_bytes(&gname),
+                    self.gguf.tensor_bytes(&uname),
+                ) {
                     let ty = ti.ggml_type;
-                    let bpr = (in_dim / ty.block_elems()) * ty.block_bytes() * out_dim;
-                    let kind = match tname { "ffn_gate_exps" => 0u64, "ffn_up_exps" => 1, _ => 2 };
+                    let bpr = (hidden / ty.block_elems()) * ty.block_bytes() * eff;
                     for e in 0..ne {
-                        let slot = (il as u64) << 16 | kind << 8 | e as u64;
-                        let sh = if down { &mut npu.down } else { &mut npu.gu };
-                        if sh.stage_q8(slot, &bytes[e * bpr..(e + 1) * bpr], ty).is_err() { break 'stage; }
+                        let slot = (il as u64) << 16 | e as u64;
+                        if npu
+                            .gu2
+                            .stage_q8_pair(slot, &gb[e * bpr..(e + 1) * bpr], &ub[e * bpr..(e + 1) * bpr], ty)
+                            .is_err()
+                        {
+                            break 'stage;
+                        }
+                        n += 1;
+                    }
+                }
+                let dname = format!("blk.{il}.ffn_down_exps.weight");
+                if let (Some(ti), Ok(db)) = (self.gguf.tensors().get(&dname), self.gguf.tensor_bytes(&dname)) {
+                    let ty = ti.ggml_type;
+                    let bpr = (eff / ty.block_elems()) * ty.block_bytes() * hidden;
+                    for e in 0..ne {
+                        let slot = (il as u64) << 16 | 2 << 8 | e as u64;
+                        if npu.down.stage_q8(slot, &db[e * bpr..(e + 1) * bpr], ty).is_err() {
+                            break 'stage;
+                        }
                         n += 1;
                     }
                 }
@@ -513,6 +530,9 @@ impl MellumModel {
     #[cfg(feature = "npu")]
     fn npu_mm(&self, il: usize, which: u8, xs: &[f32], m: usize, k: usize, n: usize, out: &mut [f32]) -> bool {
         let Some(npu) = &self.npu else { return false };
+        if m < crate::mellum_npu::M_MIN {
+            return false; // per-call NPU latency dominates tiny chunks; CPU wins
+        }
         let sh = if which == 0 { &npu.q } else { &npu.o };
         if sh.k != k || sh.n != n || !sh.has(il as u64) {
             return false;
@@ -534,7 +554,11 @@ impl MellumModel {
     #[cfg(feature = "npu")]
     fn npu_exp(&self, down: bool, slot: u64, xs: &[f32], m: usize, n: usize, out: &mut [f32]) -> bool {
         let Some(npu) = &self.npu else { return false };
-        let sh = if down { &npu.down } else { &npu.gu };
+        // experts see ~m·topk/n_expert rows; small lists are faster on CPU
+        if m < 8 {
+            return false;
+        }
+        let sh = if down { &npu.down } else { &npu.gu2 };
         if sh.n != n || !sh.has(slot) {
             return false;
         }
@@ -746,13 +770,16 @@ impl MellumModel {
                 }
                 let mut g = vec![0.0f32; me * eff];
                 let mut u = vec![0.0f32; me * eff];
-                let gslot = (il as u64) << 16 | e as u64;
-                let uslot = (il as u64) << 16 | 1 << 8 | e as u64;
+                let guslot = (il as u64) << 16 | e as u64;
                 let dslot = (il as u64) << 16 | 2 << 8 | e as u64;
-                if !self.npu_exp(false, gslot, &xs, me, eff, &mut g) {
+                let mut gu = vec![0.0f32; me * 2 * eff];
+                if self.npu_exp(false, guslot, &xs, me, 2 * eff, &mut gu) {
+                    for t in 0..me {
+                        g[t * eff..(t + 1) * eff].copy_from_slice(&gu[t * 2 * eff..t * 2 * eff + eff]);
+                        u[t * eff..(t + 1) * eff].copy_from_slice(&gu[t * 2 * eff + eff..(t + 1) * 2 * eff]);
+                    }
+                } else {
                     qmatmul_batch(&mut g, &xs, me, &wge.bytes[e * g_bpr..(e + 1) * g_bpr], wge.ty, hidden, eff);
-                }
-                if !self.npu_exp(false, uslot, &xs, me, eff, &mut u) {
                     qmatmul_batch(&mut u, &xs, me, &wue.bytes[e * u_bpr..(e + 1) * u_bpr], wue.ty, hidden, eff);
                 }
                 let mut act = vec![0.0f32; me * eff];
