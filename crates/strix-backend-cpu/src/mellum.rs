@@ -284,6 +284,11 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     s
 }
 
+/// Shareable raw f32 pointer for disjoint-slot parallel writes (expert scatter).
+struct SendPtrF(*mut f32);
+unsafe impl Sync for SendPtrF {}
+unsafe impl Send for SendPtrF {}
+
 /// A resolved weight: raw bytes + ggml type + the row length (in_dim).
 struct W<'a> {
     bytes: &'a [u8],
@@ -478,6 +483,16 @@ impl MellumModel {
         }
         self.accel = Some(accel);
         n
+    }
+
+    /// True if an NPU expert call would be used for `me` rows (drives the NPU/CPU split).
+    #[cfg(feature = "npu")]
+    fn npu_can_exp(&self, me: usize) -> bool {
+        self.npu.is_some() && me >= 8
+    }
+    #[cfg(not(feature = "npu"))]
+    fn npu_can_exp(&self, _me: usize) -> bool {
+        false
     }
 
     /// GPU gemv for `key` into `out` if adopted; false ⇒ caller uses CPU.
@@ -759,10 +774,11 @@ impl MellumModel {
             let d_bpr = (eff / wde.ty.block_elems()) * wde.ty.block_bytes() * hidden;
             // dy[t][slot] holds the down-output for token t's slot-th routed expert
             let mut dy = vec![0.0f32; m * topk * hidden];
-            for (e, list) in by_exp.iter().enumerate() {
-                if list.is_empty() {
-                    continue;
-                }
+            // Process one expert end-to-end (gather → gate/up → silu·mul → down →
+            // scatter). `on_npu` selects NPU or CPU matmuls.
+            let dyp = SendPtrF(dy.as_mut_ptr());
+            let dyp = &dyp; // capture the Sync wrapper, not the raw field
+            let run_expert = |e: usize, list: &Vec<(usize, usize)>, on_npu: bool| {
                 let me = list.len();
                 let mut xs = vec![0.0f32; me * hidden];
                 for (i, &(t, _)) in list.iter().enumerate() {
@@ -772,13 +788,20 @@ impl MellumModel {
                 let mut u = vec![0.0f32; me * eff];
                 let guslot = (il as u64) << 16 | e as u64;
                 let dslot = (il as u64) << 16 | 2 << 8 | e as u64;
-                let mut gu = vec![0.0f32; me * 2 * eff];
-                if self.npu_exp(false, guslot, &xs, me, 2 * eff, &mut gu) {
-                    for t in 0..me {
-                        g[t * eff..(t + 1) * eff].copy_from_slice(&gu[t * 2 * eff..t * 2 * eff + eff]);
-                        u[t * eff..(t + 1) * eff].copy_from_slice(&gu[t * 2 * eff + eff..(t + 1) * 2 * eff]);
+                let mut on_npu = on_npu;
+                if on_npu {
+                    let mut gu = vec![0.0f32; me * 2 * eff];
+                    if self.npu_exp(false, guslot, &xs, me, 2 * eff, &mut gu) {
+                        for t in 0..me {
+                            g[t * eff..(t + 1) * eff].copy_from_slice(&gu[t * 2 * eff..t * 2 * eff + eff]);
+                            u[t * eff..(t + 1) * eff]
+                                .copy_from_slice(&gu[t * 2 * eff + eff..(t + 1) * 2 * eff]);
+                        }
+                    } else {
+                        on_npu = false;
                     }
-                } else {
+                }
+                if !on_npu {
                     qmatmul_batch(&mut g, &xs, me, &wge.bytes[e * g_bpr..(e + 1) * g_bpr], wge.ty, hidden, eff);
                     qmatmul_batch(&mut u, &xs, me, &wue.bytes[e * u_bpr..(e + 1) * u_bpr], wue.ty, hidden, eff);
                 }
@@ -787,14 +810,32 @@ impl MellumModel {
                     act[i] = silu(g[i]) * u[i];
                 }
                 let mut d = vec![0.0f32; me * hidden];
-                if !self.npu_exp(true, dslot, &act, me, hidden, &mut d) {
+                if !(on_npu && self.npu_exp(true, dslot, &act, me, hidden, &mut d)) {
                     qmatmul_batch(&mut d, &act, me, &wde.bytes[e * d_bpr..(e + 1) * d_bpr], wde.ty, eff, hidden);
                 }
+                // scatter: dy slots are disjoint per (t,s)
                 for (i, &(t, s)) in list.iter().enumerate() {
-                    dy[(t * topk + s) * hidden..(t * topk + s + 1) * hidden]
-                        .copy_from_slice(&d[i * hidden..(i + 1) * hidden]);
+                    let dst = (t * topk + s) * hidden;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(d[i * hidden..].as_ptr(), dyp.0.add(dst), hidden)
+                    };
                 }
-            }
+            };
+            // Concurrency: the NPU is a separate engine — run its (big) experts on one
+            // thread while the CPU pool chews the small ones. ~free overlap.
+            let (npu_list, cpu_list): (Vec<usize>, Vec<usize>) = (0..ne)
+                .filter(|&e| !by_exp[e].is_empty())
+                .partition(|&e| self.npu_can_exp(by_exp[e].len()));
+            rayon::join(
+                || {
+                    for &e in &npu_list {
+                        run_expert(e, &by_exp[e], true);
+                    }
+                },
+                || {
+                    cpu_list.par_iter().for_each(|&e| run_expert(e, &by_exp[e], false));
+                },
+            );
             // per-token accumulate in routed order into a zeroed buffer, then add to h
             // (exactly moe()'s float association: out = Σ w·d, then h + out).
             for (t, route) in routes.iter().enumerate() {

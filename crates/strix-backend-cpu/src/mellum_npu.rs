@@ -35,6 +35,11 @@ pub struct NpuShape {
     weights: std::collections::HashMap<u64, (i32, Vec<f32>)>,
 }
 
+// SAFETY: callers serialize all `gemm()` calls on a single thread (the NPU branch
+// of the expert split / the chunk loop); the Sync bound is only needed so models
+// holding NpuShape can be shared with the CPU rayon pool.
+unsafe impl Sync for NpuShape {}
+
 impl NpuShape {
     pub fn open(dir: &str, k: usize, n: usize, cols: usize) -> Result<NpuShape> {
         let stem = format!("256x{k}x{n}_64x64x64_{cols}c");
