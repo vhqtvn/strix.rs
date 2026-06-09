@@ -236,6 +236,32 @@ fn qmatmul(
     );
 }
 
+/// Batched on-the-fly dequant matmul: `out[t][o] = W·xs[t]` for m tokens at once.
+/// The win over m `qmatmul` calls: each weight row is dequantized ONCE per chunk,
+/// not once per token — token-at-a-time prefill is dequant-bound (~99% of cost).
+/// xs: [m * in_dim] token-major; out: [m * out_dim]. Per-token dots are `dot_f32`,
+/// so each row's value is bit-identical to the token-at-a-time path.
+fn qmatmul_batch(out: &mut [f32], xs: &[f32], m: usize, bytes: &[u8], ty: GgmlType, in_dim: usize, out_dim: usize) {
+    let bpr = (in_dim / ty.block_elems()) * ty.block_bytes();
+    // Parallel over output rows; out[t*out_dim + o] strided writes per row, so write
+    // into a row-major scratch [out_dim][m] then transpose at the end.
+    let mut rt = vec![0.0f32; out_dim * m];
+    rt.par_chunks_mut(m).enumerate().for_each_init(
+        || vec![0.0f32; in_dim],
+        |scratch, (o, orow)| {
+            dequantize_into(ty, &bytes[o * bpr..o * bpr + bpr], scratch).unwrap();
+            for t in 0..m {
+                orow[t] = dot_f32(scratch, &xs[t * in_dim..(t + 1) * in_dim]);
+            }
+        },
+    );
+    for t in 0..m {
+        for o in 0..out_dim {
+            out[t * out_dim + o] = rt[o * m + t];
+        }
+    }
+}
+
 /// SIMD-friendly dot product. A plain `s += a[i]*b[i]` loop does NOT auto-vectorize
 /// (f32 add isn't associative + no fast-math), so split into 8 independent lane
 /// accumulators that LLVM lowers to vector FMAs, then reduce. `len` is a multiple of
@@ -424,6 +450,244 @@ impl MellumModel {
         let mut out = vec![0.0f32; n];
         dequantize_into(ti.ggml_type, self.gguf.tensor_bytes(name)?, &mut out)?;
         Ok(out)
+    }
+
+    /// Batched prefill: process the whole prompt with weight-read-once matmuls.
+    /// Token-at-a-time prefill is dequant-bound (m re-dequants of every weight);
+    /// batching reads each weight once → prefill becomes ~m× cheaper on dequant.
+    /// Bit-identical to the token loop: each row's dot is `dot_f32`, per-token
+    /// rope/norm/SDPA are the same code, and each token's MoE accumulates in its
+    /// own routed-expert order. Returns logits of the LAST token.
+    fn prefill_batch(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let cfg = self.cfg.clone();
+        let m = tokens.len();
+        let hidden = cfg.hidden;
+        let eps = cfg.rms_eps;
+        let hd = cfg.head_dim;
+        let nh = cfg.n_head;
+        let nkv = cfg.n_head_kv;
+        let groups = nh / nkv;
+        let kv_dim = nkv * hd;
+        let q_dim = nh * hd;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let corr = yarn_corr_dims(
+            cfg.n_rot,
+            cfg.yarn_orig_ctx,
+            cfg.rope_freq_base,
+            cfg.yarn_beta_fast,
+            cfg.yarn_beta_slow,
+        );
+
+        // embed all tokens
+        let emb = self.w("token_embd.weight")?;
+        let bpr_e = (hidden / emb.ty.block_elems()) * emb.ty.block_bytes();
+        let mut h = vec![0.0f32; m * hidden];
+        for (t, &tok) in tokens.iter().enumerate() {
+            dequantize_into(
+                emb.ty,
+                &emb.bytes[tok as usize * bpr_e..(tok as usize + 1) * bpr_e],
+                &mut h[t * hidden..(t + 1) * hidden],
+            )?;
+        }
+
+        let mut n = vec![0.0f32; m * hidden];
+        let mut q = vec![0.0f32; m * q_dim];
+        let mut k = vec![0.0f32; m * kv_dim];
+        let mut v = vec![0.0f32; m * kv_dim];
+        let mut attn_out = vec![0.0f32; m * q_dim];
+        let mut o = vec![0.0f32; m * hidden];
+
+        for il in 0..cfg.n_layer {
+            let b = |s: &str| format!("blk.{il}.{s}");
+            let an = self.vecw(&b("attn_norm.weight"))?;
+            for t in 0..m {
+                let (hs, ns) = (&h[t * hidden..(t + 1) * hidden], &mut n[t * hidden..(t + 1) * hidden]);
+                rmsnorm(ns, hs, &an, eps);
+            }
+            {
+                let wq = self.w(&b("attn_q.weight"))?;
+                qmatmul_batch(&mut q, &n, m, wq.bytes, wq.ty, hidden, q_dim);
+                let wk = self.w(&b("attn_k.weight"))?;
+                qmatmul_batch(&mut k, &n, m, wk.bytes, wk.ty, hidden, kv_dim);
+                let wv = self.w(&b("attn_v.weight"))?;
+                qmatmul_batch(&mut v, &n, m, wv.bytes, wv.ty, hidden, kv_dim);
+            }
+            let is_swa = cfg.is_swa(il);
+            let (freq_scale, ext_factor, mscale) = if is_swa {
+                (1.0, 0.0, 1.0)
+            } else {
+                (1.0 / cfg.yarn_factor, 1.0, cfg.yarn_attn_factor)
+            };
+            let qn = self.vecw(&b("attn_q_norm.weight"))?;
+            let kn = self.vecw(&b("attn_k_norm.weight"))?;
+            for t in 0..m {
+                let pos = self.pos + t;
+                for hh in 0..nh {
+                    let qh = &mut q[t * q_dim + hh * hd..t * q_dim + hh * hd + hd];
+                    let mut tmp = vec![0.0f32; hd];
+                    rmsnorm(&mut tmp, qh, &qn, eps);
+                    qh.copy_from_slice(&tmp);
+                    rope_neox(qh, pos, cfg.n_rot, cfg.rope_freq_base, freq_scale, ext_factor, mscale, corr);
+                }
+                for kh in 0..nkv {
+                    let khv = &mut k[t * kv_dim + kh * hd..t * kv_dim + kh * hd + hd];
+                    let mut tmp = vec![0.0f32; hd];
+                    rmsnorm(&mut tmp, khv, &kn, eps);
+                    khv.copy_from_slice(&tmp);
+                    rope_neox(khv, pos, cfg.n_rot, cfg.rope_freq_base, freq_scale, ext_factor, mscale, corr);
+                }
+            }
+            self.kc[il].extend_from_slice(&k[..m * kv_dim]);
+            self.vc[il].extend_from_slice(&v[..m * kv_dim]);
+            // per-token causal SDPA over the cache (parallel: cache is read-only now)
+            let kc = &self.kc[il];
+            let vc = &self.vc[il];
+            let base = self.pos;
+            attn_out
+                .par_chunks_mut(q_dim)
+                .enumerate()
+                .for_each(|(t, ao)| {
+                    let pos = base + t;
+                    let len = pos + 1;
+                    let win_start = if is_swa && cfg.sliding_window > 0 && len > cfg.sliding_window {
+                        len - cfg.sliding_window
+                    } else {
+                        0
+                    };
+                    let wlen = len - win_start;
+                    let mut keys = vec![0.0f32; wlen * hd];
+                    let mut vals = vec![0.0f32; wlen * hd];
+                    let mut scratch = vec![0.0f32; wlen];
+                    for hh in 0..nh {
+                        let kvh = hh / groups;
+                        for (ti, tt) in (win_start..len).enumerate() {
+                            keys[ti * hd..ti * hd + hd].copy_from_slice(
+                                &kc[tt * kv_dim + kvh * hd..tt * kv_dim + kvh * hd + hd],
+                            );
+                            vals[ti * hd..ti * hd + hd].copy_from_slice(
+                                &vc[tt * kv_dim + kvh * hd..tt * kv_dim + kvh * hd + hd],
+                            );
+                        }
+                        let mut oh = vec![0.0f32; hd];
+                        crate::attention::sdpa_single(
+                            &mut oh,
+                            &q[t * q_dim + hh * hd..t * q_dim + hh * hd + hd],
+                            &keys,
+                            &vals,
+                            hd,
+                            wlen,
+                            scale,
+                            &mut scratch,
+                        );
+                        ao[hh * hd..hh * hd + hd].copy_from_slice(&oh);
+                    }
+                });
+            {
+                let wo = self.w(&b("attn_output.weight"))?;
+                qmatmul_batch(&mut o, &attn_out, m, wo.bytes, wo.ty, q_dim, hidden);
+            }
+            for i in 0..m * hidden {
+                h[i] += o[i];
+            }
+
+            // MoE: route per token, group tokens by expert, batch each expert's GEMMs.
+            let fnw = self.vecw(&b("ffn_norm.weight"))?;
+            for t in 0..m {
+                let (hs, ns) = (&h[t * hidden..(t + 1) * hidden], &mut n[t * hidden..(t + 1) * hidden]);
+                rmsnorm(ns, hs, &fnw, eps);
+            }
+            let ne = cfg.n_expert;
+            let topk = cfg.n_expert_used;
+            let eff = cfg.expert_ff;
+            let wgi = self.w(&b("ffn_gate_inp.weight"))?;
+            let mut rl = vec![0.0f32; m * ne];
+            qmatmul_batch(&mut rl, &n, m, wgi.bytes, wgi.ty, hidden, ne);
+            // per-token top-k (same math as moe())
+            let mut routes: Vec<Vec<(usize, f32)>> = Vec::with_capacity(m);
+            for t in 0..m {
+                let logits = &rl[t * ne..(t + 1) * ne];
+                let mx = logits.iter().cloned().fold(f32::MIN, f32::max);
+                let mut probs: Vec<f32> = logits.iter().map(|&l| (l - mx).exp()).collect();
+                let sum: f32 = probs.iter().sum();
+                for p in probs.iter_mut() {
+                    *p /= sum;
+                }
+                let mut idx: Vec<usize> = (0..ne).collect();
+                idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+                idx.truncate(topk);
+                let wsum: f32 = idx.iter().map(|&e| probs[e]).sum();
+                routes.push(idx.into_iter().map(|e| (e, probs[e] / wsum)).collect());
+            }
+            // group (token, slot) by expert
+            let mut by_exp: Vec<Vec<(usize, usize)>> = vec![Vec::new(); ne];
+            for (t, route) in routes.iter().enumerate() {
+                for (s, &(e, _)) in route.iter().enumerate() {
+                    by_exp[e].push((t, s));
+                }
+            }
+            let wge = self.w(&b("ffn_gate_exps.weight"))?;
+            let wue = self.w(&b("ffn_up_exps.weight"))?;
+            let wde = self.w(&b("ffn_down_exps.weight"))?;
+            let g_bpr = (hidden / wge.ty.block_elems()) * wge.ty.block_bytes() * eff;
+            let u_bpr = (hidden / wue.ty.block_elems()) * wue.ty.block_bytes() * eff;
+            let d_bpr = (eff / wde.ty.block_elems()) * wde.ty.block_bytes() * hidden;
+            // dy[t][slot] holds the down-output for token t's slot-th routed expert
+            let mut dy = vec![0.0f32; m * topk * hidden];
+            for (e, list) in by_exp.iter().enumerate() {
+                if list.is_empty() {
+                    continue;
+                }
+                let me = list.len();
+                let mut xs = vec![0.0f32; me * hidden];
+                for (i, &(t, _)) in list.iter().enumerate() {
+                    xs[i * hidden..(i + 1) * hidden].copy_from_slice(&n[t * hidden..(t + 1) * hidden]);
+                }
+                let mut g = vec![0.0f32; me * eff];
+                let mut u = vec![0.0f32; me * eff];
+                qmatmul_batch(&mut g, &xs, me, &wge.bytes[e * g_bpr..(e + 1) * g_bpr], wge.ty, hidden, eff);
+                qmatmul_batch(&mut u, &xs, me, &wue.bytes[e * u_bpr..(e + 1) * u_bpr], wue.ty, hidden, eff);
+                let mut act = vec![0.0f32; me * eff];
+                for i in 0..me * eff {
+                    act[i] = silu(g[i]) * u[i];
+                }
+                let mut d = vec![0.0f32; me * hidden];
+                qmatmul_batch(&mut d, &act, me, &wde.bytes[e * d_bpr..(e + 1) * d_bpr], wde.ty, eff, hidden);
+                for (i, &(t, s)) in list.iter().enumerate() {
+                    dy[(t * topk + s) * hidden..(t * topk + s + 1) * hidden]
+                        .copy_from_slice(&d[i * hidden..(i + 1) * hidden]);
+                }
+            }
+            // per-token accumulate in routed order into a zeroed buffer, then add to h
+            // (exactly moe()'s float association: out = Σ w·d, then h + out).
+            for (t, route) in routes.iter().enumerate() {
+                let mut out = vec![0.0f32; hidden];
+                for (s, &(_, w)) in route.iter().enumerate() {
+                    let dys = &dy[(t * topk + s) * hidden..(t * topk + s + 1) * hidden];
+                    for i in 0..hidden {
+                        out[i] += w * dys[i];
+                    }
+                }
+                let hrow = &mut h[t * hidden..(t + 1) * hidden];
+                for i in 0..hidden {
+                    hrow[i] += out[i];
+                }
+            }
+        }
+        self.pos += m;
+
+        // lm_head on the last token only
+        let on = self.vecw("output_norm.weight")?;
+        let mut nh_ = vec![0.0f32; hidden];
+        rmsnorm(&mut nh_, &h[(m - 1) * hidden..m * hidden], &on, eps);
+        let (head_key, head) = if self.gguf.tensors().contains_key("output.weight") {
+            ("output.weight", self.w("output.weight")?)
+        } else {
+            ("token_embd.weight", self.w("token_embd.weight")?)
+        };
+        let mut logits = vec![0.0f32; cfg.vocab];
+        let mut row = vec![0.0f32; 8192];
+        self.mm(head_key, &mut logits, &nh_, &head, &mut row);
+        Ok(logits)
     }
 
     fn forward(&mut self, token: u32, want_logits: bool) -> Result<Option<Vec<f32>>> {
@@ -668,14 +932,18 @@ impl Decoder for MellumModel {
             return Err(StrixError::invalid("mellum prefill: empty"));
         }
         self.reset();
-        for (i, &t) in tokens.iter().enumerate() {
-            let last = i == tokens.len() - 1;
-            let o = self.forward(t, last)?;
-            if last {
-                return Ok(Logits::new(o.unwrap()));
+        // STRIX_NO_BATCH_PREFILL forces the token-at-a-time reference path.
+        if std::env::var("STRIX_NO_BATCH_PREFILL").is_ok() {
+            for (i, &t) in tokens.iter().enumerate() {
+                let last = i == tokens.len() - 1;
+                let o = self.forward(t, last)?;
+                if last {
+                    return Ok(Logits::new(o.unwrap()));
+                }
             }
+            unreachable!()
         }
-        unreachable!()
+        Ok(Logits::new(self.prefill_batch(tokens)?))
     }
 
     fn decode_one(&mut self, token: u32) -> Result<Logits> {
