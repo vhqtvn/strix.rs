@@ -859,46 +859,48 @@ impl Qwen35Model {
                 l2norm(&mut kn[kh * s_v..kh * s_v + s_v], cfg.rms_eps);
             }
             let scale = 1.0 / (s_v as f32).sqrt();
+            // v-heads are independent: scan all 32 in parallel (state slices disjoint).
             let st_all = &mut self.ssm[il];
             let mut core = vec![0.0f32; value_dim];
-            for vh in 0..n_vh {
-                let kh = vh % n_kh;
-                let qh = &qn[kh * s_v..kh * s_v + s_v];
-                let kk = &kn[kh * s_v..kh * s_v + s_v];
-                let vv = &v[vh * s_v..vh * s_v + s_v];
-                let g = ssm_a[vh] * softplus(alpha_raw[t * n_vh + vh] + ssm_dt[vh]);
-                let betah = sigmoid(beta_raw[t * n_vh + vh]);
-                let decay = g.exp();
-                let st = &mut st_all[vh * s_v * s_v..vh * s_v * s_v + s_v * s_v];
-                for xx in st.iter_mut() {
-                    *xx *= decay;
-                }
-                let mut delta = vec![0.0f32; s_v];
-                for j in 0..s_v {
-                    let rowj = &st[j * s_v..j * s_v + s_v];
-                    let mut sum = 0.0f32;
-                    for i in 0..s_v {
-                        sum += rowj[i] * kk[i];
+            core.par_chunks_mut(s_v)
+                .zip(st_all.par_chunks_mut(s_v * s_v))
+                .enumerate()
+                .for_each(|(vh, (outh, st))| {
+                    let kh = vh % n_kh;
+                    let qh = &qn[kh * s_v..kh * s_v + s_v];
+                    let kk = &kn[kh * s_v..kh * s_v + s_v];
+                    let vv = &v[vh * s_v..vh * s_v + s_v];
+                    let g = ssm_a[vh] * softplus(alpha_raw[t * n_vh + vh] + ssm_dt[vh]);
+                    let betah = sigmoid(beta_raw[t * n_vh + vh]);
+                    let decay = g.exp();
+                    for xx in st.iter_mut() {
+                        *xx *= decay;
                     }
-                    delta[j] = (vv[j] - sum) * betah;
-                }
-                for j in 0..s_v {
-                    let dj = delta[j];
-                    let rowj = &mut st[j * s_v..j * s_v + s_v];
-                    for i in 0..s_v {
-                        rowj[i] += dj * kk[i];
+                    let mut delta = vec![0.0f32; s_v];
+                    for j in 0..s_v {
+                        let rowj = &st[j * s_v..j * s_v + s_v];
+                        let mut sum = 0.0f32;
+                        for i in 0..s_v {
+                            sum += rowj[i] * kk[i];
+                        }
+                        delta[j] = (vv[j] - sum) * betah;
                     }
-                }
-                let outh = &mut core[vh * s_v..vh * s_v + s_v];
-                for j in 0..s_v {
-                    let rowj = &st[j * s_v..j * s_v + s_v];
-                    let mut sum = 0.0f32;
-                    for i in 0..s_v {
-                        sum += rowj[i] * qh[i];
+                    for j in 0..s_v {
+                        let dj = delta[j];
+                        let rowj = &mut st[j * s_v..j * s_v + s_v];
+                        for i in 0..s_v {
+                            rowj[i] += dj * kk[i];
+                        }
                     }
-                    outh[j] = sum * scale;
-                }
-            }
+                    for j in 0..s_v {
+                        let rowj = &st[j * s_v..j * s_v + s_v];
+                        let mut sum = 0.0f32;
+                        for i in 0..s_v {
+                            sum += rowj[i] * qh[i];
+                        }
+                        outh[j] = sum * scale;
+                    }
+                });
             for vh in 0..n_vh {
                 let mut tmp = vec![0.0f32; s_v];
                 rmsnorm(&mut tmp, &core[vh * s_v..vh * s_v + s_v], &ssm_norm, cfg.rms_eps);
