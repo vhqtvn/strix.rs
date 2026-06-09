@@ -184,6 +184,36 @@ fn read_f16(b: &[u8]) -> f32 {
     f16::from_le_bytes([b[0], b[1]]).to_f32()
 }
 
+/// Quantize `f32` values to GGML Q4_0 blocks (32 vals → [f16 d][16 nibble bytes]),
+/// matching `ggml_quantize_row_q4_0`. `n_elements` must be a multiple of 32.
+/// Used to build a lighter Q4_0 lm_head from a Q6_K tied embedding.
+pub fn quantize_q4_0(x: &[f32]) -> Vec<u8> {
+    const QK: usize = 32;
+    assert!(x.len() % QK == 0, "quantize_q4_0: len not multiple of 32");
+    let mut out = Vec::with_capacity((x.len() / QK) * 18);
+    for blk in x.chunks_exact(QK) {
+        // amax = element with the largest absolute value (signed), per ggml.
+        let mut amax = 0.0f32;
+        let mut vmax = 0.0f32;
+        for &v in blk {
+            if v.abs() > amax {
+                amax = v.abs();
+                vmax = v;
+            }
+        }
+        let d = vmax / -8.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        out.extend_from_slice(&f16::from_f32(d).to_le_bytes());
+        // nibble j packs x[j] (low) and x[j+16] (high).
+        for j in 0..16 {
+            let q0 = (((blk[j] * id) + 8.5) as i32).clamp(0, 15) as u8;
+            let q1 = (((blk[j + 16] * id) + 8.5) as i32).clamp(0, 15) as u8;
+            out.push(q0 | (q1 << 4));
+        }
+    }
+    out
+}
+
 /// Q8_0: [f16 d][32×i8 q]; y = d * q.
 fn dequant_q8_0(bytes: &[u8], out: &mut [f32]) {
     for (blk, ob) in bytes.chunks_exact(34).zip(out.chunks_mut(32)) {

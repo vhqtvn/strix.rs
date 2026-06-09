@@ -439,7 +439,23 @@ impl GemmaModel {
                     accel.upload_q4_0(name, bytes, in_dim, out_dim);
                 }
                 GgmlType::Q6K => {
-                    accel.upload_q6_k(name, bytes, in_dim, out_dim);
+                    // STRIX_Q4_LM_HEAD: requantize the tied lm_head Q6_K → Q4_0 to
+                    // cut its per-token weight read ~30% (826→566 MB). The GPU Q6
+                    // token_embd is used ONLY for lm_head (embeddings are dequantized
+                    // CPU-side from the gguf), so this needs no extra Q6 copy. Done
+                    // row-by-row to avoid a full-tensor f32 materialization.
+                    if name == "token_embd.weight" && std::env::var("STRIX_Q4_LM_HEAD").is_ok() {
+                        let mut q4 = Vec::with_capacity(out_dim * (in_dim / 32) * 18);
+                        let mut row = vec![0.0f32; in_dim];
+                        for r in 0..out_dim {
+                            if dequant_row(bytes, ty, r, in_dim, &mut row).is_ok() {
+                                q4.extend_from_slice(&strix_models::quantize_q4_0(&row));
+                            }
+                        }
+                        accel.upload_q4_0(name, &q4, in_dim, out_dim);
+                    } else {
+                        accel.upload_q6_k(name, bytes, in_dim, out_dim);
+                    }
                 }
                 _ => {}
             }

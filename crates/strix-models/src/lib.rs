@@ -12,7 +12,7 @@ pub mod inspect;
 pub mod safetensors_loader;
 pub mod tokenizer;
 
-pub use ggml_quant::{dequantize, dequantize_into, GgmlType};
+pub use ggml_quant::{dequantize, dequantize_into, quantize_q4_0, GgmlType};
 pub use hf_config::HfConfig;
 pub use inspect::{inspect_model, ModelInspection, WeightFormat};
 pub use safetensors_loader::{load_safetensors, RawTensor, TensorMap};
