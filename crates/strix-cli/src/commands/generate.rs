@@ -118,6 +118,72 @@ fn find_gguf(model: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Qwen3.5/3.6-MoE (`qwen35moe`) CPU-reference path. Hybrid Gated-DeltaNet + full
+/// GQA attention + top-8 MoE w/ shared expert (see docs/qwen36-arch.md).
+///
+/// `StrixTokenizer` is Unigram-only and can't tokenize Qwen's gpt2-BPE vocab, so
+/// this path takes **raw token IDs** via `STRIX_QWEN_IDS` (comma/space separated)
+/// for now — used to validate the forward against a llama.cpp golden. If unset, it
+/// falls back to the `prompt` string parsed as whitespace/comma-separated IDs.
+fn run_qwen35(gguf: GgufFile, prompt: &str, max_tokens: usize) -> Result<()> {
+    use strix_backend_cpu::qwen35::Qwen35Model;
+
+    let id_src = std::env::var("STRIX_QWEN_IDS").unwrap_or_else(|_| prompt.to_string());
+    let prompt_ids: Vec<u32> = id_src
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<u32>())
+        .collect::<std::result::Result<_, _>>()
+        .context(
+            "qwen35moe needs raw token IDs (StrixTokenizer can't do gpt2-BPE). \
+             Set STRIX_QWEN_IDS=\"1,2,3\" or pass IDs as the prompt.",
+        )?;
+    if prompt_ids.is_empty() {
+        anyhow::bail!("qwen35moe: no token IDs given (set STRIX_QWEN_IDS)");
+    }
+
+    let load_start = Instant::now();
+    let mut model = Qwen35Model::from_gguf(gguf).context("build qwen35 model")?;
+    eprintln!(
+        "[qwen35moe] model built in {:.1}s, prompt = {} tokens",
+        load_start.elapsed().as_secs_f64(),
+        prompt_ids.len()
+    );
+
+    let sampler = GreedySampler;
+    let prefill_start = Instant::now();
+    let logits = model.prefill(&prompt_ids).context("qwen35 prefill")?;
+    let prefill_secs = prefill_start.elapsed().as_secs_f64();
+    let mut next = sampler.sample(&logits)?;
+
+    // Show the top-5 next-token logits for the prompt (sanity vs llama.cpp).
+    let mut top: Vec<(usize, f32)> = logits.0.iter().cloned().enumerate().collect();
+    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    eprintln!("[qwen35moe] prompt next-token top5:");
+    for &(id, l) in top.iter().take(5) {
+        eprintln!("    id={id:<8} logit={l:.4}");
+    }
+
+    let mut generated: Vec<u32> = vec![next];
+    let decode_start = Instant::now();
+    for _ in 1..max_tokens {
+        let l = model.decode_one(next).context("qwen35 decode")?;
+        next = sampler.sample(&l)?;
+        generated.push(next);
+    }
+    let decode_secs = decode_start.elapsed().as_secs_f64();
+
+    let ids_str: Vec<String> = generated.iter().map(|t| t.to_string()).collect();
+    println!("[qwen35moe] generated token IDs: {}", ids_str.join(","));
+    eprintln!(
+        "[qwen35moe] prefill {:.1} tok/s ({} tok in {prefill_secs:.2}s) | decode {:.2} tok/s",
+        prompt_ids.len() as f64 / prefill_secs,
+        prompt_ids.len(),
+        (max_tokens.saturating_sub(1)) as f64 / decode_secs.max(1e-9),
+    );
+    Ok(())
+}
+
 /// GGUF/Gemma path: tokenizer + config + quantized weights all from the GGUF.
 fn run_gguf(path: &Path, prompt: &str, max_tokens: usize, chat: bool, gpu: bool) -> Result<()> {
     let total_start = Instant::now();
@@ -131,16 +197,7 @@ fn run_gguf(path: &Path, prompt: &str, max_tokens: usize, chat: bool, gpu: bool)
     // validate tensors. Forward not yet implemented (hybrid Gated-DeltaNet/MoE,
     // see docs/qwen36-arch.md). Reports and exits rather than failing in GemmaModel.
     if arch == "qwen35moe" {
-        match strix_backend_cpu::qwen35::p0_validate(&gguf) {
-            Ok((_cfg, report)) => {
-                println!("[qwen35moe P0] config parsed + all tensors validated ✓\n{report}");
-                println!("[qwen35moe P0] forward NOT yet implemented (P1 MoE → P2 attn → P3 gated-deltanet).");
-                return Ok(());
-            }
-            Err(e) => {
-                anyhow::bail!("qwen35moe P0 validation failed:\n{e}");
-            }
-        }
+        return run_qwen35(gguf, prompt, max_tokens);
     }
 
     let tokenizer = StrixTokenizer::from_gguf(&gguf).context("build tokenizer from gguf")?;
