@@ -7,6 +7,7 @@
 //! P0 only parses the architecture + verifies all expected tensors are present
 //! (with correct shapes). The forward (P1 MoE, P2 attn, P3 gated-deltanet) is TODO.
 
+use rayon::prelude::*;
 use strix_core::backend::Decoder;
 use strix_core::error::{Result, StrixError};
 use strix_core::sampler::Logits;
@@ -267,17 +268,21 @@ fn partial_rope(vec: &mut [f32], pos: usize, freq_base: f32, n_rot: usize) {
 
 /// On-the-fly dequant matmul: out[o] = sum_i W[o][i]*x[i]. `bytes` = a weight whose
 /// rows are `in_dim` elements each (gguf dims [in_dim, out_dim]); out.len() = out_dim.
-fn qmatmul(out: &mut [f32], x: &[f32], bytes: &[u8], ty: GgmlType, in_dim: usize, row: &mut [f32]) {
+fn qmatmul(out: &mut [f32], x: &[f32], bytes: &[u8], ty: GgmlType, in_dim: usize, _row: &mut [f32]) {
     let bpr = (in_dim / ty.block_elems()) * ty.block_bytes();
-    let row = &mut row[..in_dim];
-    for (o, oref) in out.iter_mut().enumerate() {
-        dequantize_into(ty, &bytes[o * bpr..o * bpr + bpr], row).unwrap();
-        let mut s = 0.0f32;
-        for i in 0..in_dim {
-            s += row[i] * x[i];
-        }
-        *oref = s;
-    }
+    // Rows are independent: parallelize across cores with per-thread dequant scratch
+    // (the `_row` arg is kept for call-site compatibility but no longer used).
+    out.par_iter_mut().enumerate().for_each_init(
+        || vec![0.0f32; in_dim],
+        |scratch, (o, oref)| {
+            dequantize_into(ty, &bytes[o * bpr..o * bpr + bpr], scratch).unwrap();
+            let mut s = 0.0f32;
+            for i in 0..in_dim {
+                s += scratch[i] * x[i];
+            }
+            *oref = s;
+        },
+    );
 }
 
 /// A resolved weight: raw bytes + ggml type + the row length (in_dim).
