@@ -1695,9 +1695,11 @@ impl WeightAccel for RocmWeightAccel {
                             .i(n_heads as i32)
                             .i(if self.kv_f16 { 1 } else { 0 }),
                     );
-                } else if std::env::var("STRIX_WMMA_SDPA").is_ok() {
+                } else if std::env::var("STRIX_WMMA_SDPA").is_ok() && hd <= 256 {
                     // WMMA (matrix-core) flash attention: NW waves/block share one K/V
                     // tile; each wave owns a 16-query sub-tile. shared = K,V + per-wave Q,S,P.
+                    // Gated to hd<=256: dchunks=hd/16<=MAXDC(16) and shared stays <64KB.
+                    // Gemma global layers (hd=512) fall through to the scalar path below.
                     let n_swa = if lc.is_local { cfg.n_swa as i32 } else { 0 };
                     let nw = std::env::var("STRIX_WMMA_NW").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(4).clamp(1, 4);
                     let shbytes = (64 * hd + 32 * nw * hd + 1664 * nw) as u32;
