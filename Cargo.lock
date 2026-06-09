@@ -1339,6 +1339,7 @@ name = "strix-backend-cpu"
 version = "0.0.1"
 dependencies = [
  "rayon",
+ "strix-backend-npu",
  "strix-core",
  "strix-models",
  "tracing",
