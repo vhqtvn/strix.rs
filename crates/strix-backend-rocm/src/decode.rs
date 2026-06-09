@@ -645,6 +645,31 @@ impl RocmWeightAccel {
                 Err(e) => eprintln!("npu: og open failed ({xclbin}): {e}"),
             }
         }
+
+        // STRIX_NPU_ROOFLINE: standalone per-shape NPU GEMM roofline (idea #26).
+        // Decides whether int4-on-AIE (#13) is worth building — only memory-bound
+        // shapes benefit. NPU-only (<2 W), safe to run sustained.
+        if std::env::var("STRIX_NPU_ROOFLINE").is_ok() {
+            let reps: usize = std::env::var("STRIX_NPU_ROOFLINE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|&r| r > 1)
+                .unwrap_or(50);
+            for (label, ffn) in [
+                ("ffn_up", &self.npu),
+                ("ffn_down", &self.npu_down),
+                ("attn_o", &self.npu_o),
+                ("attn_q", &self.npu_q),
+                ("attn_q_g", &self.npu_q_g),
+                ("attn_o_g", &self.npu_o_g),
+            ] {
+                if let Some(f) = ffn {
+                    if let Some((wid, _)) = f.layer(0) {
+                        f.roofline(label, wid, reps);
+                    }
+                }
+            }
+        }
     }
 }
 

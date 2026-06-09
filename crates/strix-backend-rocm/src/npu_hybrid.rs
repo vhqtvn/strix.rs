@@ -154,6 +154,38 @@ impl NpuFfn {
         }
         self.gemm.wait()
     }
+
+    /// Standalone NPU GEMM roofline (idea prefill-#26): run `reps` isolated
+    /// start+wait of this M=256 × K × n_npu shape and report achieved TOPS / BW /
+    /// arithmetic-intensity, classifying compute- vs memory-bound. This is the
+    /// decisive test for int4-on-AIE (#13): only a MEMORY-bound shape benefits from
+    /// halving the B (weight) bytes. NPU-only (~<2 W) → safe to run sustained.
+    pub fn roofline(&self, label: &str, wid: i32, reps: usize) {
+        // warm up (first run pays setup) then time the steady-state.
+        let _ = self.start(wid).and_then(|_| self.wait());
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            if self.start(wid).and_then(|_| self.wait()).is_err() {
+                eprintln!("[npu-roofline {label}] run failed");
+                return;
+            }
+        }
+        let t = t0.elapsed().as_secs_f64() / reps as f64;
+        let (m, k, n) = (MPAD as f64, self.k as f64, self.n_npu as f64);
+        let ops = 2.0 * m * k * n; // MAC = 2 flops
+        // int8 A (m·k) + int8 B (k·n) + int32 C (m·n·4)
+        let bytes = m * k + k * n + m * n * 4.0;
+        let tops = ops / t / 1e12;
+        let bw = bytes / t / 1e9;
+        let ai = ops / bytes;
+        // ~50 TOPS int8 peak, ~60 GB/s NPU bandwidth (measured, see memory).
+        let bound = if tops / 50.0 > bw / 60.0 { "COMPUTE" } else { "MEMORY" };
+        eprintln!(
+            "[npu-roofline {label}] M=256 K={} N={} | {:.3} ms/run | {:.1} TOPS ({:.0}%) | {:.1} GB/s ({:.0}%) | AI={:.1} | {}-bound{}",
+            self.k, self.n_npu, t * 1e3, tops, tops / 50.0 * 100.0, bw, bw / 60.0 * 100.0, ai, bound,
+            if bound == "MEMORY" { " (int4 weights WOULD help)" } else { " (int4 weights would NOT help)" }
+        );
+    }
 }
 
 // --- NPU coordination timing (gated by STRIX_NPU_TIMING; does NOT add syncs,
