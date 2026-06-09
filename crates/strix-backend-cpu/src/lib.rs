@@ -10,6 +10,8 @@ pub mod gemma;
 pub mod kv_cache;
 pub mod llama;
 pub mod mellum;
+#[cfg(feature = "npu")]
+pub mod mellum_npu;
 pub mod ops;
 pub mod qwen35;
 

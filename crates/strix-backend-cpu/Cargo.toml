@@ -12,3 +12,8 @@ strix-core.workspace = true
 strix-models.workspace = true
 tracing.workspace = true
 rayon.workspace = true
+strix-backend-npu = { workspace = true, optional = true }
+
+[features]
+# NPU prefill offload for the CPU MoE forwards (links XRT via strix-backend-npu).
+npu = ["dep:strix-backend-npu", "strix-backend-npu/ryzen-ai"]

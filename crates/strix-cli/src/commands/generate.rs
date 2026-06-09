@@ -264,6 +264,30 @@ fn run_mellum(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Res
         prompt_ids.len()
     );
 
+    // NPU prefill offload (feature npu-cpu + STRIX_NPU=1): stages dense q/o + experts
+    // (cap STRIX_NPU_EXPERT_LAYERS) onto the XDNA2 NPU as per-channel int8. CPU-driven,
+    // zero iGPU involvement — fits the min-iGPU posture. xclbin dir via STRIX_NPU_DIR.
+    #[cfg(feature = "npu-cpu")]
+    if std::env::var("STRIX_NPU").is_ok() {
+        let dir = std::env::var("STRIX_NPU_DIR").unwrap_or_else(|_| {
+            "external/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build"
+                .into()
+        });
+        match strix_backend_cpu::mellum_npu::MellumNpu::open(&dir) {
+            Ok(npu) => {
+                let t = Instant::now();
+                match model.attach_npu(npu) {
+                    Ok(n) => eprintln!(
+                        "[mellum] {n} weights staged on NPU ({:.1}s)",
+                        t.elapsed().as_secs_f64()
+                    ),
+                    Err(e) => eprintln!("[mellum] NPU staging failed: {e}"),
+                }
+            }
+            Err(e) => eprintln!("[mellum] NPU open failed ({dir}): {e}"),
+        }
+    }
+
     // --gpu: Mellum is all-Q8_0 → needs the ROCm accel (STRIX_ROCM=1; Vulkan adopts
     // nothing). Uploads dense q/k/v/o + output + per-expert slices (cap via
     // STRIX_GPU_EXPERT_LAYERS). 12B fits resident, unlike the 35B.

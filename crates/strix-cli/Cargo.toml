@@ -33,3 +33,4 @@ vulkan = ["strix-backend-vulkan/vulkan", "strix-backend-vulkan/ash"]
 rocm = ["strix-backend-rocm/rocm"]  # ROCm/HIP backend (Radeon 890M, gfx1150)
 ryzen-ai = ["strix-backend-npu/ryzen-ai"]  # XDNA2 NPU via XRT
 npu-hybrid = ["rocm", "strix-backend-rocm/npu"]  # NPU+iGPU concurrent prefill
+npu-cpu = ["strix-backend-cpu/npu"]  # NPU prefill offload for CPU MoE forwards (no iGPU)
