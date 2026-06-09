@@ -409,40 +409,93 @@ impl Qwen35Model {
             names.push("output.weight".to_string());
         }
         let mut n = 0usize;
+        let mut up = |accel: &mut Box<dyn strix_core::WeightAccel>,
+                      key: &str,
+                      bytes: &[u8],
+                      ty: GgmlType,
+                      in_dim: usize,
+                      out_dim: usize| {
+            let ok = match ty {
+                GgmlType::Q4_0 => accel.upload_q4_0(key, bytes, in_dim, out_dim),
+                GgmlType::Q6K => accel.upload_q6_k(key, bytes, in_dim, out_dim),
+                _ => false, // Q8_0 (dense, in UD quant) not supported yet — stays CPU
+            };
+            if ok {
+                n += 1;
+            }
+        };
         for name in &names {
             let Some(ti) = self.gguf.tensors().get(name) else {
                 continue;
             };
             let (ty, in_dim) = (ti.ggml_type, ti.dims[0] as usize);
             let out_dim: usize = ti.dims[1..].iter().map(|&d| d as usize).product();
-            let Ok(bytes) = self.gguf.tensor_bytes(name) else {
-                continue;
-            };
-            let ok = match ty {
-                GgmlType::Q4_0 => accel.upload_q4_0(name, bytes, in_dim, out_dim),
-                GgmlType::Q6K => accel.upload_q6_k(name, bytes, in_dim, out_dim),
-                _ => false,
-            };
-            if ok {
-                n += 1;
+            if let Ok(bytes) = self.gguf.tensor_bytes(name) {
+                up(&mut accel, name, bytes, ty, in_dim, out_dim);
+            }
+        }
+        // MoE experts (P2): the bulk of the model. Each 3D `ffn_*_exps` tensor is
+        // [in, ff, n_expert]; expert e is a contiguous byte slice = a 2D [out,in]
+        // weight. Upload each Q6_K expert slice under `<tensor>.e{e}` so the MoE loop
+        // can gemv it by key. (Layers whose exps tensor is Q8_0 fall through to CPU.)
+        let hidden = self.cfg.hidden;
+        let eff = self.cfg.expert_ff;
+        let ne = self.cfg.n_expert;
+        for il in 0..self.cfg.n_layer {
+            for (tname, in_dim, out_dim) in [
+                ("ffn_gate_exps", hidden, eff),
+                ("ffn_up_exps", hidden, eff),
+                ("ffn_down_exps", eff, hidden),
+            ] {
+                let full = format!("blk.{il}.{tname}.weight");
+                let Some(ti) = self.gguf.tensors().get(&full) else {
+                    continue;
+                };
+                let ty = ti.ggml_type;
+                if ty != GgmlType::Q6K && ty != GgmlType::Q4_0 {
+                    continue; // e.g. a few Q8_0 ffn_down layers → CPU
+                }
+                let bpr = (in_dim / ty.block_elems()) * ty.block_bytes() * out_dim;
+                let Ok(bytes) = self.gguf.tensor_bytes(&full) else {
+                    continue;
+                };
+                for e in 0..ne {
+                    let slice = &bytes[e * bpr..(e + 1) * bpr];
+                    up(
+                        &mut accel,
+                        &format!("blk.{il}.{tname}.e{e}"),
+                        slice,
+                        ty,
+                        in_dim,
+                        out_dim,
+                    );
+                }
             }
         }
         self.accel = Some(accel);
         n
     }
 
-    /// Matmul `out = W·x` for weight `key`: GPU gemv if the accelerator adopted it,
-    /// else the CPU path. With no accelerator this is exactly `qmatmul`.
-    fn mm(&self, key: &str, out: &mut [f32], x: &[f32], w: &W<'_>, row: &mut [f32]) {
+    /// Try the GPU gemv for `key` into `out`; returns true if the accelerator adopted
+    /// the weight and produced a correctly-sized result. False ⇒ caller does the CPU path.
+    fn try_gemv(&self, key: &str, x: &[f32], out: &mut [f32]) -> bool {
         if let Some(a) = &self.accel {
             if let Some(y) = a.gemv(key, x) {
                 if y.len() == out.len() {
                     out.copy_from_slice(&y);
-                    return;
+                    return true;
                 }
             }
         }
-        qmatmul(out, x, w.bytes, w.ty, w.in_dim, row);
+        false
+    }
+
+    /// Matmul `out = W·x` for weight `key`: GPU gemv if the accelerator adopted it,
+    /// else the CPU path. With no accelerator this is exactly `qmatmul`.
+    fn mm(&self, key: &str, out: &mut [f32], x: &[f32], w: &W<'_>, row: &mut [f32]) {
+        if !self.try_gemv(key, x, out) {
+            qmatmul(out, x, w.bytes, w.ty, w.in_dim, row);
+        }
     }
 
     fn w(&self, name: &str) -> Result<W<'_>> {
@@ -801,15 +854,23 @@ impl Qwen35Model {
         let mut dy = vec![0.0f32; hidden];
         for &e in &idx {
             let wexp = probs[e] / wsum;
-            let ge = &wge.bytes[e * gate_bpr..(e + 1) * gate_bpr];
-            let ue = &wue.bytes[e * up_bpr..(e + 1) * up_bpr];
-            let de = &wde.bytes[e * down_bpr..(e + 1) * down_bpr];
-            qmatmul(&mut g, x, ge, wge.ty, hidden, row);
-            qmatmul(&mut u, x, ue, wue.ty, hidden, row);
+            // GPU gemv per expert slice (key `blk.{il}.ffn_*_exps.e{e}`) if resident,
+            // else CPU on the byte slice. Experts are the bulk of decode compute.
+            let gkey = format!("blk.{il}.ffn_gate_exps.e{e}");
+            if !self.try_gemv(&gkey, x, &mut g) {
+                qmatmul(&mut g, x, &wge.bytes[e * gate_bpr..(e + 1) * gate_bpr], wge.ty, hidden, row);
+            }
+            let ukey = format!("blk.{il}.ffn_up_exps.e{e}");
+            if !self.try_gemv(&ukey, x, &mut u) {
+                qmatmul(&mut u, x, &wue.bytes[e * up_bpr..(e + 1) * up_bpr], wue.ty, hidden, row);
+            }
             for i in 0..eff {
                 act[i] = silu(g[i]) * u[i];
             }
-            qmatmul(&mut dy, &act, de, wde.ty, eff, row);
+            let dkey = format!("blk.{il}.ffn_down_exps.e{e}");
+            if !self.try_gemv(&dkey, &act, &mut dy) {
+                qmatmul(&mut dy, &act, &wde.bytes[e * down_bpr..(e + 1) * down_bpr], wde.ty, eff, row);
+            }
             for i in 0..hidden {
                 out[i] += wexp * dy[i];
             }
