@@ -241,7 +241,15 @@ fn qmatmul(
 /// not once per token — token-at-a-time prefill is dequant-bound (~99% of cost).
 /// xs: [m * in_dim] token-major; out: [m * out_dim]. Per-token dots are `dot_f32`,
 /// so each row's value is bit-identical to the token-at-a-time path.
-fn qmatmul_batch(out: &mut [f32], xs: &[f32], m: usize, bytes: &[u8], ty: GgmlType, in_dim: usize, out_dim: usize) {
+fn qmatmul_batch(
+    out: &mut [f32],
+    xs: &[f32],
+    m: usize,
+    bytes: &[u8],
+    ty: GgmlType,
+    in_dim: usize,
+    out_dim: usize,
+) {
     let bpr = (in_dim / ty.block_elems()) * ty.block_bytes();
     // Parallel over output rows; out[t*out_dim + o] strided writes per row, so write
     // into a row-major scratch [out_dim][m] then transpose at the end.
@@ -345,12 +353,26 @@ impl MellumModel {
         'stage: {
             for il in 0..nl {
                 let name = format!("blk.{il}.attn_q.weight");
-                let (Some(ti), Ok(bytes)) = (self.gguf.tensors().get(&name), self.gguf.tensor_bytes(&name)) else { continue };
-                if npu.q.stage_q8(il as u64, bytes, ti.ggml_type).is_err() { break 'stage; }
+                let (Some(ti), Ok(bytes)) = (
+                    self.gguf.tensors().get(&name),
+                    self.gguf.tensor_bytes(&name),
+                ) else {
+                    continue;
+                };
+                if npu.q.stage_q8(il as u64, bytes, ti.ggml_type).is_err() {
+                    break 'stage;
+                }
                 n += 1;
                 let name = format!("blk.{il}.attn_output.weight");
-                let (Some(ti), Ok(bytes)) = (self.gguf.tensors().get(&name), self.gguf.tensor_bytes(&name)) else { continue };
-                if npu.o.stage_q8(il as u64, bytes, ti.ggml_type).is_err() { break 'stage; }
+                let (Some(ti), Ok(bytes)) = (
+                    self.gguf.tensors().get(&name),
+                    self.gguf.tensor_bytes(&name),
+                ) else {
+                    continue;
+                };
+                if npu.o.stage_q8(il as u64, bytes, ti.ggml_type).is_err() {
+                    break 'stage;
+                }
                 n += 1;
             }
             let eff = self.cfg.expert_ff;
@@ -370,7 +392,12 @@ impl MellumModel {
                         let slot = (il as u64) << 16 | e as u64;
                         if npu
                             .gu2
-                            .stage_q8_pair(slot, &gb[e * bpr..(e + 1) * bpr], &ub[e * bpr..(e + 1) * bpr], ty)
+                            .stage_q8_pair(
+                                slot,
+                                &gb[e * bpr..(e + 1) * bpr],
+                                &ub[e * bpr..(e + 1) * bpr],
+                                ty,
+                            )
                             .is_err()
                         {
                             break 'stage;
@@ -379,12 +406,19 @@ impl MellumModel {
                     }
                 }
                 let dname = format!("blk.{il}.ffn_down_exps.weight");
-                if let (Some(ti), Ok(db)) = (self.gguf.tensors().get(&dname), self.gguf.tensor_bytes(&dname)) {
+                if let (Some(ti), Ok(db)) = (
+                    self.gguf.tensors().get(&dname),
+                    self.gguf.tensor_bytes(&dname),
+                ) {
                     let ty = ti.ggml_type;
                     let bpr = (eff / ty.block_elems()) * ty.block_bytes() * hidden;
                     for e in 0..ne {
                         let slot = (il as u64) << 16 | 2 << 8 | e as u64;
-                        if npu.down.stage_q8(slot, &db[e * bpr..(e + 1) * bpr], ty).is_err() {
+                        if npu
+                            .down
+                            .stage_q8(slot, &db[e * bpr..(e + 1) * bpr], ty)
+                            .is_err()
+                        {
                             break 'stage;
                         }
                         n += 1;
@@ -468,7 +502,14 @@ impl MellumModel {
                 let mut got = 0usize;
                 for e in 0..ne {
                     let slice = &bytes[e * bpr..(e + 1) * bpr];
-                    if up(&mut accel, &format!("blk.{il}.{tname}.e{e}"), slice, ty, in_dim, out_dim) {
+                    if up(
+                        &mut accel,
+                        &format!("blk.{il}.{tname}.e{e}"),
+                        slice,
+                        ty,
+                        in_dim,
+                        out_dim,
+                    ) {
                         got += 1;
                     }
                 }
@@ -543,7 +584,16 @@ impl MellumModel {
     /// NPU dense matmul for layer `il` (`which` 0 = attn_q, 1 = attn_output), chunked
     /// to the fixed M=256. Returns false (CPU fallback) if NPU absent / not staged.
     #[cfg(feature = "npu")]
-    fn npu_mm(&self, il: usize, which: u8, xs: &[f32], m: usize, k: usize, n: usize, out: &mut [f32]) -> bool {
+    fn npu_mm(
+        &self,
+        il: usize,
+        which: u8,
+        xs: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        out: &mut [f32],
+    ) -> bool {
         let Some(npu) = &self.npu else { return false };
         if m < crate::mellum_npu::M_MIN {
             return false; // per-call NPU latency dominates tiny chunks; CPU wins
@@ -554,20 +604,46 @@ impl MellumModel {
         }
         for c in (0..m).step_by(crate::mellum_npu::M_NPU) {
             let mc = (m - c).min(crate::mellum_npu::M_NPU);
-            if sh.gemm(il as u64, &xs[c * k..(c + mc) * k], mc, &mut out[c * n..(c + mc) * n]).is_err() {
+            if sh
+                .gemm(
+                    il as u64,
+                    &xs[c * k..(c + mc) * k],
+                    mc,
+                    &mut out[c * n..(c + mc) * n],
+                )
+                .is_err()
+            {
                 return false;
             }
         }
         true
     }
     #[cfg(not(feature = "npu"))]
-    fn npu_mm(&self, _il: usize, _w: u8, _xs: &[f32], _m: usize, _k: usize, _n: usize, _o: &mut [f32]) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    fn npu_mm(
+        &self,
+        _il: usize,
+        _w: u8,
+        _xs: &[f32],
+        _m: usize,
+        _k: usize,
+        _n: usize,
+        _o: &mut [f32],
+    ) -> bool {
         false
     }
 
     /// NPU expert matmul (gu shape unless `down`), chunked to M=256.
     #[cfg(feature = "npu")]
-    fn npu_exp(&self, down: bool, slot: u64, xs: &[f32], m: usize, n: usize, out: &mut [f32]) -> bool {
+    fn npu_exp(
+        &self,
+        down: bool,
+        slot: u64,
+        xs: &[f32],
+        m: usize,
+        n: usize,
+        out: &mut [f32],
+    ) -> bool {
         let Some(npu) = &self.npu else { return false };
         // experts see ~m·topk/n_expert rows; small lists are faster on CPU
         if m < 8 {
@@ -580,14 +656,30 @@ impl MellumModel {
         let k = sh.k;
         for c in (0..m).step_by(crate::mellum_npu::M_NPU) {
             let mc = (m - c).min(crate::mellum_npu::M_NPU);
-            if sh.gemm(slot, &xs[c * k..(c + mc) * k], mc, &mut out[c * n..(c + mc) * n]).is_err() {
+            if sh
+                .gemm(
+                    slot,
+                    &xs[c * k..(c + mc) * k],
+                    mc,
+                    &mut out[c * n..(c + mc) * n],
+                )
+                .is_err()
+            {
                 return false;
             }
         }
         true
     }
     #[cfg(not(feature = "npu"))]
-    fn npu_exp(&self, _d: bool, _s: u64, _xs: &[f32], _m: usize, _n: usize, _o: &mut [f32]) -> bool {
+    fn npu_exp(
+        &self,
+        _d: bool,
+        _s: u64,
+        _xs: &[f32],
+        _m: usize,
+        _n: usize,
+        _o: &mut [f32],
+    ) -> bool {
         false
     }
 
@@ -640,7 +732,10 @@ impl MellumModel {
             let b = |s: &str| format!("blk.{il}.{s}");
             let an = self.vecw(&b("attn_norm.weight"))?;
             for t in 0..m {
-                let (hs, ns) = (&h[t * hidden..(t + 1) * hidden], &mut n[t * hidden..(t + 1) * hidden]);
+                let (hs, ns) = (
+                    &h[t * hidden..(t + 1) * hidden],
+                    &mut n[t * hidden..(t + 1) * hidden],
+                );
                 rmsnorm(ns, hs, &an, eps);
             }
             {
@@ -668,14 +763,32 @@ impl MellumModel {
                     let mut tmp = vec![0.0f32; hd];
                     rmsnorm(&mut tmp, qh, &qn, eps);
                     qh.copy_from_slice(&tmp);
-                    rope_neox(qh, pos, cfg.n_rot, cfg.rope_freq_base, freq_scale, ext_factor, mscale, corr);
+                    rope_neox(
+                        qh,
+                        pos,
+                        cfg.n_rot,
+                        cfg.rope_freq_base,
+                        freq_scale,
+                        ext_factor,
+                        mscale,
+                        corr,
+                    );
                 }
                 for kh in 0..nkv {
                     let khv = &mut k[t * kv_dim + kh * hd..t * kv_dim + kh * hd + hd];
                     let mut tmp = vec![0.0f32; hd];
                     rmsnorm(&mut tmp, khv, &kn, eps);
                     khv.copy_from_slice(&tmp);
-                    rope_neox(khv, pos, cfg.n_rot, cfg.rope_freq_base, freq_scale, ext_factor, mscale, corr);
+                    rope_neox(
+                        khv,
+                        pos,
+                        cfg.n_rot,
+                        cfg.rope_freq_base,
+                        freq_scale,
+                        ext_factor,
+                        mscale,
+                        corr,
+                    );
                 }
             }
             self.kc[il].extend_from_slice(&k[..m * kv_dim]);
@@ -690,7 +803,8 @@ impl MellumModel {
                 .for_each(|(t, ao)| {
                     let pos = base + t;
                     let len = pos + 1;
-                    let win_start = if is_swa && cfg.sliding_window > 0 && len > cfg.sliding_window {
+                    let win_start = if is_swa && cfg.sliding_window > 0 && len > cfg.sliding_window
+                    {
                         len - cfg.sliding_window
                     } else {
                         0
@@ -734,7 +848,10 @@ impl MellumModel {
             // MoE: route per token, group tokens by expert, batch each expert's GEMMs.
             let fnw = self.vecw(&b("ffn_norm.weight"))?;
             for t in 0..m {
-                let (hs, ns) = (&h[t * hidden..(t + 1) * hidden], &mut n[t * hidden..(t + 1) * hidden]);
+                let (hs, ns) = (
+                    &h[t * hidden..(t + 1) * hidden],
+                    &mut n[t * hidden..(t + 1) * hidden],
+                );
                 rmsnorm(ns, hs, &fnw, eps);
             }
             let ne = cfg.n_expert;
@@ -782,7 +899,8 @@ impl MellumModel {
                 let me = list.len();
                 let mut xs = vec![0.0f32; me * hidden];
                 for (i, &(t, _)) in list.iter().enumerate() {
-                    xs[i * hidden..(i + 1) * hidden].copy_from_slice(&n[t * hidden..(t + 1) * hidden]);
+                    xs[i * hidden..(i + 1) * hidden]
+                        .copy_from_slice(&n[t * hidden..(t + 1) * hidden]);
                 }
                 let mut g = vec![0.0f32; me * eff];
                 let mut u = vec![0.0f32; me * eff];
@@ -793,7 +911,8 @@ impl MellumModel {
                     let mut gu = vec![0.0f32; me * 2 * eff];
                     if self.npu_exp(false, guslot, &xs, me, 2 * eff, &mut gu) {
                         for t in 0..me {
-                            g[t * eff..(t + 1) * eff].copy_from_slice(&gu[t * 2 * eff..t * 2 * eff + eff]);
+                            g[t * eff..(t + 1) * eff]
+                                .copy_from_slice(&gu[t * 2 * eff..t * 2 * eff + eff]);
                             u[t * eff..(t + 1) * eff]
                                 .copy_from_slice(&gu[t * 2 * eff + eff..(t + 1) * 2 * eff]);
                         }
@@ -802,8 +921,24 @@ impl MellumModel {
                     }
                 }
                 if !on_npu {
-                    qmatmul_batch(&mut g, &xs, me, &wge.bytes[e * g_bpr..(e + 1) * g_bpr], wge.ty, hidden, eff);
-                    qmatmul_batch(&mut u, &xs, me, &wue.bytes[e * u_bpr..(e + 1) * u_bpr], wue.ty, hidden, eff);
+                    qmatmul_batch(
+                        &mut g,
+                        &xs,
+                        me,
+                        &wge.bytes[e * g_bpr..(e + 1) * g_bpr],
+                        wge.ty,
+                        hidden,
+                        eff,
+                    );
+                    qmatmul_batch(
+                        &mut u,
+                        &xs,
+                        me,
+                        &wue.bytes[e * u_bpr..(e + 1) * u_bpr],
+                        wue.ty,
+                        hidden,
+                        eff,
+                    );
                 }
                 let mut act = vec![0.0f32; me * eff];
                 for i in 0..me * eff {
@@ -811,13 +946,25 @@ impl MellumModel {
                 }
                 let mut d = vec![0.0f32; me * hidden];
                 if !(on_npu && self.npu_exp(true, dslot, &act, me, hidden, &mut d)) {
-                    qmatmul_batch(&mut d, &act, me, &wde.bytes[e * d_bpr..(e + 1) * d_bpr], wde.ty, eff, hidden);
+                    qmatmul_batch(
+                        &mut d,
+                        &act,
+                        me,
+                        &wde.bytes[e * d_bpr..(e + 1) * d_bpr],
+                        wde.ty,
+                        eff,
+                        hidden,
+                    );
                 }
                 // scatter: dy slots are disjoint per (t,s)
                 for (i, &(t, s)) in list.iter().enumerate() {
                     let dst = (t * topk + s) * hidden;
                     unsafe {
-                        std::ptr::copy_nonoverlapping(d[i * hidden..].as_ptr(), dyp.0.add(dst), hidden)
+                        std::ptr::copy_nonoverlapping(
+                            d[i * hidden..].as_ptr(),
+                            dyp.0.add(dst),
+                            hidden,
+                        )
                     };
                 }
             };
@@ -833,7 +980,9 @@ impl MellumModel {
                     }
                 },
                 || {
-                    cpu_list.par_iter().for_each(|&e| run_expert(e, &by_exp[e], false));
+                    cpu_list
+                        .par_iter()
+                        .for_each(|&e| run_expert(e, &by_exp[e], false));
                 },
             );
             // per-token accumulate in routed order into a zeroed buffer, then add to h
@@ -1084,18 +1233,39 @@ impl MellumModel {
             let wexp = probs[e] / wsum;
             let gkey = format!("blk.{il}.ffn_gate_exps.e{e}");
             if !self.try_gemv(&gkey, x, &mut g) {
-                qmatmul(&mut g, x, &wge.bytes[e * gate_bpr..(e + 1) * gate_bpr], wge.ty, hidden, row);
+                qmatmul(
+                    &mut g,
+                    x,
+                    &wge.bytes[e * gate_bpr..(e + 1) * gate_bpr],
+                    wge.ty,
+                    hidden,
+                    row,
+                );
             }
             let ukey = format!("blk.{il}.ffn_up_exps.e{e}");
             if !self.try_gemv(&ukey, x, &mut u) {
-                qmatmul(&mut u, x, &wue.bytes[e * up_bpr..(e + 1) * up_bpr], wue.ty, hidden, row);
+                qmatmul(
+                    &mut u,
+                    x,
+                    &wue.bytes[e * up_bpr..(e + 1) * up_bpr],
+                    wue.ty,
+                    hidden,
+                    row,
+                );
             }
             for i in 0..eff {
                 act[i] = silu(g[i]) * u[i];
             }
             let dkey = format!("blk.{il}.ffn_down_exps.e{e}");
             if !self.try_gemv(&dkey, &act, &mut dy) {
-                qmatmul(&mut dy, &act, &wde.bytes[e * down_bpr..(e + 1) * down_bpr], wde.ty, eff, row);
+                qmatmul(
+                    &mut dy,
+                    &act,
+                    &wde.bytes[e * down_bpr..(e + 1) * down_bpr],
+                    wde.ty,
+                    eff,
+                    row,
+                );
             }
             for i in 0..hidden {
                 out[i] += wexp * dy[i];

@@ -313,7 +313,15 @@ fn qmatmul(
 
 /// Batched on-the-fly dequant matmul: `out[t][o] = W·xs[t]` for m tokens (each weight
 /// row dequantized ONCE per chunk). Same per-row `dot_f32` as `qmatmul` → identical.
-fn qmatmul_batch(out: &mut [f32], xs: &[f32], m: usize, bytes: &[u8], ty: GgmlType, in_dim: usize, out_dim: usize) {
+fn qmatmul_batch(
+    out: &mut [f32],
+    xs: &[f32],
+    m: usize,
+    bytes: &[u8],
+    ty: GgmlType,
+    in_dim: usize,
+    out_dim: usize,
+) {
     let bpr = (in_dim / ty.block_elems()) * ty.block_bytes();
     let mut rt = vec![0.0f32; out_dim * m];
     rt.par_chunks_mut(m).enumerate().for_each_init(
@@ -434,12 +442,28 @@ impl Qwen35Model {
         };
         for il in 0..self.cfg.n_layer {
             if self.cfg.is_recr(il) {
-                n += stage(&mut npu.p8192, format!("blk.{il}.attn_qkv.weight"), il as u64);
-                n += stage(&mut npu.p4096, format!("blk.{il}.attn_gate.weight"), il as u64);
-                n += stage(&mut npu.p2048, format!("blk.{il}.ssm_out.weight"), il as u64);
+                n += stage(
+                    &mut npu.p8192,
+                    format!("blk.{il}.attn_qkv.weight"),
+                    il as u64,
+                );
+                n += stage(
+                    &mut npu.p4096,
+                    format!("blk.{il}.attn_gate.weight"),
+                    il as u64,
+                );
+                n += stage(
+                    &mut npu.p2048,
+                    format!("blk.{il}.ssm_out.weight"),
+                    il as u64,
+                );
             } else {
                 n += stage(&mut npu.p8192, format!("blk.{il}.attn_q.weight"), il as u64);
-                n += stage(&mut npu.p2048, format!("blk.{il}.attn_output.weight"), il as u64);
+                n += stage(
+                    &mut npu.p2048,
+                    format!("blk.{il}.attn_output.weight"),
+                    il as u64,
+                );
             }
         }
         self.npu = Some(npu);
@@ -449,7 +473,16 @@ impl Qwen35Model {
     /// NPU dense projection for layer `il` during batched prefill (`which`: 0 = the
     /// 2048→8192 shape, 1 = 2048→4096, 2 = 4096→2048), chunked to M=256.
     #[cfg(feature = "npu")]
-    fn npu_proj(&self, which: u8, il: usize, xs: &[f32], m: usize, k: usize, n: usize, out: &mut [f32]) -> bool {
+    fn npu_proj(
+        &self,
+        which: u8,
+        il: usize,
+        xs: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        out: &mut [f32],
+    ) -> bool {
         let Some(npu) = &self.npu else { return false };
         if m < crate::mellum_npu::M_MIN {
             return false;
@@ -464,7 +497,15 @@ impl Qwen35Model {
         }
         for c in (0..m).step_by(crate::mellum_npu::M_NPU) {
             let mc = (m - c).min(crate::mellum_npu::M_NPU);
-            if sh.gemm(il as u64, &xs[c * k..(c + mc) * k], mc, &mut out[c * n..(c + mc) * n]).is_err() {
+            if sh
+                .gemm(
+                    il as u64,
+                    &xs[c * k..(c + mc) * k],
+                    mc,
+                    &mut out[c * n..(c + mc) * n],
+                )
+                .is_err()
+            {
                 return false;
             }
         }
@@ -472,7 +513,16 @@ impl Qwen35Model {
     }
     #[cfg(not(feature = "npu"))]
     #[allow(clippy::too_many_arguments)]
-    fn npu_proj(&self, _w: u8, _il: usize, _xs: &[f32], _m: usize, _k: usize, _n: usize, _o: &mut [f32]) -> bool {
+    fn npu_proj(
+        &self,
+        _w: u8,
+        _il: usize,
+        _xs: &[f32],
+        _m: usize,
+        _k: usize,
+        _n: usize,
+        _o: &mut [f32],
+    ) -> bool {
         false
     }
 
@@ -662,7 +712,10 @@ impl Qwen35Model {
             let b = |s: &str| format!("blk.{il}.{s}");
             let an = self.vecw(&b("attn_norm.weight"))?;
             for t in 0..m {
-                let (hs, ns) = (&h[t * hidden..(t + 1) * hidden], &mut n[t * hidden..(t + 1) * hidden]);
+                let (hs, ns) = (
+                    &h[t * hidden..(t + 1) * hidden],
+                    &mut n[t * hidden..(t + 1) * hidden],
+                );
                 rmsnorm(ns, hs, &an, eps);
             }
             if cfg.is_recr(il) {
@@ -672,7 +725,10 @@ impl Qwen35Model {
             }
             let pn = self.vecw(&b("post_attention_norm.weight"))?;
             for t in 0..m {
-                let (hs, ns) = (&h[t * hidden..(t + 1) * hidden], &mut n[t * hidden..(t + 1) * hidden]);
+                let (hs, ns) = (
+                    &h[t * hidden..(t + 1) * hidden],
+                    &mut n[t * hidden..(t + 1) * hidden],
+                );
                 rmsnorm(ns, hs, &pn, eps);
             }
             self.moe_batch(&n, m, il, &mut h)?;
@@ -752,36 +808,41 @@ impl Qwen35Model {
         let base_pos = self.pos;
         let scale = 1.0 / (hd as f32).sqrt();
         let mut attn_out = vec![0.0f32; m * q_dim];
-        attn_out.par_chunks_mut(q_dim).enumerate().for_each(|(t, ao)| {
-            let len = base_pos + t + 1;
-            let mut keys = vec![0.0f32; len * hd];
-            let mut vals = vec![0.0f32; len * hd];
-            let mut scratch = vec![0.0f32; len];
-            for hh in 0..nh {
-                let kvh = hh / groups;
-                for tt in 0..len {
-                    keys[tt * hd..tt * hd + hd]
-                        .copy_from_slice(&kc[tt * kv_dim + kvh * hd..tt * kv_dim + kvh * hd + hd]);
-                    vals[tt * hd..tt * hd + hd]
-                        .copy_from_slice(&vc[tt * kv_dim + kvh * hd..tt * kv_dim + kvh * hd + hd]);
+        attn_out
+            .par_chunks_mut(q_dim)
+            .enumerate()
+            .for_each(|(t, ao)| {
+                let len = base_pos + t + 1;
+                let mut keys = vec![0.0f32; len * hd];
+                let mut vals = vec![0.0f32; len * hd];
+                let mut scratch = vec![0.0f32; len];
+                for hh in 0..nh {
+                    let kvh = hh / groups;
+                    for tt in 0..len {
+                        keys[tt * hd..tt * hd + hd].copy_from_slice(
+                            &kc[tt * kv_dim + kvh * hd..tt * kv_dim + kvh * hd + hd],
+                        );
+                        vals[tt * hd..tt * hd + hd].copy_from_slice(
+                            &vc[tt * kv_dim + kvh * hd..tt * kv_dim + kvh * hd + hd],
+                        );
+                    }
+                    let mut oh = vec![0.0f32; hd];
+                    crate::attention::sdpa_single(
+                        &mut oh,
+                        &q[t * q_dim + hh * hd..t * q_dim + hh * hd + hd],
+                        &keys,
+                        &vals,
+                        hd,
+                        len,
+                        scale,
+                        &mut scratch,
+                    );
+                    for d in 0..hd {
+                        oh[d] *= sigmoid(gate[t * q_dim + hh * hd + d]);
+                    }
+                    ao[hh * hd..hh * hd + hd].copy_from_slice(&oh);
                 }
-                let mut oh = vec![0.0f32; hd];
-                crate::attention::sdpa_single(
-                    &mut oh,
-                    &q[t * q_dim + hh * hd..t * q_dim + hh * hd + hd],
-                    &keys,
-                    &vals,
-                    hd,
-                    len,
-                    scale,
-                    &mut scratch,
-                );
-                for d in 0..hd {
-                    oh[d] *= sigmoid(gate[t * q_dim + hh * hd + d]);
-                }
-                ao[hh * hd..hh * hd + hd].copy_from_slice(&oh);
-            }
-        });
+            });
         let mut o = vec![0.0f32; m * hidden];
         if !self.npu_proj(2, il, &attn_out, m, q_dim, hidden, &mut o) {
             let wo = self.w(&b("attn_output.weight"))?;
@@ -903,9 +964,15 @@ impl Qwen35Model {
                 });
             for vh in 0..n_vh {
                 let mut tmp = vec![0.0f32; s_v];
-                rmsnorm(&mut tmp, &core[vh * s_v..vh * s_v + s_v], &ssm_norm, cfg.rms_eps);
+                rmsnorm(
+                    &mut tmp,
+                    &core[vh * s_v..vh * s_v + s_v],
+                    &ssm_norm,
+                    cfg.rms_eps,
+                );
                 for j in 0..s_v {
-                    gated[t * value_dim + vh * s_v + j] = tmp[j] * silu(z[t * value_dim + vh * s_v + j]);
+                    gated[t * value_dim + vh * s_v + j] =
+                        tmp[j] * silu(z[t * value_dim + vh * s_v + j]);
                 }
             }
         }
@@ -972,14 +1039,38 @@ impl Qwen35Model {
             }
             let mut g = vec![0.0f32; me * eff];
             let mut u = vec![0.0f32; me * eff];
-            qmatmul_batch(&mut g, &xs, me, &wge.bytes[e * g_bpr..(e + 1) * g_bpr], wge.ty, hidden, eff);
-            qmatmul_batch(&mut u, &xs, me, &wue.bytes[e * u_bpr..(e + 1) * u_bpr], wue.ty, hidden, eff);
+            qmatmul_batch(
+                &mut g,
+                &xs,
+                me,
+                &wge.bytes[e * g_bpr..(e + 1) * g_bpr],
+                wge.ty,
+                hidden,
+                eff,
+            );
+            qmatmul_batch(
+                &mut u,
+                &xs,
+                me,
+                &wue.bytes[e * u_bpr..(e + 1) * u_bpr],
+                wue.ty,
+                hidden,
+                eff,
+            );
             let mut act = vec![0.0f32; me * eff];
             for i in 0..me * eff {
                 act[i] = silu(g[i]) * u[i];
             }
             let mut d = vec![0.0f32; me * hidden];
-            qmatmul_batch(&mut d, &act, me, &wde.bytes[e * d_bpr..(e + 1) * d_bpr], wde.ty, eff, hidden);
+            qmatmul_batch(
+                &mut d,
+                &act,
+                me,
+                &wde.bytes[e * d_bpr..(e + 1) * d_bpr],
+                wde.ty,
+                eff,
+                hidden,
+            );
             for (i, &(t, s)) in list.iter().enumerate() {
                 dy[(t * topk + s) * hidden..(t * topk + s + 1) * hidden]
                     .copy_from_slice(&d[i * hidden..(i + 1) * hidden]);
@@ -1362,18 +1453,39 @@ impl Qwen35Model {
             // else CPU on the byte slice. Experts are the bulk of decode compute.
             let gkey = format!("blk.{il}.ffn_gate_exps.e{e}");
             if !self.try_gemv(&gkey, x, &mut g) {
-                qmatmul(&mut g, x, &wge.bytes[e * gate_bpr..(e + 1) * gate_bpr], wge.ty, hidden, row);
+                qmatmul(
+                    &mut g,
+                    x,
+                    &wge.bytes[e * gate_bpr..(e + 1) * gate_bpr],
+                    wge.ty,
+                    hidden,
+                    row,
+                );
             }
             let ukey = format!("blk.{il}.ffn_up_exps.e{e}");
             if !self.try_gemv(&ukey, x, &mut u) {
-                qmatmul(&mut u, x, &wue.bytes[e * up_bpr..(e + 1) * up_bpr], wue.ty, hidden, row);
+                qmatmul(
+                    &mut u,
+                    x,
+                    &wue.bytes[e * up_bpr..(e + 1) * up_bpr],
+                    wue.ty,
+                    hidden,
+                    row,
+                );
             }
             for i in 0..eff {
                 act[i] = silu(g[i]) * u[i];
             }
             let dkey = format!("blk.{il}.ffn_down_exps.e{e}");
             if !self.try_gemv(&dkey, &act, &mut dy) {
-                qmatmul(&mut dy, &act, &wde.bytes[e * down_bpr..(e + 1) * down_bpr], wde.ty, eff, row);
+                qmatmul(
+                    &mut dy,
+                    &act,
+                    &wde.bytes[e * down_bpr..(e + 1) * down_bpr],
+                    wde.ty,
+                    eff,
+                    row,
+                );
             }
             for i in 0..hidden {
                 out[i] += wexp * dy[i];

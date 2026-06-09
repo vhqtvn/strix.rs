@@ -155,17 +155,22 @@ impl NpuShape {
         });
         // zero-pad remaining rows so stale data can't bleed in
         if m < M_NPU {
-            unsafe { std::ptr::write_bytes((self.gemm.a_host as *mut i8).add(m * k), 0, (M_NPU - m) * k) };
+            unsafe {
+                std::ptr::write_bytes((self.gemm.a_host as *mut i8).add(m * k), 0, (M_NPU - m) * k)
+            };
         }
         self.gemm.start(*wid).map_err(StrixError::backend)?;
         self.gemm.wait().map_err(StrixError::backend)?;
         let acc = unsafe { std::slice::from_raw_parts(self.gemm.out_host as *const i32, m * n) };
-        out[..m * n].par_chunks_mut(n).enumerate().for_each(|(t, orow)| {
-            let s = xsc[t];
-            for o in 0..n {
-                orow[o] = s * ws[o] * acc[t * n + o] as f32;
-            }
-        });
+        out[..m * n]
+            .par_chunks_mut(n)
+            .enumerate()
+            .for_each(|(t, orow)| {
+                let s = xsc[t];
+                for o in 0..n {
+                    orow[o] = s * ws[o] * acc[t * n + o] as f32;
+                }
+            });
         Ok(())
     }
 }

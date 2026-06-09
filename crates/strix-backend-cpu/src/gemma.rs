@@ -571,7 +571,10 @@ impl GemmaModel {
             *x *= scale;
         }
         let pos = self.seq;
-        let next = self.accel.as_mut().and_then(|a| a.decode_step_argmax(&h, pos));
+        let next = self
+            .accel
+            .as_mut()
+            .and_then(|a| a.decode_step_argmax(&h, pos));
         match next {
             Some(t) => {
                 self.seq += 1;
