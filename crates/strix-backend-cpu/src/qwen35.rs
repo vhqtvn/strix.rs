@@ -351,6 +351,10 @@ pub struct Qwen35Model {
     // deltanet layers: conv rolling state per layer [conv_dim * (d_conv-1)]
     conv: Vec<Vec<f32>>,
     pos: usize,
+    // Optional iGPU weight accelerator (per-weight GEMV by GGUF tensor name). When
+    // `None` (default / CPU build), every matmul takes the CPU path → behaviour is
+    // byte-identical to the pure-CPU forward. See docs/ideas/moe-accel-plan.md (P1).
+    accel: Option<Box<dyn strix_core::WeightAccel>>,
 }
 
 impl Qwen35Model {
@@ -383,7 +387,62 @@ impl Qwen35Model {
             cfg,
             gguf,
             pos: 0,
+            accel: None,
         })
+    }
+
+    /// Attach an iGPU weight accelerator and upload the dense Q6_K/Q4_0 projection
+    /// weights (full-attn q/k/v/o + lm_head) resident by GGUF tensor name. Returns
+    /// the count adopted. MoE experts + deltanet projections stay on CPU for now (P2).
+    /// NOTE: the ROCm backend's `gemv` is a no-op (decode_step-only) — use a Vulkan
+    /// accel (`GpuWeightAccel`/`AshWeightAccel`), which implements per-weight gemv.
+    pub fn attach_accel(&mut self, mut accel: Box<dyn strix_core::WeightAccel>) -> usize {
+        let mut names: Vec<String> = Vec::new();
+        for il in 0..self.cfg.n_layer {
+            if !self.cfg.is_recr(il) {
+                for t in ["attn_q", "attn_k", "attn_v", "attn_output"] {
+                    names.push(format!("blk.{il}.{t}.weight"));
+                }
+            }
+        }
+        if self.gguf.tensors().contains_key("output.weight") {
+            names.push("output.weight".to_string());
+        }
+        let mut n = 0usize;
+        for name in &names {
+            let Some(ti) = self.gguf.tensors().get(name) else {
+                continue;
+            };
+            let (ty, in_dim) = (ti.ggml_type, ti.dims[0] as usize);
+            let out_dim: usize = ti.dims[1..].iter().map(|&d| d as usize).product();
+            let Ok(bytes) = self.gguf.tensor_bytes(name) else {
+                continue;
+            };
+            let ok = match ty {
+                GgmlType::Q4_0 => accel.upload_q4_0(name, bytes, in_dim, out_dim),
+                GgmlType::Q6K => accel.upload_q6_k(name, bytes, in_dim, out_dim),
+                _ => false,
+            };
+            if ok {
+                n += 1;
+            }
+        }
+        self.accel = Some(accel);
+        n
+    }
+
+    /// Matmul `out = W·x` for weight `key`: GPU gemv if the accelerator adopted it,
+    /// else the CPU path. With no accelerator this is exactly `qmatmul`.
+    fn mm(&self, key: &str, out: &mut [f32], x: &[f32], w: &W<'_>, row: &mut [f32]) {
+        if let Some(a) = &self.accel {
+            if let Some(y) = a.gemv(key, x) {
+                if y.len() == out.len() {
+                    out.copy_from_slice(&y);
+                    return;
+                }
+            }
+        }
+        qmatmul(out, x, w.bytes, w.ty, w.in_dim, row);
     }
 
     fn w(&self, name: &str) -> Result<W<'_>> {
@@ -467,13 +526,13 @@ impl Qwen35Model {
         let on = self.vecw("output_norm.weight")?;
         let mut nh = vec![0.0f32; hidden];
         rmsnorm(&mut nh, &h, &on, eps);
-        let head = if self.gguf.tensors().contains_key("output.weight") {
-            self.w("output.weight")?
+        let (head_key, head) = if self.gguf.tensors().contains_key("output.weight") {
+            ("output.weight", self.w("output.weight")?)
         } else {
-            self.w("token_embd.weight")?
+            ("token_embd.weight", self.w("token_embd.weight")?)
         };
         let mut logits = vec![0.0f32; cfg.vocab];
-        qmatmul(&mut logits, &nh, head.bytes, head.ty, hidden, &mut row);
+        self.mm(head_key, &mut logits, &nh, &head, &mut row);
         Ok(Some(logits))
     }
 
@@ -492,11 +551,11 @@ impl Qwen35Model {
         let mut v = vec![0.0f32; kv_dim];
         {
             let wq = self.w(&b("attn_q.weight"))?;
-            qmatmul(&mut qg, x, wq.bytes, wq.ty, wq.in_dim, row);
+            self.mm(&b("attn_q.weight"), &mut qg, x, &wq, row);
             let wk = self.w(&b("attn_k.weight"))?;
-            qmatmul(&mut k, x, wk.bytes, wk.ty, wk.in_dim, row);
+            self.mm(&b("attn_k.weight"), &mut k, x, &wk, row);
             let wv = self.w(&b("attn_v.weight"))?;
-            qmatmul(&mut v, x, wv.bytes, wv.ty, wv.in_dim, row);
+            self.mm(&b("attn_v.weight"), &mut v, x, &wv, row);
         }
 
         // per-head Q (+gate) norm + rope; per-kv-head K norm + rope
@@ -562,7 +621,7 @@ impl Qwen35Model {
         let mut o = vec![0.0f32; cfg.hidden];
         {
             let wo = self.w(&b("attn_output.weight"))?;
-            qmatmul(&mut o, &attn_out, wo.bytes, wo.ty, wo.in_dim, row);
+            self.mm(&b("attn_output.weight"), &mut o, &attn_out, &wo, row);
         }
         Ok(o)
     }
