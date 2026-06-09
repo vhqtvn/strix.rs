@@ -11,6 +11,7 @@
 //! Used by `MellumModel::prefill_batch` per chunk of up to 256 tokens; shorter
 //! chunks are zero-padded in M.
 
+use rayon::prelude::*;
 use strix_backend_npu::NpuGemm as Gemm;
 use strix_backend_npu::{load_instr_bin, load_instr_txt};
 use strix_core::error::{Result, StrixError};
@@ -19,6 +20,11 @@ use strix_models::ggml_quant::{dequantize_into, GgmlType};
 pub const M_NPU: usize = 256;
 /// Below this row count CPU wins (per-call NPU latency dominates).
 pub const M_MIN: usize = 64;
+
+/// Shareable raw pointer for disjoint-index parallel writes.
+struct SendPtr<T>(*mut T);
+unsafe impl<T> Sync for SendPtr<T> {}
+unsafe impl<T> Send for SendPtr<T> {}
 
 /// One fixed-shape NPU GEMM (K×N) with N staged weights (per layer / per expert).
 pub struct NpuShape {
@@ -59,20 +65,28 @@ impl NpuShape {
     /// (column-major for the GEMM's B layout = row-major [K][N]) and stage it.
     pub fn stage_q8(&mut self, slot: u64, bytes: &[u8], ty: GgmlType) -> Result<()> {
         let (k, n) = (self.k, self.n);
-        let mut rowf = vec![0.0f32; k];
         let bpr = (k / ty.block_elems()) * ty.block_bytes();
         let mut b8 = vec![0i8; k * n];
         let mut ws = vec![0.0f32; n];
-        for o in 0..n {
-            dequantize_into(ty, &bytes[o * bpr..(o + 1) * bpr], &mut rowf)?;
-            let amax = rowf.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-            let s = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-            ws[o] = s;
-            let inv = 1.0 / s;
-            for i in 0..k {
-                b8[i * n + o] = (rowf[i] * inv).round().clamp(-127.0, 127.0) as i8;
-            }
-        }
+        // Parallel over output channels: dequant+scale each row, scatter [K,N]-major.
+        // b8 columns are disjoint per channel — share the buffer via raw pointer.
+        let b8p = SendPtr(b8.as_mut_ptr());
+        ws.par_iter_mut().enumerate().for_each_init(
+            || vec![0.0f32; k],
+            |rowf, (o, wso)| {
+                let b8p = &b8p;
+                dequantize_into(ty, &bytes[o * bpr..(o + 1) * bpr], rowf).unwrap();
+                let amax = rowf.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+                let s = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                *wso = s;
+                let inv = 1.0 / s;
+                for i in 0..k {
+                    unsafe {
+                        *b8p.0.add(i * n + o) = (rowf[i] * inv).round().clamp(-127.0, 127.0) as i8
+                    };
+                }
+            },
+        );
         let wid = self.gemm.stage(&b8).map_err(StrixError::backend)?;
         self.weights.insert(slot, (wid, ws));
         Ok(())
@@ -83,21 +97,27 @@ impl NpuShape {
     pub fn stage_q8_pair(&mut self, slot: u64, a: &[u8], b: &[u8], ty: GgmlType) -> Result<()> {
         let (k, n) = (self.k, self.n);
         let half = n / 2;
-        let mut rowf = vec![0.0f32; k];
         let bpr = (k / ty.block_elems()) * ty.block_bytes();
         let mut b8 = vec![0i8; k * n];
         let mut ws = vec![0.0f32; n];
-        for o in 0..n {
-            let (src, r) = if o < half { (a, o) } else { (b, o - half) };
-            dequantize_into(ty, &src[r * bpr..(r + 1) * bpr], &mut rowf)?;
-            let amax = rowf.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-            let s = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-            ws[o] = s;
-            let inv = 1.0 / s;
-            for i in 0..k {
-                b8[i * n + o] = (rowf[i] * inv).round().clamp(-127.0, 127.0) as i8;
-            }
-        }
+        let b8p = SendPtr(b8.as_mut_ptr());
+        ws.par_iter_mut().enumerate().for_each_init(
+            || vec![0.0f32; k],
+            |rowf, (o, wso)| {
+                let b8p = &b8p;
+                let (src, r) = if o < half { (a, o) } else { (b, o - half) };
+                dequantize_into(ty, &src[r * bpr..(r + 1) * bpr], rowf).unwrap();
+                let amax = rowf.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+                let s = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                *wso = s;
+                let inv = 1.0 / s;
+                for i in 0..k {
+                    unsafe {
+                        *b8p.0.add(i * n + o) = (rowf[i] * inv).round().clamp(-127.0, 127.0) as i8
+                    };
+                }
+            },
+        );
         let wid = self.gemm.stage(&b8).map_err(StrixError::backend)?;
         self.weights.insert(slot, (wid, ws));
         Ok(())
@@ -116,32 +136,31 @@ impl NpuShape {
             .get(&slot)
             .ok_or_else(|| StrixError::backend("npu: slot not staged"))?;
         let mut xsc = vec![0.0f32; m];
-        unsafe {
-            let a = self.gemm.a_host as *mut i8;
-            for t in 0..m {
-                let row = &xs[t * k..(t + 1) * k];
-                let amax = row.iter().fold(0.0f32, |mx, &v| mx.max(v.abs()));
-                let s = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-                xsc[t] = s;
-                let inv = 1.0 / s;
-                for i in 0..k {
-                    *a.add(t * k + i) = (row[i] * inv).round().clamp(-127.0, 127.0) as i8;
-                }
+        let ap = SendPtr(self.gemm.a_host as *mut i8);
+        xsc.par_iter_mut().enumerate().for_each(|(t, sc)| {
+            let ap = &ap;
+            let row = &xs[t * k..(t + 1) * k];
+            let amax = row.iter().fold(0.0f32, |mx, &v| mx.max(v.abs()));
+            let s = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            *sc = s;
+            let inv = 1.0 / s;
+            for i in 0..k {
+                unsafe { *ap.0.add(t * k + i) = (row[i] * inv).round().clamp(-127.0, 127.0) as i8 };
             }
-            // zero-pad remaining rows so stale data can't bleed in
-            if m < M_NPU {
-                std::ptr::write_bytes(a.add(m * k), 0, (M_NPU - m) * k);
-            }
+        });
+        // zero-pad remaining rows so stale data can't bleed in
+        if m < M_NPU {
+            unsafe { std::ptr::write_bytes((self.gemm.a_host as *mut i8).add(m * k), 0, (M_NPU - m) * k) };
         }
         self.gemm.start(*wid).map_err(StrixError::backend)?;
         self.gemm.wait().map_err(StrixError::backend)?;
         let acc = unsafe { std::slice::from_raw_parts(self.gemm.out_host as *const i32, m * n) };
-        for t in 0..m {
+        out[..m * n].par_chunks_mut(n).enumerate().for_each(|(t, orow)| {
             let s = xsc[t];
             for o in 0..n {
-                out[t * n + o] = s * ws[o] * acc[t * n + o] as f32;
+                orow[o] = s * ws[o] * acc[t * n + o] as f32;
             }
-        }
+        });
         Ok(())
     }
 }
