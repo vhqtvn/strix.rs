@@ -418,11 +418,14 @@ impl RocmWeightAccel {
             (cfg.hidden, cfg.ffn)
         };
         // Split-N: iGPU computes ffn_up cols [0,n_ig); NPU computes [n_ig, ffn).
-        // n_ig tuned so both finish together (iGPU also does ffn_gate).
+        // Default n_ig=0 → ffn_up runs FULLY on the NPU (full-N xclbin exists), the
+        // max-NPU / min-iGPU posture for this box (the partition doesn't change the
+        // math; rescale concatenates). ~1% slower than the speed-optimal 2048 split,
+        // but keeps the biggest GEMM (N=15360) off the iGPU. STRIX_NPU_NIG overrides.
         let n_ig = std::env::var("STRIX_NPU_NIG")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(2048usize);
+            .unwrap_or(0usize);
         let n_npu = ffn - n_ig;
         let dir = std::env::var("STRIX_NPU_XCLBIN_DIR").unwrap_or_else(|_| {
             "external/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build".into()
