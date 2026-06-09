@@ -713,14 +713,15 @@ impl WeightAccel for RocmWeightAccel {
         // NPU hybrid: stash ffn_up raw Q4 bytes for offload (repacked at configure).
         #[cfg(feature = "npu")]
         if std::env::var("STRIX_NPU").is_ok() {
-            // STRIX_NPU_MODE: "speed" (DEFAULT) offloads only ffn_up (the gate∥up
-            // pair has free iGPU/NPU parallelism → robustly ≥ pure-iGPU); "power"
-            // offloads everything (down/o/q too — more iGPU work moved to the NPU,
-            // but they put the NPU on the critical path so prefill can be slower
-            // than pure-iGPU at high iGPU clock). MEASURED (thermal-gated bench):
-            // up-only 136 > pure-iGPU 125 > all-offloads 122 tok/s. STRIX_NPU_SKIP
-            // is a fine override (comma list of up,down,o,q to force-disable).
-            let power = std::env::var("STRIX_NPU_MODE").map(|m| m == "power").unwrap_or(false);
+            // STRIX_NPU_MODE: "power" (DEFAULT) offloads everything (ffn_up/down +
+            // attn_o/q) to the NPU — maximizes NPU use and MINIMIZES sustained iGPU
+            // compute. This is the default on this box because heavy/sustained iGPU
+            // load is the trigger for its SoC-reset hardware fault; shifting GEMMs to
+            // the low-power NPU keeps the iGPU's own rail load down. "speed" offloads
+            // only ffn_up (the gate∥up free-parallelism pair), which is marginally
+            // faster at high iGPU clock but works the iGPU harder. STRIX_NPU_SKIP
+            // (comma list of up,down,o,q) is a fine override.
+            let power = std::env::var("STRIX_NPU_MODE").map(|m| m != "speed").unwrap_or(true);
             let skipv = std::env::var("STRIX_NPU_SKIP").unwrap_or_default();
             let skip = |n: &str| {
                 skipv.split(',').any(|s| s.trim() == n)
