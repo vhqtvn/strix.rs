@@ -1080,6 +1080,114 @@ extern "C" __global__ void sdpa_prefill_wmma(const float* __restrict__ q, const 
     }
 }
 
+// ===== GEMM-based prefill attention (gated STRIX_GEMM_SDPA) =====
+// llama's fast prefill attention is QK^T-GEMM -> softmax -> P*V-GEMM (NOT fused
+// flash). These 3 kernels read K/V ONCE (vs the fused kernel's per-query-tile
+// re-reads) and use f16 WMMA at high occupancy. Handles hd=256 AND hd=512 (the
+// O accumulator is a per-tile WMMA frag, not a per-thread [hd] array). One wave
+// (32 lanes) per output 16x16 tile. scores buffer: f32 [n_heads * m * len].
+
+// S[h][i][j] = scale * sum_d Q[i,d]*K[j,d]. grid=(n_heads, ceil(m/16), ceil(len/16)), block=32.
+extern "C" __global__ void sdpa_qk_wmma(const float* __restrict__ q, const float* __restrict__ k,
+                                        __fp16* __restrict__ scores, int hd, int groups, int n_kv,
+                                        float scale, int n_heads, int m, int len, int kvf16,
+                                        int start_pos) {
+    int NW = blockDim.x >> 5, w = threadIdx.x >> 5;
+    int h = blockIdx.x, q0 = blockIdx.y * 16, k0 = (blockIdx.z * NW + w) * 16;
+    // each wave handles its own key-tile (no shared K — staging it tanks occupancy
+    // more than the saved K-reads help, like every prior shared-tiling attempt).
+    if (k0 >= len || k0 > start_pos + q0 + 15) return;
+    int lane = threadIdx.x & 31, row = lane & 15, half = lane >> 4;
+    int kvh = h / groups, dchunks = hd >> 4;
+    int mq = q0 + row, ki = k0 + row;          // this lane's A query-row / B key-row
+    v8f sacc = {0,0,0,0,0,0,0,0};
+    const float* qp = q + ((size_t)mq * n_heads + h) * hd;
+    for (int dc = 0; dc < dchunks; dc++) {
+        v16h a, b;
+        for (int j = 0; j < 16; j++) a[j] = (mq < m) ? (__fp16)qp[dc*16 + j] : (__fp16)0.f;
+        for (int j = 0; j < 16; j++) {
+            size_t kb = ((size_t)ki * n_kv + kvh) * hd + dc*16 + j;
+            b[j] = (ki < len) ? (__fp16)KVLD(k, kb, kvf16) : (__fp16)0.f;
+        }
+        sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, sacc);
+    }
+    for (int kk = 0; kk < 8; kk++) {            // element [row 2kk+half][col lane&15]
+        int qi = q0 + 2*kk + half, kj = k0 + row;
+        if (qi < m && kj < len) scores[((size_t)h * m + qi) * len + kj] = (__fp16)(sacc[kk] * scale);
+    }
+}
+
+// Row softmax over S[h][i][0:len] with causal + sliding-window masking, in place.
+// grid=(n_heads, m), block=256. start_pos = KV position of query 0; n_swa>0 = local layer.
+extern "C" __global__ void sdpa_softmax_mask(__fp16* __restrict__ scores, int start_pos, int m,
+                                             int n_heads, int len, int n_swa, float* __restrict__ rowsum) {
+    int h = blockIdx.x, i = blockIdx.y, t = threadIdx.x;
+    if (i >= m) return;
+    __fp16* S = scores + ((size_t)h * m + i) * len;
+    int my_len = start_pos + i + 1;                 // causal: keys [0, my_len)
+    int lo = (n_swa > 0) ? (my_len - n_swa) : 0;     // sliding window: keys < lo masked
+    if (lo < 0) lo = 0;
+    // f16 S: reductions in f32, recompute the mask each pass. Write UNNORMALIZED exp
+    // (P, in [0, ...]) + the per-row sum; PV divides O by the sum (saves the 3rd pass).
+    __shared__ float red[256];
+    float mx = -3.0e38f;
+    for (int j = t; j < len; j += 256) if (j < my_len && j >= lo) mx = fmaxf(mx, (float)S[j]);
+    red[t] = mx; __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) { if (t < s) red[t] = fmaxf(red[t], red[t+s]); __syncthreads(); }
+    float m0 = red[0]; __syncthreads();
+    float sum = 0.f;
+    for (int j = t; j < len; j += 256) {
+        float e = (j < my_len && j >= lo) ? __expf((float)S[j] - m0) : 0.f;
+        S[j] = (__fp16)e; sum += e;
+    }
+    red[t] = sum; __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) { if (t < s) red[t] += red[t+s]; __syncthreads(); }
+    if (t == 0) rowsum[(size_t)h * m + i] = red[0];
+}
+
+// O[i][d] = sum_j P[i][j]*V[j][d]. grid=(n_heads, ceil(m/16), ceil(hd/16)), block=32.
+extern "C" __global__ void sdpa_pv_wmma(const __fp16* __restrict__ scores, const float* __restrict__ v,
+                                        float* __restrict__ out, int hd, int groups, int n_kv,
+                                        int n_heads, int m, int len, int kvf16, int start_pos,
+                                        const float* __restrict__ rowsum) {
+    int NW = blockDim.x >> 5, w = threadIdx.x >> 5, t = threadIdx.x;
+    int h = blockIdx.x, q0 = blockIdx.y * 16, d0 = (blockIdx.z * NW + w) * 16;
+    int lane = threadIdx.x & 31, row = lane & 15, half = lane >> 4;
+    int kvh = h / groups;
+    int dcol = d0 + row;                          // B output-col(d) for this wave
+    const __fp16* Pbase = scores + ((size_t)h * m + q0) * len;
+    v8f oacc = {0,0,0,0,0,0,0,0};
+    // causal: keys beyond the last query of this tile (start_pos+q0+15) are all P=0.
+    int pv_len = start_pos + q0 + 16; if (pv_len > len) pv_len = len;
+    // P[16 queries x 16 keys] tile is identical for all d-tile waves -> stage in shared.
+    __shared__ __fp16 sP[16 * 16];
+    for (int j0 = 0; j0 < pv_len; j0 += 16) {
+        __syncthreads();
+        for (int e = t; e < 256; e += blockDim.x) {     // cooperative P-tile load (all waves)
+            int qq = e >> 4, kk2 = e & 15;
+            sP[e] = (q0+qq < m && j0+kk2 < len) ? Pbase[(size_t)qq * len + j0 + kk2] : (__fp16)0.f;
+        }
+        __syncthreads();
+        if (d0 >= hd) continue;                      // wave has no valid d-tile (still syncs)
+        v16h a, b;
+        for (int j = 0; j < 16; j++) a[j] = sP[row * 16 + j];
+        for (int j = 0; j < 16; j++) {
+            size_t vb = ((size_t)(j0+j) * n_kv + kvh) * hd + dcol;   // V[key j0+j][d=dcol]
+            b[j] = (j0+j < len) ? (__fp16)KVLD(v, vb, kvf16) : (__fp16)0.f;
+        }
+        oacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, oacc);
+    }
+    if (d0 >= hd) return;
+    for (int kk = 0; kk < 8; kk++) {            // element [row 2kk+half = query][col lane&15 = d]
+        int qi = q0 + 2*kk + half, dd = d0 + row;
+        if (qi < m && dd < hd) {
+            float sum = rowsum[(size_t)h * m + qi];      // normalize here (softmax skipped it)
+            float inv = (sum > 0.f) ? 1.f / sum : 0.f;
+            out[((size_t)qi * n_heads + h) * hd + dd] = oacc[kk] * inv;
+        }
+    }
+}
+
 // Plain float copy (KV-cache append; dst pointer pre-offset to the slot).
 extern "C" __global__ void copyf(float* __restrict__ dst, const float* __restrict__ src, int n) {
     int i = blockIdx.x * 256 + threadIdx.x;

@@ -161,6 +161,8 @@ struct Scratch {
     p_xqhi: Dbuf,
     p_xqd: Dbuf,
     p_xqsum: Dbuf,
+    p_scores: Dbuf, // GEMM-attention S[n_heads*M_CHUNK*max_seq] (STRIX_GEMM_SDPA)
+    p_rowsum: Dbuf, // GEMM-attention per-row softmax sums [n_heads*M_CHUNK]
     k_cache: Vec<Dbuf>,
     v_cache: Vec<Dbuf>,
 }
@@ -268,6 +270,9 @@ impl RocmWeightAccel {
             "sdpa_prefill",
             "sdpa_prefill_f",
             "sdpa_prefill_wmma",
+            "sdpa_qk_wmma",
+            "sdpa_softmax_mask",
+            "sdpa_pv_wmma",
             "xquant_npu",
             "rescale_npu",
         ] {
@@ -909,6 +914,15 @@ impl WeightAccel for RocmWeightAccel {
             p_xqhi: self.gpu.alloc(M_CHUNK * nb_max * 16).expect("p_xqhi"),
             p_xqd: mk(M_CHUNK * nb_max),
             p_xqsum: mk(M_CHUNK * nb_max),
+            // GEMM-attention scores scratch — only sized when the path is enabled
+            // (n_heads*M_CHUNK*max_seq f32 can be 10s-100s of MB).
+            p_scores: if std::env::var("STRIX_GEMM_SDPA").is_ok() {
+                // f16 scores (2 bytes/elem): n_heads * M_CHUNK * max_seq.
+                self.gpu.alloc(n_heads * M_CHUNK * cfg.max_seq * 2).expect("p_scores")
+            } else {
+                self.gpu.alloc(2).expect("p_scores")
+            },
+            p_rowsum: mk(n_heads * M_CHUNK),
             k_cache,
             v_cache,
         });
@@ -1743,7 +1757,71 @@ impl WeightAccel for RocmWeightAccel {
                 _ => true, // any other value (incl. "1") = skip all
             };
             if !skip_this {
-                if std::env::var("STRIX_OLD_SDPA").is_ok() {
+                if std::env::var("STRIX_GEMM_SDPA").is_ok() {
+                    // GEMM-based attention (llama's non-flash path): QK^T -> mask+softmax -> P*V,
+                    // all f16 WMMA, K/V read once. len = total keys after this chunk.
+                    let len = start_pos + m;
+                    let n_swa = if lc.is_local { cfg.n_swa as i32 } else { 0 };
+                    // waves/block (each wave = one independent output tile). 8 default.
+                    let gnw = std::env::var("STRIX_GEMM_NW").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(8).clamp(1, 16);
+                    self.launch3(
+                        "sdpa_qk_wmma",
+                        n_heads as u32,
+                        m.div_ceil(16) as u32,
+                        len.div_ceil(16 * gnw) as u32,
+                        (gnw * 32) as u32,
+                        0,
+                        Args::new()
+                            .ptr(s.p_q2.ptr)
+                            .ptr(s.k_cache[l].ptr)
+                            .ptr(s.p_scores.ptr)
+                            .i(hd as i32)
+                            .i(groups as i32)
+                            .i(n_kv as i32)
+                            .f(scale)
+                            .i(n_heads as i32)
+                            .i(m as i32)
+                            .i(len as i32)
+                            .i(if self.kv_f16 { 1 } else { 0 })
+                            .i(start_pos as i32),
+                    );
+                    self.launch2(
+                        "sdpa_softmax_mask",
+                        n_heads as u32,
+                        m as u32,
+                        256,
+                        0,
+                        Args::new()
+                            .ptr(s.p_scores.ptr)
+                            .i(start_pos as i32)
+                            .i(m as i32)
+                            .i(n_heads as i32)
+                            .i(len as i32)
+                            .i(n_swa)
+                            .ptr(s.p_rowsum.ptr),
+                    );
+                    self.launch3(
+                        "sdpa_pv_wmma",
+                        n_heads as u32,
+                        m.div_ceil(16) as u32,
+                        hd.div_ceil(16 * gnw) as u32,
+                        (gnw * 32) as u32,
+                        0,
+                        Args::new()
+                            .ptr(s.p_scores.ptr)
+                            .ptr(s.v_cache[l].ptr)
+                            .ptr(s.p_attn.ptr)
+                            .i(hd as i32)
+                            .i(groups as i32)
+                            .i(n_kv as i32)
+                            .i(n_heads as i32)
+                            .i(m as i32)
+                            .i(len as i32)
+                            .i(if self.kv_f16 { 1 } else { 0 })
+                            .i(start_pos as i32)
+                            .ptr(s.p_rowsum.ptr),
+                    );
+                } else if std::env::var("STRIX_OLD_SDPA").is_ok() {
                     self.launch(
                         "sdpa_prefill",
                         (m * n_heads) as u32,
