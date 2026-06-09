@@ -125,7 +125,27 @@ fn find_gguf(model: &Path) -> Option<PathBuf> {
 /// this path takes **raw token IDs** via `STRIX_QWEN_IDS` (comma/space separated)
 /// for now — used to validate the forward against a llama.cpp golden. If unset, it
 /// falls back to the `prompt` string parsed as whitespace/comma-separated IDs.
-fn run_qwen35(gguf: GgufFile, prompt: &str, max_tokens: usize) -> Result<()> {
+/// Build a per-weight GEMV accelerator for the MoE models (Qwen35/Mellum). Prefers a
+/// Vulkan accel — `GpuWeightAccel` (wgpu) or `AshWeightAccel` (ash, `STRIX_ASH=1`) —
+/// because they implement real per-weight `gemv`. The ROCm backend's `gemv` is a no-op
+/// (decode_step-only), so it is NOT used here. `None` if no GPU / not built `--features
+/// vulkan` (the model then stays fully on CPU).
+#[allow(unused_mut, unused_assignments, clippy::let_and_return)]
+fn build_weight_accel() -> Option<Box<dyn strix_core::WeightAccel>> {
+    #[cfg(feature = "vulkan")]
+    {
+        if std::env::var("STRIX_ASH").is_ok() {
+            if let Some(a) = strix_backend_vulkan::AshWeightAccel::new() {
+                return Some(Box::new(a) as Box<dyn strix_core::WeightAccel>);
+            }
+        } else if let Some(a) = strix_backend_vulkan::GpuWeightAccel::new() {
+            return Some(Box::new(a) as Box<dyn strix_core::WeightAccel>);
+        }
+    }
+    None
+}
+
+fn run_qwen35(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Result<()> {
     use strix_backend_cpu::qwen35::Qwen35Model;
 
     let id_src = std::env::var("STRIX_QWEN_IDS").unwrap_or_else(|_| prompt.to_string());
@@ -149,6 +169,26 @@ fn run_qwen35(gguf: GgufFile, prompt: &str, max_tokens: usize) -> Result<()> {
         load_start.elapsed().as_secs_f64(),
         prompt_ids.len()
     );
+
+    // --gpu: offload the dense Q6_K projections (attn q/k/v/o + lm_head) to the iGPU
+    // via per-weight gemv (Vulkan). Experts/deltanet stay on CPU (P2). No-op if no
+    // Vulkan accel is available.
+    if gpu {
+        match build_weight_accel() {
+            Some(accel) => {
+                let name = accel.name().to_string();
+                let t = Instant::now();
+                let n = model.attach_accel(accel);
+                eprintln!(
+                    "[qwen35moe] {n} dense weights resident on {name} ({:.1}s upload)",
+                    t.elapsed().as_secs_f64()
+                );
+            }
+            None => eprintln!(
+                "[qwen35moe] --gpu: no Vulkan accel (rebuild --features vulkan; ROCm gemv is a no-op for MoE)"
+            ),
+        }
+    }
 
     let sampler = GreedySampler;
     let prefill_start = Instant::now();
@@ -187,11 +227,16 @@ fn run_qwen35(gguf: GgufFile, prompt: &str, max_tokens: usize) -> Result<()> {
 /// JetBrains Mellum2 (`mellum`) CPU-reference path. Sparse-MoE transformer with
 /// hybrid sliding/full attention + per-layer-type RoPE (YaRN on full layers). Takes
 /// raw token IDs via `STRIX_QWEN_IDS` (or the prompt) — same tokenizer caveat as Qwen.
-fn run_mellum(gguf: GgufFile, prompt: &str, max_tokens: usize) -> Result<()> {
+fn run_mellum(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Result<()> {
     use strix_backend_cpu::mellum::{MellumCfg, MellumModel};
 
     let cfg = MellumCfg::from_gguf(&gguf).context("parse mellum config")?;
     eprintln!("[mellum] {}", cfg.report());
+    if gpu {
+        // Mellum is Q8_0; the accel kernels adopt only Q4_0/Q6_K, so iGPU offload needs
+        // a Q8_0 GEMV kernel first (plan P3). Stays on CPU until then.
+        eprintln!("[mellum] --gpu: Q8_0 iGPU kernel not yet implemented (plan P3) — staying on CPU");
+    }
 
     let id_src = std::env::var("STRIX_QWEN_IDS").unwrap_or_else(|_| prompt.to_string());
     let prompt_ids: Vec<u32> = id_src
@@ -261,10 +306,10 @@ fn run_gguf(path: &Path, prompt: &str, max_tokens: usize, chat: bool, gpu: bool)
     // validate tensors. Forward not yet implemented (hybrid Gated-DeltaNet/MoE,
     // see docs/qwen36-arch.md). Reports and exits rather than failing in GemmaModel.
     if arch == "qwen35moe" {
-        return run_qwen35(gguf, prompt, max_tokens);
+        return run_qwen35(gguf, prompt, max_tokens, gpu);
     }
     if arch == "mellum" {
-        return run_mellum(gguf, prompt, max_tokens);
+        return run_mellum(gguf, prompt, max_tokens, gpu);
     }
 
     let tokenizer = StrixTokenizer::from_gguf(&gguf).context("build tokenizer from gguf")?;
