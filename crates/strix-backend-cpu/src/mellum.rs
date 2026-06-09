@@ -2,11 +2,13 @@
 //!
 //! A Mixtral-class sparse-MoE transformer with two twists, both verified against
 //! `refs/llama.cpp/src/models/mellum.cpp`:
-//!   - **Hybrid attention**: every 4th layer (il where `(il+1)%4==0`) is full
-//!     attention; the rest are sliding-window (window=1024). Full layers use YaRN
-//!     RoPE (freq_scale=1/16, ext_factor=1, mscale via attn_factor); sliding layers
-//!     use plain RoPE (freq_scale=1, ext_factor=0). Both share freq_base=500000.
-//!   - **Per-head Q/K RMSNorm** over head_dim (128) before RoPE.
+//!
+//! - **Hybrid attention**: every 4th layer (il where `(il+1)%4==0`) is full
+//!   attention; the rest are sliding-window (window=1024). Full layers use YaRN
+//!   RoPE (freq_scale=1/16, ext_factor=1, mscale via attn_factor); sliding layers
+//!   use plain RoPE (freq_scale=1, ext_factor=0). Both share freq_base=500000.
+//! - **Per-head Q/K RMSNorm** over head_dim (128) before RoPE.
+//!
 //! MoE: 64 experts, top-8 softmax + renorm (norm_topk_prob), SiLU, NO shared expert.
 //! GQA: 32 q-heads / 4 kv-heads (groups=8), head_dim=128. Separate output.weight.
 //!
@@ -156,7 +158,7 @@ fn yarn_corr_dims(n_dims: usize, n_ctx_orig: f32, base: f32, beta_fast: f32, bet
 #[inline]
 fn yarn_ramp(low: f32, high: f32, i0: usize) -> f32 {
     let y = ((i0 / 2) as f32 - low) / (high - low).max(0.001);
-    1.0 - y.min(1.0).max(0.0)
+    1.0 - y.clamp(0.0, 1.0)
 }
 
 /// One YaRN-corrected (cos,sin) for pair index, exactly as ggml `rope_yarn`.
