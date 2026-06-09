@@ -149,7 +149,13 @@ fn yarn_corr_dim(n_dims: usize, n_ctx_orig: f32, n_rot: f32, base: f32) -> f32 {
     n_dims as f32 * (n_ctx_orig / (n_rot * 2.0 * PI)).ln() / (2.0 * base.ln())
 }
 
-fn yarn_corr_dims(n_dims: usize, n_ctx_orig: f32, base: f32, beta_fast: f32, beta_slow: f32) -> [f32; 2] {
+fn yarn_corr_dims(
+    n_dims: usize,
+    n_ctx_orig: f32,
+    base: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> [f32; 2] {
     let start = yarn_corr_dim(n_dims, n_ctx_orig, beta_fast, base).floor();
     let end = yarn_corr_dim(n_dims, n_ctx_orig, beta_slow, base).ceil();
     [start.max(0.0), end.min(n_dims as f32 - 1.0)]
@@ -210,7 +216,14 @@ fn rope_neox(
 
 /// On-the-fly dequant matmul: out[o] = sum_i W[o][i]*x[i]. `bytes` = a weight whose
 /// rows are `in_dim` elements each (gguf dims [in_dim, out_dim]); out.len() = out_dim.
-fn qmatmul(out: &mut [f32], x: &[f32], bytes: &[u8], ty: GgmlType, in_dim: usize, _row: &mut [f32]) {
+fn qmatmul(
+    out: &mut [f32],
+    x: &[f32],
+    bytes: &[u8],
+    ty: GgmlType,
+    in_dim: usize,
+    _row: &mut [f32],
+) {
     let bpr = (in_dim / ty.block_elems()) * ty.block_bytes();
     // Rows are independent: parallelize across cores with per-thread dequant scratch
     // (the `_row` arg is kept for call-site compatibility but no longer used).
@@ -400,14 +413,32 @@ impl MellumModel {
             let mut tmp = vec![0.0f32; hd];
             rmsnorm(&mut tmp, qh, &qn, cfg.rms_eps);
             qh.copy_from_slice(&tmp);
-            rope_neox(qh, pos, cfg.n_rot, cfg.rope_freq_base, freq_scale, ext_factor, mscale, corr);
+            rope_neox(
+                qh,
+                pos,
+                cfg.n_rot,
+                cfg.rope_freq_base,
+                freq_scale,
+                ext_factor,
+                mscale,
+                corr,
+            );
         }
         for kh in 0..nkv {
             let khv = &mut k[kh * hd..kh * hd + hd];
             let mut tmp = vec![0.0f32; hd];
             rmsnorm(&mut tmp, khv, &kn, cfg.rms_eps);
             khv.copy_from_slice(&tmp);
-            rope_neox(khv, pos, cfg.n_rot, cfg.rope_freq_base, freq_scale, ext_factor, mscale, corr);
+            rope_neox(
+                khv,
+                pos,
+                cfg.n_rot,
+                cfg.rope_freq_base,
+                freq_scale,
+                ext_factor,
+                mscale,
+                corr,
+            );
         }
 
         // append to KV cache
@@ -430,10 +461,12 @@ impl MellumModel {
         for hh in 0..nh {
             let kvh = hh / groups;
             for (ti, t) in (win_start..len).enumerate() {
-                keys[ti * hd..ti * hd + hd]
-                    .copy_from_slice(&self.kc[il][t * kv_dim + kvh * hd..t * kv_dim + kvh * hd + hd]);
-                vals[ti * hd..ti * hd + hd]
-                    .copy_from_slice(&self.vc[il][t * kv_dim + kvh * hd..t * kv_dim + kvh * hd + hd]);
+                keys[ti * hd..ti * hd + hd].copy_from_slice(
+                    &self.kc[il][t * kv_dim + kvh * hd..t * kv_dim + kvh * hd + hd],
+                );
+                vals[ti * hd..ti * hd + hd].copy_from_slice(
+                    &self.vc[il][t * kv_dim + kvh * hd..t * kv_dim + kvh * hd + hd],
+                );
             }
             let mut oh = vec![0.0f32; hd];
             crate::attention::sdpa_single(

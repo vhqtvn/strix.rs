@@ -37,7 +37,7 @@ pub struct Qwen35Cfg {
     pub n_head_kv: usize,
     pub head_dim: usize, // key_length == value_length
     pub rope_freq_base: f32,
-    pub n_rot: usize,          // rope dimension_count (partial: < head_dim)
+    pub n_rot: usize, // rope dimension_count (partial: < head_dim)
     pub rope_sections: [i64; 4],
     pub full_attn_interval: usize,
     // MoE
@@ -66,7 +66,10 @@ impl Qwen35Cfg {
         let k = |s: &str| format!("qwen35moe.{s}");
         // rope sections [11,11,10,0]
         let mut rope_sections = [0i64; 4];
-        if let Some(arr) = g.meta(&k("rope.dimension_sections")).and_then(|v| v.as_array()) {
+        if let Some(arr) = g
+            .meta(&k("rope.dimension_sections"))
+            .and_then(|v| v.as_array())
+        {
             for (i, v) in arr.iter().take(4).enumerate() {
                 rope_sections[i] = v.as_u64().map(|x| x as i64).unwrap_or(0);
             }
@@ -167,7 +170,10 @@ pub fn p0_validate(g: &GgufFile) -> Result<(Qwen35Cfg, String)> {
             // Gated-DeltaNet linear-attn tensors
             want(b("attn_qkv.weight"), &[cfg.hidden, key_dim * 2 + value_dim]);
             want(b("attn_gate.weight"), &[cfg.hidden, value_dim]);
-            want(b("ssm_conv1d.weight"), &[cfg.ssm_d_conv, key_dim * 2 + value_dim]);
+            want(
+                b("ssm_conv1d.weight"),
+                &[cfg.ssm_d_conv, key_dim * 2 + value_dim],
+            );
             want(b("ssm_a"), &[cfg.ssm_dt_rank]);
             want(b("ssm_dt.bias"), &[cfg.ssm_dt_rank]);
             want(b("ssm_alpha.weight"), &[cfg.hidden, cfg.ssm_dt_rank]);
@@ -185,9 +191,18 @@ pub fn p0_validate(g: &GgufFile) -> Result<(Qwen35Cfg, String)> {
         }
         // MoE (every layer)
         want(b("ffn_gate_inp.weight"), &[cfg.hidden, cfg.n_expert]);
-        want(b("ffn_gate_exps.weight"), &[cfg.hidden, cfg.expert_ff, cfg.n_expert]);
-        want(b("ffn_up_exps.weight"), &[cfg.hidden, cfg.expert_ff, cfg.n_expert]);
-        want(b("ffn_down_exps.weight"), &[cfg.expert_ff, cfg.hidden, cfg.n_expert]);
+        want(
+            b("ffn_gate_exps.weight"),
+            &[cfg.hidden, cfg.expert_ff, cfg.n_expert],
+        );
+        want(
+            b("ffn_up_exps.weight"),
+            &[cfg.hidden, cfg.expert_ff, cfg.n_expert],
+        );
+        want(
+            b("ffn_down_exps.weight"),
+            &[cfg.expert_ff, cfg.hidden, cfg.n_expert],
+        );
         want(b("ffn_gate_inp_shexp.weight"), &[cfg.hidden]);
         want(b("ffn_gate_shexp.weight"), &[cfg.hidden, cfg.shared_ff]);
         want(b("ffn_up_shexp.weight"), &[cfg.hidden, cfg.shared_ff]);
@@ -200,7 +215,11 @@ pub fn p0_validate(g: &GgufFile) -> Result<(Qwen35Cfg, String)> {
         cfg.report(),
         checked,
         missing.len(),
-        if tied { "tied to token_embd" } else { "separate output.weight" },
+        if tied {
+            "tied to token_embd"
+        } else {
+            "separate output.weight"
+        },
     );
     if missing.is_empty() {
         Ok((cfg, report))
@@ -229,7 +248,11 @@ fn sigmoid(x: f32) -> f32 {
 #[inline]
 fn softplus(x: f32) -> f32 {
     // numerically stable
-    if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
+    if x > 20.0 {
+        x
+    } else {
+        (1.0 + x.exp()).ln()
+    }
 }
 
 /// RMSNorm over a slice with a weight vector (out = x/rms(x) * w).
@@ -268,7 +291,14 @@ fn partial_rope(vec: &mut [f32], pos: usize, freq_base: f32, n_rot: usize) {
 
 /// On-the-fly dequant matmul: out[o] = sum_i W[o][i]*x[i]. `bytes` = a weight whose
 /// rows are `in_dim` elements each (gguf dims [in_dim, out_dim]); out.len() = out_dim.
-fn qmatmul(out: &mut [f32], x: &[f32], bytes: &[u8], ty: GgmlType, in_dim: usize, _row: &mut [f32]) {
+fn qmatmul(
+    out: &mut [f32],
+    x: &[f32],
+    bytes: &[u8],
+    ty: GgmlType,
+    in_dim: usize,
+    _row: &mut [f32],
+) {
     let bpr = (in_dim / ty.block_elems()) * ty.block_bytes();
     // Rows are independent: parallelize across cores with per-thread dequant scratch
     // (the `_row` arg is kept for call-site compatibility but no longer used).
@@ -396,7 +426,11 @@ impl Qwen35Model {
         let mut h = vec![0.0f32; hidden];
         {
             let bpr = (hidden / emb.ty.block_elems()) * emb.ty.block_bytes();
-            dequantize_into(emb.ty, &emb.bytes[token as usize * bpr..token as usize * bpr + bpr], &mut h)?;
+            dequantize_into(
+                emb.ty,
+                &emb.bytes[token as usize * bpr..token as usize * bpr + bpr],
+                &mut h,
+            )?;
         }
 
         for il in 0..cfg.n_layer {
@@ -501,13 +535,24 @@ impl Qwen35Model {
         for hh in 0..nh {
             let kvh = hh / groups;
             for t in 0..len {
-                keys[t * hd..t * hd + hd]
-                    .copy_from_slice(&self.kc[il][t * kv_dim + kvh * hd..t * kv_dim + kvh * hd + hd]);
-                vals[t * hd..t * hd + hd]
-                    .copy_from_slice(&self.vc[il][t * kv_dim + kvh * hd..t * kv_dim + kvh * hd + hd]);
+                keys[t * hd..t * hd + hd].copy_from_slice(
+                    &self.kc[il][t * kv_dim + kvh * hd..t * kv_dim + kvh * hd + hd],
+                );
+                vals[t * hd..t * hd + hd].copy_from_slice(
+                    &self.vc[il][t * kv_dim + kvh * hd..t * kv_dim + kvh * hd + hd],
+                );
             }
             let mut oh = vec![0.0f32; hd];
-            crate::attention::sdpa_single(&mut oh, &q[hh * hd..hh * hd + hd], &keys, &vals, hd, len, scale, &mut scratch);
+            crate::attention::sdpa_single(
+                &mut oh,
+                &q[hh * hd..hh * hd + hd],
+                &keys,
+                &vals,
+                hd,
+                len,
+                scale,
+                &mut scratch,
+            );
             // output gating
             for d in 0..hd {
                 oh[d] *= sigmoid(gate[hh * hd + d]);
@@ -550,7 +595,14 @@ impl Qwen35Model {
             let wbeta = self.w(&b("ssm_beta.weight"))?;
             qmatmul(&mut beta_raw, x, wbeta.bytes, wbeta.ty, wbeta.in_dim, row);
             let walpha = self.w(&b("ssm_alpha.weight"))?;
-            qmatmul(&mut alpha_raw, x, walpha.bytes, walpha.ty, walpha.in_dim, row);
+            qmatmul(
+                &mut alpha_raw,
+                x,
+                walpha.bytes,
+                walpha.ty,
+                walpha.in_dim,
+                row,
+            );
         }
 
         // causal depthwise conv (kernel dconv) over qkv using conv state, then silu
@@ -575,7 +627,7 @@ impl Qwen35Model {
         let q = &conv_out[0..key_dim]; // 16 heads x 128
         let k = &conv_out[key_dim..2 * key_dim];
         let v = &conv_out[2 * key_dim..2 * key_dim + value_dim]; // 32 heads x 128
-        // L2-norm q,k per k-head (128)
+                                                                 // L2-norm q,k per k-head (128)
         let mut qn = vec![0.0f32; key_dim];
         let mut kn = vec![0.0f32; key_dim];
         qn.copy_from_slice(q);
@@ -596,7 +648,7 @@ impl Qwen35Model {
             let betah = sigmoid(beta_raw[vh]);
             let decay = g.exp();
             let st = &mut self.ssm[il][vh * s_v * s_v..vh * s_v * s_v + s_v * s_v]; // s[j*s_v+i]=S[i][j]
-            // 1) decay
+                                                                                    // 1) decay
             for x in st.iter_mut() {
                 *x *= decay;
             }
@@ -634,7 +686,12 @@ impl Qwen35Model {
         let mut gated = vec![0.0f32; value_dim];
         for vh in 0..n_vh {
             let mut tmp = vec![0.0f32; s_v];
-            rmsnorm(&mut tmp, &core[vh * s_v..vh * s_v + s_v], &ssm_norm, cfg.rms_eps);
+            rmsnorm(
+                &mut tmp,
+                &core[vh * s_v..vh * s_v + s_v],
+                &ssm_norm,
+                cfg.rms_eps,
+            );
             for j in 0..s_v {
                 gated[vh * s_v + j] = tmp[j] * silu(z[vh * s_v + j]);
             }

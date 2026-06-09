@@ -358,7 +358,10 @@ fn run_gguf(path: &Path, prompt: &str, max_tokens: usize, chat: bool, gpu: bool)
                 let (pr, dr) = (prompt_ids.len() as f64 / ps, dn as f64 / ds);
                 pf.push(pr);
                 dc.push(dr);
-                eprintln!("[bench] rep{}: prefill {pr:.1} tok/s | decode {dr:.2} tok/s", r - warm + 1);
+                eprintln!(
+                    "[bench] rep{}: prefill {pr:.1} tok/s | decode {dr:.2} tok/s",
+                    r - warm + 1
+                );
             } else {
                 eprintln!("[bench] warmup {} done (discarded)", r + 1);
             }
