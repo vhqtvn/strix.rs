@@ -548,10 +548,12 @@ impl RocmWeightAccel {
         // so it moves FLOPs off the iGPU for free (power) at no wall-time cost.
         if !self.npu_q_pending.is_empty() {
             let qd = 4096usize; // local q_dim
+            // Default 4096 → attn_q(local) FULLY on NPU (full-N 256x3840x4096_8c xclbin
+            // exists); max-NPU posture, transparent partition. STRIX_NPU_NNPU_Q overrides.
             let n_npu_q = std::env::var("STRIX_NPU_NNPU_Q")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(2048usize);
+                .unwrap_or(4096usize);
             let n_ig_q = qd - n_npu_q;
             let xclbin = format!("{dir}/final_256x{k}x{n_npu_q}_64x64x64_{cols}c.xclbin");
             let insts_path = format!("{dir}/insts_256x{k}x{n_npu_q}_64x64x64_{cols}c.txt");
