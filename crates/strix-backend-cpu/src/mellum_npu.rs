@@ -179,6 +179,7 @@ impl NpuShape {
 pub struct MellumNpu {
     pub q: NpuShape,    // [2304 -> 4096]
     pub o: NpuShape,    // [4096 -> 2304]
+    pub kv: NpuShape,   // [2304 -> 512] attn_k / attn_v (slots il*2 / il*2+1)
     pub gu2: NpuShape,  // expert gate‖up fused [2304 -> 1792] (one call → both)
     pub down: NpuShape, // expert down [896 -> 2304]
 }
@@ -188,6 +189,7 @@ impl MellumNpu {
         Ok(MellumNpu {
             q: NpuShape::open(dir, 2304, 4096, 8)?,
             o: NpuShape::open(dir, 4096, 2304, 4)?,
+            kv: NpuShape::open(dir, 2304, 512, 8)?,
             gu2: NpuShape::open(dir, 2304, 1792, 4)?,
             down: NpuShape::open(dir, 896, 2304, 4)?,
         })

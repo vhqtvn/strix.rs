@@ -374,6 +374,19 @@ impl MellumModel {
                     break 'stage;
                 }
                 n += 1;
+                for (j, t) in ["attn_k", "attn_v"].iter().enumerate() {
+                    let name = format!("blk.{il}.{t}.weight");
+                    let (Some(ti), Ok(bytes)) = (
+                        self.gguf.tensors().get(&name),
+                        self.gguf.tensor_bytes(&name),
+                    ) else {
+                        continue;
+                    };
+                    if npu.kv.stage_q8((il * 2 + j) as u64, bytes, ti.ggml_type).is_err() {
+                        break 'stage;
+                    }
+                    n += 1;
+                }
             }
             let eff = self.cfg.expert_ff;
             let hidden = self.cfg.hidden;
@@ -598,15 +611,21 @@ impl MellumModel {
         if m < crate::mellum_npu::M_MIN {
             return false; // per-call NPU latency dominates tiny chunks; CPU wins
         }
-        let sh = if which == 0 { &npu.q } else { &npu.o };
-        if sh.k != k || sh.n != n || !sh.has(il as u64) {
+        // which: 0 = attn_q, 1 = attn_output, 2 = attn_k, 3 = attn_v
+        let (sh, slot) = match which {
+            0 => (&npu.q, il as u64),
+            1 => (&npu.o, il as u64),
+            2 => (&npu.kv, (il * 2) as u64),
+            _ => (&npu.kv, (il * 2 + 1) as u64),
+        };
+        if sh.k != k || sh.n != n || !sh.has(slot) {
             return false;
         }
         for c in (0..m).step_by(crate::mellum_npu::M_NPU) {
             let mc = (m - c).min(crate::mellum_npu::M_NPU);
             if sh
                 .gemm(
-                    il as u64,
+                    slot,
                     &xs[c * k..(c + mc) * k],
                     mc,
                     &mut out[c * n..(c + mc) * n],
@@ -743,10 +762,14 @@ impl MellumModel {
                     let wq = self.w(&b("attn_q.weight"))?;
                     qmatmul_batch(&mut q, &n, m, wq.bytes, wq.ty, hidden, q_dim);
                 }
-                let wk = self.w(&b("attn_k.weight"))?;
-                qmatmul_batch(&mut k, &n, m, wk.bytes, wk.ty, hidden, kv_dim);
-                let wv = self.w(&b("attn_v.weight"))?;
-                qmatmul_batch(&mut v, &n, m, wv.bytes, wv.ty, hidden, kv_dim);
+                if !self.npu_mm(il, 2, &n, m, hidden, kv_dim, &mut k) {
+                    let wk = self.w(&b("attn_k.weight"))?;
+                    qmatmul_batch(&mut k, &n, m, wk.bytes, wk.ty, hidden, kv_dim);
+                }
+                if !self.npu_mm(il, 3, &n, m, hidden, kv_dim, &mut v) {
+                    let wv = self.w(&b("attn_v.weight"))?;
+                    qmatmul_batch(&mut v, &n, m, wv.bytes, wv.ty, hidden, kv_dim);
+                }
             }
             let is_swa = cfg.is_swa(il);
             let (freq_scale, ext_factor, mscale) = if is_swa {
