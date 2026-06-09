@@ -409,19 +409,18 @@ impl Qwen35Model {
             names.push("output.weight".to_string());
         }
         let mut n = 0usize;
-        let mut up = |accel: &mut Box<dyn strix_core::WeightAccel>,
-                      key: &str,
-                      bytes: &[u8],
-                      ty: GgmlType,
-                      in_dim: usize,
-                      out_dim: usize| {
-            let ok = match ty {
+        // Returns true iff the weight was adopted by the accelerator.
+        let up = |accel: &mut Box<dyn strix_core::WeightAccel>,
+                  key: &str,
+                  bytes: &[u8],
+                  ty: GgmlType,
+                  in_dim: usize,
+                  out_dim: usize|
+         -> bool {
+            match ty {
                 GgmlType::Q4_0 => accel.upload_q4_0(key, bytes, in_dim, out_dim),
                 GgmlType::Q6K => accel.upload_q6_k(key, bytes, in_dim, out_dim),
                 _ => false, // Q8_0 (dense, in UD quant) not supported yet — stays CPU
-            };
-            if ok {
-                n += 1;
             }
         };
         for name in &names {
@@ -431,7 +430,9 @@ impl Qwen35Model {
             let (ty, in_dim) = (ti.ggml_type, ti.dims[0] as usize);
             let out_dim: usize = ti.dims[1..].iter().map(|&d| d as usize).product();
             if let Ok(bytes) = self.gguf.tensor_bytes(name) {
-                up(&mut accel, name, bytes, ty, in_dim, out_dim);
+                if up(&mut accel, name, bytes, ty, in_dim, out_dim) {
+                    n += 1;
+                }
             }
         }
         // MoE experts (P2): the bulk of the model. Each 3D `ffn_*_exps` tensor is
@@ -441,6 +442,7 @@ impl Qwen35Model {
         let hidden = self.cfg.hidden;
         let eff = self.cfg.expert_ff;
         let ne = self.cfg.n_expert;
+        let mut advise: Vec<String> = Vec::new();
         for il in 0..self.cfg.n_layer {
             for (tname, in_dim, out_dim) in [
                 ("ffn_gate_exps", hidden, eff),
@@ -459,18 +461,32 @@ impl Qwen35Model {
                 let Ok(bytes) = self.gguf.tensor_bytes(&full) else {
                     continue;
                 };
+                let mut got = 0usize;
                 for e in 0..ne {
                     let slice = &bytes[e * bpr..(e + 1) * bpr];
-                    up(
+                    if up(
                         &mut accel,
                         &format!("blk.{il}.{tname}.e{e}"),
                         slice,
                         ty,
                         in_dim,
                         out_dim,
-                    );
+                    ) {
+                        got += 1;
+                    }
+                }
+                n += got;
+                // If every expert of this tensor was uploaded to the GPU, drop its
+                // CPU mmap pages (MADV_DONTNEED) — the GPU now holds the working copy.
+                // Avoids double-counting ~24GB of experts (mmap + UMA) which would
+                // otherwise swap-thrash a 58GB box on the 35B model.
+                if got == ne {
+                    advise.push(full.clone());
                 }
             }
+        }
+        for name in &advise {
+            self.gguf.advise_dontneed(name);
         }
         self.accel = Some(accel);
         n

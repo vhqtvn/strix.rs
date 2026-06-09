@@ -231,6 +231,34 @@ impl GgufFile {
         Ok(&self.mmap[start..end])
     }
 
+    /// Advise the kernel to drop the resident pages of tensor `name`
+    /// (`MADV_DONTNEED`). For this read-only shared file mapping this is safe: any
+    /// later access re-faults the pages from the backing file. Used to release the
+    /// CPU-resident copy of a weight once it has been uploaded to a GPU accelerator
+    /// (otherwise the weight is double-counted: mmap on CPU + buffer on the iGPU's
+    /// unified memory). Only whole pages fully inside the tensor are dropped.
+    pub fn advise_dontneed(&self, name: &str) {
+        let Some(info) = self.tensors.get(name) else {
+            return;
+        };
+        let start = self.data_offset + info.offset as usize;
+        let nbytes = (info.numel() / info.ggml_type.block_elems()) * info.ggml_type.block_bytes();
+        let page = 4096usize;
+        let a = start.div_ceil(page) * page; // first whole page inside the tensor
+        let b = (start + nbytes) / page * page; // last whole-page boundary
+        if b > a && b <= self.mmap.len() {
+            // SAFETY: `self.mmap` is a read-only shared file mapping; MADV_DONTNEED only
+            // discards cached pages, which re-fault from the file on next read.
+            unsafe {
+                let _ = self.mmap.unchecked_advise_range(
+                    memmap2::UncheckedAdvice::DontNeed,
+                    a,
+                    b - a,
+                );
+            }
+        }
+    }
+
     /// Dequantize a tensor to `f32`.
     pub fn dequant_tensor(&self, name: &str) -> Result<Vec<f32>> {
         let info = self
