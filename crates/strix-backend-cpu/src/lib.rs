@@ -9,6 +9,7 @@ pub mod attention;
 pub mod gemma;
 pub mod kv_cache;
 pub mod llama;
+pub mod mellum;
 pub mod ops;
 pub mod qwen35;
 

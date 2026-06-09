@@ -184,6 +184,70 @@ fn run_qwen35(gguf: GgufFile, prompt: &str, max_tokens: usize) -> Result<()> {
     Ok(())
 }
 
+/// JetBrains Mellum2 (`mellum`) CPU-reference path. Sparse-MoE transformer with
+/// hybrid sliding/full attention + per-layer-type RoPE (YaRN on full layers). Takes
+/// raw token IDs via `STRIX_QWEN_IDS` (or the prompt) — same tokenizer caveat as Qwen.
+fn run_mellum(gguf: GgufFile, prompt: &str, max_tokens: usize) -> Result<()> {
+    use strix_backend_cpu::mellum::{MellumCfg, MellumModel};
+
+    let cfg = MellumCfg::from_gguf(&gguf).context("parse mellum config")?;
+    eprintln!("[mellum] {}", cfg.report());
+
+    let id_src = std::env::var("STRIX_QWEN_IDS").unwrap_or_else(|_| prompt.to_string());
+    let prompt_ids: Vec<u32> = id_src
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<u32>())
+        .collect::<std::result::Result<_, _>>()
+        .context(
+            "mellum needs raw token IDs (StrixTokenizer can't do gpt2-BPE). \
+             Set STRIX_QWEN_IDS=\"1,2,3\" or pass IDs as the prompt.",
+        )?;
+    if prompt_ids.is_empty() {
+        anyhow::bail!("mellum: no token IDs given (set STRIX_QWEN_IDS)");
+    }
+
+    let load_start = Instant::now();
+    let mut model = MellumModel::from_gguf(gguf).context("build mellum model")?;
+    eprintln!(
+        "[mellum] model built in {:.1}s, prompt = {} tokens",
+        load_start.elapsed().as_secs_f64(),
+        prompt_ids.len()
+    );
+
+    let sampler = GreedySampler;
+    let prefill_start = Instant::now();
+    let logits = model.prefill(&prompt_ids).context("mellum prefill")?;
+    let prefill_secs = prefill_start.elapsed().as_secs_f64();
+    let mut next = sampler.sample(&logits)?;
+
+    let mut top: Vec<(usize, f32)> = logits.0.iter().cloned().enumerate().collect();
+    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    eprintln!("[mellum] prompt next-token top5:");
+    for &(id, l) in top.iter().take(5) {
+        eprintln!("    id={id:<8} logit={l:.4}");
+    }
+
+    let mut generated: Vec<u32> = vec![next];
+    let decode_start = Instant::now();
+    for _ in 1..max_tokens {
+        let l = model.decode_one(next).context("mellum decode")?;
+        next = sampler.sample(&l)?;
+        generated.push(next);
+    }
+    let decode_secs = decode_start.elapsed().as_secs_f64();
+
+    let ids_str: Vec<String> = generated.iter().map(|t| t.to_string()).collect();
+    println!("[mellum] generated token IDs: {}", ids_str.join(","));
+    eprintln!(
+        "[mellum] prefill {:.1} tok/s ({} tok in {prefill_secs:.2}s) | decode {:.2} tok/s",
+        prompt_ids.len() as f64 / prefill_secs,
+        prompt_ids.len(),
+        (max_tokens.saturating_sub(1)) as f64 / decode_secs.max(1e-9),
+    );
+    Ok(())
+}
+
 /// GGUF/Gemma path: tokenizer + config + quantized weights all from the GGUF.
 fn run_gguf(path: &Path, prompt: &str, max_tokens: usize, chat: bool, gpu: bool) -> Result<()> {
     let total_start = Instant::now();
@@ -198,6 +262,9 @@ fn run_gguf(path: &Path, prompt: &str, max_tokens: usize, chat: bool, gpu: bool)
     // see docs/qwen36-arch.md). Reports and exits rather than failing in GemmaModel.
     if arch == "qwen35moe" {
         return run_qwen35(gguf, prompt, max_tokens);
+    }
+    if arch == "mellum" {
+        return run_mellum(gguf, prompt, max_tokens);
     }
 
     let tokenizer = StrixTokenizer::from_gguf(&gguf).context("build tokenizer from gguf")?;

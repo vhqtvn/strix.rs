@@ -1,0 +1,517 @@
+//! JetBrains Mellum2-12B-A2.5B (`mellum`) CPU reference forward.
+//!
+//! A Mixtral-class sparse-MoE transformer with two twists, both verified against
+//! `refs/llama.cpp/src/models/mellum.cpp`:
+//!   - **Hybrid attention**: every 4th layer (il where `(il+1)%4==0`) is full
+//!     attention; the rest are sliding-window (window=1024). Full layers use YaRN
+//!     RoPE (freq_scale=1/16, ext_factor=1, mscale via attn_factor); sliding layers
+//!     use plain RoPE (freq_scale=1, ext_factor=0). Both share freq_base=500000.
+//!   - **Per-head Q/K RMSNorm** over head_dim (128) before RoPE.
+//! MoE: 64 experts, top-8 softmax + renorm (norm_topk_prob), SiLU, NO shared expert.
+//! GQA: 32 q-heads / 4 kv-heads (groups=8), head_dim=128. Separate output.weight.
+//!
+//! Token-at-a-time forward with a KV cache (mirrors the qwen35 reference). CPU-only,
+//! on-the-fly dequant matmul (12B can't fit as f32). Correctness-first.
+
+use std::f32::consts::PI;
+
+use strix_core::backend::Decoder;
+use strix_core::error::{Result, StrixError};
+use strix_core::sampler::Logits;
+use strix_models::ggml_quant::{dequantize_into, GgmlType};
+use strix_models::gguf::GgufFile;
+
+fn mu32(g: &GgufFile, key: &str) -> Result<u32> {
+    g.meta_u32(key)
+}
+fn mu32_or(g: &GgufFile, key: &str, d: u32) -> u32 {
+    g.meta_u32(key).unwrap_or(d)
+}
+fn mf32_or(g: &GgufFile, key: &str, d: f32) -> f32 {
+    g.meta_f32(key).unwrap_or(d)
+}
+
+/// Parsed `mellum` hyper-parameters.
+#[derive(Debug, Clone)]
+pub struct MellumCfg {
+    pub n_layer: usize,
+    pub hidden: usize,
+    pub vocab: usize,
+    pub ctx_len: usize,
+    pub rms_eps: f32,
+    pub n_head: usize,
+    pub n_head_kv: usize,
+    pub head_dim: usize,
+    pub n_rot: usize,
+    pub rope_freq_base: f32,
+    pub n_expert: usize,
+    pub n_expert_used: usize,
+    pub expert_ff: usize,
+    pub sliding_window: usize,
+    pub swa_period: usize,
+    // YaRN (full-attention layers only)
+    pub yarn_factor: f32,      // rope.scaling.factor (e.g. 16)
+    pub yarn_orig_ctx: f32,    // rope.scaling.original_context_length (e.g. 8192)
+    pub yarn_attn_factor: f32, // rope.scaling.attn_factor (mscale passed in; usually 1.0)
+    pub yarn_beta_fast: f32,
+    pub yarn_beta_slow: f32,
+}
+
+impl MellumCfg {
+    pub fn from_gguf(g: &GgufFile) -> Result<MellumCfg> {
+        let arch = g
+            .architecture()
+            .ok_or_else(|| StrixError::invalid("mellum: no general.architecture"))?;
+        if arch != "mellum" {
+            return Err(StrixError::unsupported(format!(
+                "mellum: arch `{arch}` is not mellum"
+            )));
+        }
+        let k = |s: &str| format!("mellum.{s}");
+        let vocab = g
+            .tensors()
+            .get("token_embd.weight")
+            .and_then(|t| t.dims.last().copied())
+            .map(|d| d as usize)
+            .or_else(|| g.meta_u32(&k("vocab_size")).ok().map(|v| v as usize))
+            .ok_or_else(|| StrixError::invalid("mellum: cannot determine vocab"))?;
+
+        // Mellum has no `rope.dimension_count` key; llama.cpp asserts n_rot == head_dim.
+        let head_dim = mu32(g, &k("attention.key_length"))? as usize;
+        Ok(MellumCfg {
+            n_layer: mu32(g, &k("block_count"))? as usize,
+            hidden: mu32(g, &k("embedding_length"))? as usize,
+            vocab,
+            ctx_len: mu32_or(g, &k("context_length"), 0) as usize,
+            rms_eps: mf32_or(g, &k("attention.layer_norm_rms_epsilon"), 1e-6),
+            n_head: mu32(g, &k("attention.head_count"))? as usize,
+            n_head_kv: mu32(g, &k("attention.head_count_kv"))? as usize,
+            head_dim,
+            n_rot: mu32_or(g, &k("rope.dimension_count"), head_dim as u32) as usize,
+            rope_freq_base: mf32_or(g, &k("rope.freq_base"), 500000.0),
+            n_expert: mu32(g, &k("expert_count"))? as usize,
+            n_expert_used: mu32(g, &k("expert_used_count"))? as usize,
+            expert_ff: mu32(g, &k("expert_feed_forward_length"))? as usize,
+            sliding_window: mu32_or(g, &k("attention.sliding_window"), 0) as usize,
+            swa_period: mu32_or(g, &k("attention.sliding_window_pattern"), 4) as usize,
+            yarn_factor: mf32_or(g, &k("rope.scaling.factor"), 1.0),
+            yarn_orig_ctx: mu32_or(g, &k("rope.scaling.original_context_length"), 0) as f32,
+            yarn_attn_factor: mf32_or(g, &k("rope.scaling.attn_factor"), 1.0),
+            yarn_beta_fast: mf32_or(g, &k("rope.scaling.yarn_beta_fast"), 32.0),
+            yarn_beta_slow: mf32_or(g, &k("rope.scaling.yarn_beta_slow"), 1.0),
+        })
+    }
+
+    /// True if layer `il` is a sliding-window-attention layer (else full attention).
+    /// Matches llama.cpp `set_swa_pattern`: every `swa_period`-th layer is full.
+    pub fn is_swa(&self, il: usize) -> bool {
+        self.sliding_window > 0 && self.swa_period > 0 && (il + 1) % self.swa_period != 0
+    }
+
+    pub fn report(&self) -> String {
+        let n_full = (0..self.n_layer).filter(|&l| !self.is_swa(l)).count();
+        format!(
+            "mellum: {} layers ({} sliding / {} full-attn, window={}, period={}), hidden={}, vocab={}, ctx={}\n  \
+             attn: head_dim={} n_head={} n_head_kv={} (GQA {}:1), QK-norm, NEOX rope n_rot={} freq_base={:.0}\n  \
+             YaRN(full layers): factor={} orig_ctx={} attn_factor={} beta=[{},{}]\n  \
+             MoE: {} experts top-{}, expert_ff={} (no shared expert), rms_eps={:.1e}",
+            self.n_layer, self.n_layer - n_full, n_full, self.sliding_window, self.swa_period,
+            self.hidden, self.vocab, self.ctx_len,
+            self.head_dim, self.n_head, self.n_head_kv, self.n_head / self.n_head_kv.max(1),
+            self.n_rot, self.rope_freq_base,
+            self.yarn_factor, self.yarn_orig_ctx, self.yarn_attn_factor, self.yarn_beta_fast, self.yarn_beta_slow,
+            self.n_expert, self.n_expert_used, self.expert_ff, self.rms_eps,
+        )
+    }
+}
+
+#[inline]
+fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+/// RMSNorm over a slice with a weight vector (out = x/rms(x) * w).
+fn rmsnorm(out: &mut [f32], x: &[f32], w: &[f32], eps: f32) {
+    let n = x.len();
+    let ss: f32 = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
+    let r = 1.0 / (ss + eps).sqrt();
+    for i in 0..n {
+        out[i] = x[i] * r * w[i];
+    }
+}
+
+// --- YaRN RoPE (replicates ggml `rope_yarn` / `ggml_rope_cache_init`, NEOX) ---
+
+fn yarn_corr_dim(n_dims: usize, n_ctx_orig: f32, n_rot: f32, base: f32) -> f32 {
+    n_dims as f32 * (n_ctx_orig / (n_rot * 2.0 * PI)).ln() / (2.0 * base.ln())
+}
+
+fn yarn_corr_dims(n_dims: usize, n_ctx_orig: f32, base: f32, beta_fast: f32, beta_slow: f32) -> [f32; 2] {
+    let start = yarn_corr_dim(n_dims, n_ctx_orig, beta_fast, base).floor();
+    let end = yarn_corr_dim(n_dims, n_ctx_orig, beta_slow, base).ceil();
+    [start.max(0.0), end.min(n_dims as f32 - 1.0)]
+}
+
+#[inline]
+fn yarn_ramp(low: f32, high: f32, i0: usize) -> f32 {
+    let y = ((i0 / 2) as f32 - low) / (high - low).max(0.001);
+    1.0 - y.min(1.0).max(0.0)
+}
+
+/// One YaRN-corrected (cos,sin) for pair index, exactly as ggml `rope_yarn`.
+#[inline]
+fn rope_yarn(
+    theta_extrap: f32,
+    freq_scale: f32,
+    corr: [f32; 2],
+    i0: usize,
+    ext_factor: f32,
+    mscale_in: f32,
+) -> (f32, f32) {
+    let theta_interp = freq_scale * theta_extrap;
+    let mut theta = theta_interp;
+    let mut mscale = mscale_in;
+    if ext_factor != 0.0 {
+        let ramp_mix = yarn_ramp(corr[0], corr[1], i0) * ext_factor;
+        theta = theta_interp * (1.0 - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0 + 0.1 * (1.0 / freq_scale).ln();
+    }
+    (theta.cos() * mscale, theta.sin() * mscale)
+}
+
+/// NEOX RoPE on a head vector (`vec.len() == head_dim`, rotating the first `n_dims`).
+/// `ext_factor`/`freq_scale`/`mscale` select plain (sliding) vs YaRN (full) behaviour.
+#[allow(clippy::too_many_arguments)]
+fn rope_neox(
+    vec: &mut [f32],
+    pos: usize,
+    n_dims: usize,
+    freq_base: f32,
+    freq_scale: f32,
+    ext_factor: f32,
+    mscale: f32,
+    corr: [f32; 2],
+) {
+    let half = n_dims / 2;
+    let theta_scale = freq_base.powf(-2.0 / n_dims as f32);
+    let mut theta = pos as f32;
+    for k in 0..half {
+        let (c, s) = rope_yarn(theta, freq_scale, corr, 2 * k, ext_factor, mscale);
+        let x0 = vec[k];
+        let x1 = vec[k + half];
+        vec[k] = x0 * c - x1 * s;
+        vec[k + half] = x0 * s + x1 * c;
+        theta *= theta_scale;
+    }
+}
+
+/// On-the-fly dequant matmul: out[o] = sum_i W[o][i]*x[i]. `bytes` = a weight whose
+/// rows are `in_dim` elements each (gguf dims [in_dim, out_dim]); out.len() = out_dim.
+fn qmatmul(out: &mut [f32], x: &[f32], bytes: &[u8], ty: GgmlType, in_dim: usize, row: &mut [f32]) {
+    let bpr = (in_dim / ty.block_elems()) * ty.block_bytes();
+    let row = &mut row[..in_dim];
+    for (o, oref) in out.iter_mut().enumerate() {
+        dequantize_into(ty, &bytes[o * bpr..o * bpr + bpr], row).unwrap();
+        let mut s = 0.0f32;
+        for i in 0..in_dim {
+            s += row[i] * x[i];
+        }
+        *oref = s;
+    }
+}
+
+/// A resolved weight: raw bytes + ggml type + the row length (in_dim).
+struct W<'a> {
+    bytes: &'a [u8],
+    ty: GgmlType,
+    in_dim: usize,
+}
+
+pub struct MellumModel {
+    gguf: GgufFile,
+    cfg: MellumCfg,
+    // per layer: KV cache, flat [t * kv_dim ..] (kv_dim = n_head_kv * head_dim)
+    kc: Vec<Vec<f32>>,
+    vc: Vec<Vec<f32>>,
+    pos: usize,
+}
+
+impl MellumModel {
+    pub fn from_gguf(gguf: GgufFile) -> Result<Self> {
+        let cfg = MellumCfg::from_gguf(&gguf)?;
+        let nl = cfg.n_layer;
+        Ok(MellumModel {
+            kc: vec![Vec::new(); nl],
+            vc: vec![Vec::new(); nl],
+            cfg,
+            gguf,
+            pos: 0,
+        })
+    }
+
+    fn w(&self, name: &str) -> Result<W<'_>> {
+        let ti = self
+            .gguf
+            .tensors()
+            .get(name)
+            .ok_or_else(|| StrixError::invalid(format!("mellum: missing tensor {name}")))?;
+        let in_dim = ti.dims[0] as usize;
+        Ok(W {
+            bytes: self.gguf.tensor_bytes(name)?,
+            ty: ti.ggml_type,
+            in_dim,
+        })
+    }
+
+    fn vecw(&self, name: &str) -> Result<Vec<f32>> {
+        let ti = self
+            .gguf
+            .tensors()
+            .get(name)
+            .ok_or_else(|| StrixError::invalid(format!("mellum: missing tensor {name}")))?;
+        let n: usize = ti.dims.iter().map(|&d| d as usize).product();
+        let mut out = vec![0.0f32; n];
+        dequantize_into(ti.ggml_type, self.gguf.tensor_bytes(name)?, &mut out)?;
+        Ok(out)
+    }
+
+    fn forward(&mut self, token: u32, want_logits: bool) -> Result<Option<Vec<f32>>> {
+        let cfg = self.cfg.clone();
+        let pos = self.pos;
+        let hidden = cfg.hidden;
+        let eps = cfg.rms_eps;
+        let mut row = vec![0.0f32; 8192]; // dequant scratch (>= max in_dim)
+
+        // embedding row
+        let emb = self.w("token_embd.weight")?;
+        let mut h = vec![0.0f32; hidden];
+        {
+            let bpr = (hidden / emb.ty.block_elems()) * emb.ty.block_bytes();
+            dequantize_into(
+                emb.ty,
+                &emb.bytes[token as usize * bpr..token as usize * bpr + bpr],
+                &mut h,
+            )?;
+        }
+
+        for il in 0..cfg.n_layer {
+            let b = |s: &str| format!("blk.{il}.{s}");
+            let an = self.vecw(&b("attn_norm.weight"))?;
+            let mut n = vec![0.0f32; hidden];
+            rmsnorm(&mut n, &h, &an, eps);
+
+            let attn = self.attn(&n, il, pos, &mut row)?;
+            for i in 0..hidden {
+                h[i] += attn[i];
+            }
+
+            let ffn_res = h.clone();
+            let fn_ = self.vecw(&b("ffn_norm.weight"))?;
+            let mut nn = vec![0.0f32; hidden];
+            rmsnorm(&mut nn, &h, &fn_, eps);
+            let moe = self.moe(&nn, il, &mut row)?;
+            for i in 0..hidden {
+                h[i] = ffn_res[i] + moe[i];
+            }
+        }
+        self.pos += 1;
+
+        if !want_logits {
+            return Ok(None);
+        }
+        let on = self.vecw("output_norm.weight")?;
+        let mut nh = vec![0.0f32; hidden];
+        rmsnorm(&mut nh, &h, &on, eps);
+        let head = if self.gguf.tensors().contains_key("output.weight") {
+            self.w("output.weight")?
+        } else {
+            self.w("token_embd.weight")?
+        };
+        let mut logits = vec![0.0f32; cfg.vocab];
+        qmatmul(&mut logits, &nh, head.bytes, head.ty, hidden, &mut row);
+        Ok(Some(logits))
+    }
+
+    fn attn(&mut self, x: &[f32], il: usize, pos: usize, row: &mut [f32]) -> Result<Vec<f32>> {
+        let cfg = self.cfg.clone();
+        let hd = cfg.head_dim; // 128
+        let nh = cfg.n_head; // 32
+        let nkv = cfg.n_head_kv; // 4
+        let groups = nh / nkv; // 8
+        let kv_dim = nkv * hd; // 512
+        let b = |s: &str| format!("blk.{il}.{s}");
+        let qn = self.vecw(&b("attn_q_norm.weight"))?;
+        let kn = self.vecw(&b("attn_k_norm.weight"))?;
+        let mut q = vec![0.0f32; hd * nh]; // 4096
+        let mut k = vec![0.0f32; kv_dim];
+        let mut v = vec![0.0f32; kv_dim];
+        {
+            let wq = self.w(&b("attn_q.weight"))?;
+            qmatmul(&mut q, x, wq.bytes, wq.ty, wq.in_dim, row);
+            let wk = self.w(&b("attn_k.weight"))?;
+            qmatmul(&mut k, x, wk.bytes, wk.ty, wk.in_dim, row);
+            let wv = self.w(&b("attn_v.weight"))?;
+            qmatmul(&mut v, x, wv.bytes, wv.ty, wv.in_dim, row);
+        }
+
+        // RoPE config for this layer: sliding => plain, full => YaRN.
+        let is_swa = cfg.is_swa(il);
+        let (freq_scale, ext_factor, mscale) = if is_swa {
+            (1.0, 0.0, 1.0)
+        } else {
+            (1.0 / cfg.yarn_factor, 1.0, cfg.yarn_attn_factor)
+        };
+        let corr = yarn_corr_dims(
+            cfg.n_rot,
+            cfg.yarn_orig_ctx,
+            cfg.rope_freq_base,
+            cfg.yarn_beta_fast,
+            cfg.yarn_beta_slow,
+        );
+
+        // per-head Q-norm + rope; per-kv-head K-norm + rope
+        for hh in 0..nh {
+            let qh = &mut q[hh * hd..hh * hd + hd];
+            let mut tmp = vec![0.0f32; hd];
+            rmsnorm(&mut tmp, qh, &qn, cfg.rms_eps);
+            qh.copy_from_slice(&tmp);
+            rope_neox(qh, pos, cfg.n_rot, cfg.rope_freq_base, freq_scale, ext_factor, mscale, corr);
+        }
+        for kh in 0..nkv {
+            let khv = &mut k[kh * hd..kh * hd + hd];
+            let mut tmp = vec![0.0f32; hd];
+            rmsnorm(&mut tmp, khv, &kn, cfg.rms_eps);
+            khv.copy_from_slice(&tmp);
+            rope_neox(khv, pos, cfg.n_rot, cfg.rope_freq_base, freq_scale, ext_factor, mscale, corr);
+        }
+
+        // append to KV cache
+        self.kc[il].extend_from_slice(&k);
+        self.vc[il].extend_from_slice(&v);
+        let len = pos + 1;
+        // sliding window: attend to keys in [win_start, pos]
+        let win_start = if is_swa && cfg.sliding_window > 0 && len > cfg.sliding_window {
+            len - cfg.sliding_window
+        } else {
+            0
+        };
+        let wlen = len - win_start;
+        let scale = 1.0 / (hd as f32).sqrt();
+
+        let mut attn_out = vec![0.0f32; hd * nh];
+        let mut keys = vec![0.0f32; wlen * hd];
+        let mut vals = vec![0.0f32; wlen * hd];
+        let mut scratch = vec![0.0f32; wlen];
+        for hh in 0..nh {
+            let kvh = hh / groups;
+            for (ti, t) in (win_start..len).enumerate() {
+                keys[ti * hd..ti * hd + hd]
+                    .copy_from_slice(&self.kc[il][t * kv_dim + kvh * hd..t * kv_dim + kvh * hd + hd]);
+                vals[ti * hd..ti * hd + hd]
+                    .copy_from_slice(&self.vc[il][t * kv_dim + kvh * hd..t * kv_dim + kvh * hd + hd]);
+            }
+            let mut oh = vec![0.0f32; hd];
+            crate::attention::sdpa_single(
+                &mut oh,
+                &q[hh * hd..hh * hd + hd],
+                &keys,
+                &vals,
+                hd,
+                wlen,
+                scale,
+                &mut scratch,
+            );
+            attn_out[hh * hd..hh * hd + hd].copy_from_slice(&oh);
+        }
+        let mut o = vec![0.0f32; cfg.hidden];
+        {
+            let wo = self.w(&b("attn_output.weight"))?;
+            qmatmul(&mut o, &attn_out, wo.bytes, wo.ty, wo.in_dim, row);
+        }
+        Ok(o)
+    }
+
+    fn moe(&self, x: &[f32], il: usize, row: &mut [f32]) -> Result<Vec<f32>> {
+        let cfg = &self.cfg;
+        let hidden = cfg.hidden;
+        let ne = cfg.n_expert; // 64
+        let topk = cfg.n_expert_used; // 8
+        let eff = cfg.expert_ff; // 896
+        let b = |s: &str| format!("blk.{il}.{s}");
+
+        // router: softmax over all experts, take top-k, renormalize (norm_topk_prob)
+        let wgi = self.w(&b("ffn_gate_inp.weight"))?;
+        let mut logits = vec![0.0f32; ne];
+        qmatmul(&mut logits, x, wgi.bytes, wgi.ty, wgi.in_dim, row);
+        let mx = logits.iter().cloned().fold(f32::MIN, f32::max);
+        let mut probs: Vec<f32> = logits.iter().map(|&l| (l - mx).exp()).collect();
+        let sum: f32 = probs.iter().sum();
+        for p in probs.iter_mut() {
+            *p /= sum;
+        }
+        let mut idx: Vec<usize> = (0..ne).collect();
+        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+        idx.truncate(topk);
+        let wsum: f32 = idx.iter().map(|&e| probs[e]).sum();
+
+        let wge = self.w(&b("ffn_gate_exps.weight"))?; // [hidden, eff, ne]
+        let wue = self.w(&b("ffn_up_exps.weight"))?;
+        let wde = self.w(&b("ffn_down_exps.weight"))?; // [eff, hidden, ne]
+        let gate_bpr = (hidden / wge.ty.block_elems()) * wge.ty.block_bytes() * eff;
+        let up_bpr = (hidden / wue.ty.block_elems()) * wue.ty.block_bytes() * eff;
+        let down_bpr = (eff / wde.ty.block_elems()) * wde.ty.block_bytes() * hidden;
+
+        let mut out = vec![0.0f32; hidden];
+        let mut g = vec![0.0f32; eff];
+        let mut u = vec![0.0f32; eff];
+        let mut act = vec![0.0f32; eff];
+        let mut dy = vec![0.0f32; hidden];
+        for &e in &idx {
+            let wexp = probs[e] / wsum;
+            let ge = &wge.bytes[e * gate_bpr..(e + 1) * gate_bpr];
+            let ue = &wue.bytes[e * up_bpr..(e + 1) * up_bpr];
+            let de = &wde.bytes[e * down_bpr..(e + 1) * down_bpr];
+            qmatmul(&mut g, x, ge, wge.ty, hidden, row);
+            qmatmul(&mut u, x, ue, wue.ty, hidden, row);
+            for i in 0..eff {
+                act[i] = silu(g[i]) * u[i];
+            }
+            qmatmul(&mut dy, &act, de, wde.ty, eff, row);
+            for i in 0..hidden {
+                out[i] += wexp * dy[i];
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl Decoder for MellumModel {
+    fn prefill(&mut self, tokens: &[u32]) -> Result<Logits> {
+        if tokens.is_empty() {
+            return Err(StrixError::invalid("mellum prefill: empty"));
+        }
+        self.reset();
+        for (i, &t) in tokens.iter().enumerate() {
+            let last = i == tokens.len() - 1;
+            let o = self.forward(t, last)?;
+            if last {
+                return Ok(Logits::new(o.unwrap()));
+            }
+        }
+        unreachable!()
+    }
+
+    fn decode_one(&mut self, token: u32) -> Result<Logits> {
+        Ok(Logits::new(self.forward(token, true)?.unwrap()))
+    }
+
+    fn reset(&mut self) {
+        self.pos = 0;
+        for v in self.kc.iter_mut() {
+            v.clear();
+        }
+        for v in self.vc.iter_mut() {
+            v.clear();
+        }
+    }
+}
