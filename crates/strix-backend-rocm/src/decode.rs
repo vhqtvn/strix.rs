@@ -1522,6 +1522,11 @@ impl WeightAccel for RocmWeightAccel {
         // `w`, written into `y` with row-stride `ns` (for split-N with the NPU).
         #[cfg(feature = "npu")]
         let q4gemm_part = |w: &ResQ4, y: *mut c_void, n_compute: usize, ns: usize| {
+            // n_ig=0 (ffn_up/attn_q fully on NPU) → iGPU computes 0 cols: skip the
+            // launch entirely (a 0-block grid is an invalid HIP launch).
+            if n_compute == 0 {
+                return;
+            }
             self.launch2(
                 "q4_gemm_w",
                 n_compute.div_ceil(128) as u32,
