@@ -939,6 +939,122 @@ extern "C" __global__ void sdpa_prefill_f(const float* __restrict__ q, const flo
     }
 }
 
+// ---- WMMA (matrix-core) flash attention for prefill (gated STRIX_WMMA_SDPA) ----
+// Replaces the scalar sdpa_prefill_f's per-(query,key) dot products with f16 WMMA
+// for QK^T and P·V — the prefill SDPA is the whole gap vs llama.cpp (which uses
+// matrix cores). One block = one wave (32 lanes) handling one (head, 16-query tile);
+// grid=(n_heads, ceil(m/16)). Softmax is done in shared S (avoids fragment-layout
+// reductions). RDNA3 wave32 16x16x16 f16 WMMA: A/B frag = v16h (lane l → matrix
+// row (l&15)'s 16 K-values), C = v8f (lane l, c[k] → element [row 2k+(l>>4)][col l&15]).
+typedef __fp16 v16h __attribute__((ext_vector_type(16)));
+typedef float   v8f __attribute__((ext_vector_type(8)));
+
+extern "C" __global__ void sdpa_prefill_wmma(const float* __restrict__ q, const float* __restrict__ k,
+                                             const float* __restrict__ v, float* __restrict__ out,
+                                             int hd, int start_pos, int groups, int n_kv,
+                                             float scale, int n_heads, int m_total, int n_swa, int kvf16) {
+    // NW waves/block share ONE K/V tile (loaded once, reused) — each wave owns its
+    // own 16-query sub-tile, fully independent (no cross-wave combine). NW = blockDim/32.
+    const int BK = 16, MAXDC = 16;             // hd<=256 → dchunks<=16
+    int NW = blockDim.x >> 5;
+    int h = blockIdx.x, kvh = h / groups;
+    int t = threadIdx.x, w = t >> 5, lane = t & 31;
+    int dchunks = hd >> 4, row = lane & 15, half = lane >> 4;
+    int q0 = blockIdx.y * (16 * NW) + w * 16;  // this wave's first query
+
+    extern __shared__ char shm[];
+    __fp16* Ks = (__fp16*)shm;                 // [BK*hd] shared by all waves
+    __fp16* Vs = Ks + BK * hd;                 // [BK*hd]
+    __fp16* Qs = Vs + BK * hd;                 // [NW*16*hd]  (per-wave query tile)
+    float*  Ssb = (float*)(Qs + NW * 16 * hd); // [NW*16*BK]
+    __fp16* Psb = (__fp16*)(Ssb + NW * 16 * BK); // [NW*16*BK]
+    float*  MLb = (float*)(Psb + NW * 16 * BK);  // [NW*32]: per-wave m[16],l[16]
+    float* Ss = Ssb + w * 16 * BK;
+    __fp16* Ps = Psb + w * 16 * BK;
+    float* Mrow = MLb + w * 32, *Lrow = Mrow + 16;
+
+    // O accumulator in registers: Oacc[dc] holds rows {2k+half}, col {dc*16+row}
+    v8f Oacc[MAXDC];
+    for (int dc = 0; dc < dchunks; dc++) Oacc[dc] = (v8f){0,0,0,0,0,0,0,0};
+    // load this wave's Q tile (f32->f16) into shared Qs[w]
+    __fp16* Qw = Qs + w * 16 * hd;
+    for (int e = lane; e < 16 * hd; e += 32) {
+        int r = e / hd, d = e % hd, mq = q0 + r;
+        Qw[e] = (mq < m_total) ? (__fp16)q[((size_t)mq * n_heads + h) * hd + d] : (__fp16)0.f;
+    }
+    if (lane < 16) { Mrow[lane] = -3.0e38f; Lrow[lane] = 0.f; }
+
+    int blk_q0 = blockIdx.y * (16 * NW);        // block's first query
+    int last_mq = blk_q0 + 16 * NW - 1;
+    int max_len = start_pos + last_mq + 1, cap = start_pos + m_total;
+    if (max_len > cap) max_len = cap;
+    int i_lo = (n_swa > 0) ? (start_pos + blk_q0 + 1 - n_swa) : 0;
+    if (i_lo < 0) i_lo = 0;
+    int kt0 = (i_lo / BK) * BK;
+
+    for (int i0 = kt0; i0 < max_len; i0 += BK) {
+        __syncthreads();
+        for (int e = t; e < BK * hd; e += blockDim.x) {   // cooperative K/V load (all waves)
+            int kk = i0 + e / hd, d = e % hd;
+            float kv_k = 0.f, kv_v = 0.f;
+            if (kk < max_len) { size_t kb = ((size_t)kk * n_kv + kvh) * hd + d; kv_k = KVLD(k, kb, kvf16); kv_v = KVLD(v, kb, kvf16); }
+            Ks[e] = (__fp16)kv_k; Vs[e] = (__fp16)kv_v;
+        }
+        __syncthreads();
+        v8f sacc = {0,0,0,0,0,0,0,0};
+        for (int dc = 0; dc < dchunks; dc++) {
+            v16h a, b;
+            for (int j = 0; j < 16; j++) { a[j] = Qw[row * hd + dc*16 + j]; b[j] = Ks[row * hd + dc*16 + j]; }
+            sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, sacc);
+        }
+        for (int kk = 0; kk < 8; kk++) Ss[(2*kk + half) * BK + row] = sacc[kk];
+        // softmax (lane r → query row r), produce corr[r] for O rescale
+        __syncthreads();   // wave-local: Ss written by this wave
+        float corr_r = 1.f;
+        if (lane < 16) {
+            int r = lane, mq = q0 + r;
+            int my_len = start_pos + mq + 1, swa_lo = (n_swa > 0) ? (my_len - n_swa) : 0;
+            float tmax = -3.0e38f;
+            for (int j = 0; j < BK; j++) {
+                int key = i0 + j;
+                float s = (mq < m_total && key < my_len && key >= swa_lo) ? Ss[r*BK + j] * scale : -3.0e38f;
+                Ss[r*BK + j] = s; tmax = fmaxf(tmax, s);
+            }
+            float nm = fmaxf(Mrow[r], tmax);
+            corr_r = __expf(Mrow[r] - nm);
+            float tsum = 0.f;
+            for (int j = 0; j < BK; j++) { float p = (Ss[r*BK+j] > -1e30f) ? __expf(Ss[r*BK+j] - nm) : 0.f; Ps[r*BK+j] = (__fp16)p; tsum += p; }
+            Lrow[r] = Lrow[r] * corr_r + tsum; Mrow[r] = nm;
+            MLb[w*32 + 16 + r] = Lrow[r];   // (Lrow already in MLb)
+        }
+        __syncthreads();
+        // rescale O accumulator by corr (per row 2k+half) — broadcast corr via shuffle
+        // corr_r lives on lane==r (r<16); fetch corr for rows 2k+half from those lanes
+        for (int kk = 0; kk < 8; kk++) {
+            int rr = 2*kk + half;
+            float c = __shfl(corr_r, rr);   // lane rr holds corr for row rr
+            for (int dc = 0; dc < dchunks; dc++) Oacc[dc][kk] *= c;
+        }
+        // P·V accumulate
+        for (int dc = 0; dc < dchunks; dc++) {
+            v16h pa, vb;
+            for (int j = 0; j < 16; j++) { pa[j] = Ps[row*BK + j]; vb[j] = Vs[j*hd + dc*16 + row]; }
+            v8f pv = {0,0,0,0,0,0,0,0};
+            pv = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pa, vb, pv);
+            for (int kk = 0; kk < 8; kk++) Oacc[dc][kk] += pv[kk];
+        }
+    }
+    // write O / l : element row 2k+half, col dc*16+row
+    for (int kk = 0; kk < 8; kk++) {
+        int r = 2*kk + half, mq = q0 + r;
+        if (mq < m_total) {
+            float inv = (Lrow[r] > 0.f) ? 1.f / Lrow[r] : 0.f;
+            size_t ob = ((size_t)mq * n_heads + h) * hd;
+            for (int dc = 0; dc < dchunks; dc++) out[ob + dc*16 + row] = Oacc[dc][kk] * inv;
+        }
+    }
+}
+
 // Plain float copy (KV-cache append; dst pointer pre-offset to the slot).
 extern "C" __global__ void copyf(float* __restrict__ dst, const float* __restrict__ src, int n) {
     int i = blockIdx.x * 256 + threadIdx.x;

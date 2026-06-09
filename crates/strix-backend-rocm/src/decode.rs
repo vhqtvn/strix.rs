@@ -261,6 +261,7 @@ impl RocmWeightAccel {
             "addnorm_batch",
             "sdpa_prefill",
             "sdpa_prefill_f",
+            "sdpa_prefill_wmma",
             "xquant_npu",
             "rescale_npu",
         ] {
@@ -1692,6 +1693,33 @@ impl WeightAccel for RocmWeightAccel {
                             .i(n_kv as i32)
                             .f(scale)
                             .i(n_heads as i32)
+                            .i(if self.kv_f16 { 1 } else { 0 }),
+                    );
+                } else if std::env::var("STRIX_WMMA_SDPA").is_ok() {
+                    // WMMA (matrix-core) flash attention: NW waves/block share one K/V
+                    // tile; each wave owns a 16-query sub-tile. shared = K,V + per-wave Q,S,P.
+                    let n_swa = if lc.is_local { cfg.n_swa as i32 } else { 0 };
+                    let nw = std::env::var("STRIX_WMMA_NW").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(4).clamp(1, 4);
+                    let shbytes = (64 * hd + 32 * nw * hd + 1664 * nw) as u32;
+                    self.launch2(
+                        "sdpa_prefill_wmma",
+                        n_heads as u32,
+                        m.div_ceil(16 * nw) as u32,
+                        (nw * 32) as u32,
+                        shbytes,
+                        Args::new()
+                            .ptr(s.p_q2.ptr)
+                            .ptr(s.k_cache[l].ptr)
+                            .ptr(s.v_cache[l].ptr)
+                            .ptr(s.p_attn.ptr)
+                            .i(hd as i32)
+                            .i(start_pos as i32)
+                            .i(groups as i32)
+                            .i(n_kv as i32)
+                            .f(scale)
+                            .i(n_heads as i32)
+                            .i(m as i32)
+                            .i(n_swa)
                             .i(if self.kv_f16 { 1 } else { 0 }),
                     );
                 } else {
