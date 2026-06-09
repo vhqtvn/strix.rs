@@ -536,6 +536,35 @@ impl GemmaModel {
         Ok(logits)
     }
 
+    /// Greedy on-device decode: like [`Self::gpu_decode_step`] but returns only the
+    /// argmax token id (no vocab-wide logits readback). `Ok(None)` if the backend
+    /// has no on-device argmax (caller falls back to logits + CPU argmax).
+    fn gpu_decode_step_argmax(&mut self, token: u32) -> Result<Option<u32>> {
+        let tok = token as usize;
+        if tok >= self.cfg.vocab {
+            return Err(StrixError::invalid("gpu decode: token out of range"));
+        }
+        if self.seq >= self.max_seq() {
+            return Err(StrixError::invalid("gpu decode: kv cache full"));
+        }
+        let (eb, ety, e_in, _) = Self::weight(&self.gguf, "token_embd.weight")?;
+        let mut h = vec![0.0f32; self.cfg.hidden];
+        dequant_row(eb, ety, tok, e_in, &mut h)?;
+        let scale = self.cfg.emb_scale;
+        for x in h.iter_mut() {
+            *x *= scale;
+        }
+        let pos = self.seq;
+        let next = self.accel.as_mut().and_then(|a| a.decode_step_argmax(&h, pos));
+        match next {
+            Some(t) => {
+                self.seq += 1;
+                Ok(Some(t))
+            }
+            None => Ok(None), // unsupported — seq NOT advanced; caller retries via decode_one
+        }
+    }
+
     /// Batched on-device prefill: embed all prompt tokens on the CPU, then run
     /// the accelerator's batched forward in chunks of `prefill_max`. Each weight
     /// is read once per chunk (compute-bound GEMM) instead of once per token.
@@ -927,6 +956,24 @@ impl Decoder for GemmaModel {
             self.forward(token)?
         };
         Ok(Logits::new(logits))
+    }
+
+    fn decode_one_token(&mut self, token: u32) -> Result<u32> {
+        if self.gpu_decode && std::env::var("STRIX_NO_ARGMAX").is_err() {
+            if let Some(t) = self.gpu_decode_step_argmax(token)? {
+                return Ok(t);
+            }
+        }
+        // Fallback: full logits + CPU argmax (default-trait behavior).
+        let logits = self.decode_one(token)?;
+        let (mut bi, mut bv) = (0usize, f32::NEG_INFINITY);
+        for (i, &v) in logits.0.iter().enumerate() {
+            if v > bv {
+                bv = v;
+                bi = i;
+            }
+        }
+        Ok(bi as u32)
     }
 
     fn reset(&mut self) {

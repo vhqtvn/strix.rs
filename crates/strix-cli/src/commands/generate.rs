@@ -205,13 +205,14 @@ fn run_gguf(path: &Path, prompt: &str, max_tokens: usize, chat: bool, gpu: bool)
         for r in 0..(reps + warm) {
             model.set_seq(0);
             let t0 = Instant::now();
-            let mut logits = model.prefill(&prompt_ids).context("bench prefill")?;
+            let logits = model.prefill(&prompt_ids).context("bench prefill")?;
             let ps = t0.elapsed().as_secs_f64();
             let t1 = Instant::now();
+            let mut next = sampler.sample(&logits)?;
             for _ in 0..dn {
-                let next = sampler.sample(&logits)?;
-                logits = model.decode_one(next)?;
+                next = model.decode_one_token(next)?; // greedy fast path (on-device argmax)
             }
+            let _ = next;
             let ds = t1.elapsed().as_secs_f64();
             if r >= warm {
                 let (pr, dr) = (prompt_ids.len() as f64 / ps, dn as f64 / ds);
@@ -390,19 +391,21 @@ fn run_safetensors(model_dir: &Path, prompt: &str, max_tokens: usize) -> Result<
     // --- Prefill ---
     let sampler = GreedySampler;
     let prefill_start = Instant::now();
-    let mut logits = model.prefill(&prompt_ids).context("prefill failed")?;
+    let logits = model.prefill(&prompt_ids).context("prefill failed")?;
     let prefill_secs = prefill_start.elapsed().as_secs_f64();
 
     // --- Decode loop (greedy) ---
+    // First token from the prefill logits, then the on-device argmax fast path
+    // (no vocab-wide logits readback per step).
     let mut generated: Vec<u32> = Vec::new();
     let decode_start = Instant::now();
+    let mut next = sampler.sample(&logits)?;
     for _ in 0..max_tokens {
-        let next = sampler.sample(&logits)?;
         if Some(next) == eos_id {
             break;
         }
         generated.push(next);
-        logits = model.decode_one(next)?;
+        next = model.decode_one_token(next)?;
     }
     let decode_secs = decode_start.elapsed().as_secs_f64();
 

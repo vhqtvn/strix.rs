@@ -685,6 +685,31 @@ extern "C" __global__ void softcap(float* __restrict__ x, int n, float cap) {
     x[i] = cap * tanhf(x[i] / cap);
 }
 
+// Greedy argmax over logits[n] in one block. Ties resolve to the LOWEST index
+// (matches the CPU GreedySampler). softcap is monotone so argmax(raw)==argmax(capped),
+// letting the greedy decode path skip both softcap and the vocab-wide DtoH.
+extern "C" __global__ void argmax_f32(const float* __restrict__ x, int n,
+                                      int* __restrict__ out_idx, float* __restrict__ out_val) {
+    int t = threadIdx.x, nt = blockDim.x;
+    float bestv = -3.0e38f; int besti = 0;
+    for (int i = t; i < n; i += nt) {
+        float v = x[i];
+        if (v > bestv) { bestv = v; besti = i; }   // ascending scan → lowest idx on tie
+    }
+    __shared__ float sv[1024];
+    __shared__ int si[1024];
+    sv[t] = bestv; si[t] = besti;
+    __syncthreads();
+    for (int s = nt >> 1; s > 0; s >>= 1) {
+        if (t < s) {
+            float ov = sv[t + s]; int oi = si[t + s];
+            if (ov > sv[t] || (ov == sv[t] && oi < si[t])) { sv[t] = ov; si[t] = oi; }
+        }
+        __syncthreads();
+    }
+    if (t == 0) { *out_idx = si[0]; *out_val = sv[0]; }
+}
+
 // Single-query causal SDPA with GQA. grid=n_heads, block=256, scores in shared.
 extern "C" __global__ void sdpa(const float* __restrict__ q, const float* __restrict__ k,
                                 const float* __restrict__ v, float* __restrict__ out,

@@ -43,6 +43,21 @@ pub trait Decoder: Send {
     /// Advance one step with the previously sampled token; return next logits.
     fn decode_one(&mut self, token: u32) -> Result<Logits>;
 
+    /// Greedy variant of [`Decoder::decode_one`]: advance one step and return only
+    /// the argmax token id. Backends with an on-device argmax (no vocab-wide logits
+    /// readback) override this; the default falls back to `decode_one` + CPU argmax.
+    fn decode_one_token(&mut self, token: u32) -> Result<u32> {
+        let logits = self.decode_one(token)?;
+        let (mut bi, mut bv) = (0usize, f32::NEG_INFINITY);
+        for (i, &v) in logits.0.iter().enumerate() {
+            if v > bv {
+                bv = v;
+                bi = i;
+            }
+        }
+        Ok(bi as u32)
+    }
+
     /// Reset decoder state (KV cache, positions) for a fresh sequence.
     fn reset(&mut self);
 }

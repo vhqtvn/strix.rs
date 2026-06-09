@@ -106,6 +106,13 @@ pub trait WeightAccel: Send + Sync {
         None
     }
 
+    /// Greedy decode of one token, returning only the argmax token id (computed
+    /// on-device, no vocab-wide logits readback). `None` if unsupported — callers
+    /// fall back to `decode_step` + CPU argmax. Same KV side effect as `decode_step`.
+    fn decode_step_argmax(&mut self, _h: &[f32], _pos: usize) -> Option<u32> {
+        None
+    }
+
     /// Run a BATCHED prefill of `m` tokens in one pass: `h` is the
     /// embedding-scaled hidden states `[m * hidden]` (row-major, token-major) for
     /// positions `start_pos .. start_pos+m`. Fills the device KV cache for those

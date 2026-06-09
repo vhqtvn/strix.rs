@@ -131,6 +131,7 @@ struct Scratch {
     gate: Dbuf,
     up: Dbuf,
     logits: Dbuf,
+    argmax_out: Dbuf,
     ones: Dbuf,
     // Q8-quantized activation for the dp4a GEMV (reused per matmul input).
     xq_lo: Dbuf,
@@ -193,6 +194,10 @@ pub struct RocmWeightAccel {
     /// When set, `prefill` returns logits for ALL m tokens (m×vocab), not just
     /// the last — the speculative-decoding "verify" path. Reset after each call.
     verify_all: bool,
+    /// Greedy fast path: when set, `decode_step` skips softcap + the vocab-wide
+    /// logits DtoH, does an on-device argmax, and returns a 1-element vec holding
+    /// the winning token id (as f32). Set/reset around `decode_step_argmax`.
+    want_argmax: bool,
     /// NPU offload for ffn_up: raw Q4 bytes stashed at upload (per layer),
     /// consumed at configure into the live `npu` state.
     #[cfg(feature = "npu")]
@@ -243,6 +248,7 @@ impl RocmWeightAccel {
             "rmsnorm_xquant",
             "geglu_xquant",
             "q6_gemv",
+            "argmax_f32",
             "rmsnorm",
             "addnorm",
             "rope",
@@ -280,6 +286,7 @@ impl RocmWeightAccel {
             n_split: std::env::var("STRIX_N_SPLIT").ok().and_then(|s| s.parse::<usize>().ok()).map(|v| v.clamp(1, N_SPLIT_MAX)).unwrap_or(0),
             name,
             verify_all: false,
+            want_argmax: false,
             #[cfg(feature = "npu")]
             npu_pending: std::collections::BTreeMap::new(),
             #[cfg(feature = "npu")]
@@ -850,6 +857,7 @@ impl WeightAccel for RocmWeightAccel {
             gate: mk(cfg.ffn),
             up: mk(cfg.ffn),
             logits: mk(cfg.vocab),
+            argmax_out: mk(2), // [0]=idx (i32), [1]=val (f32)
             ones: ones_buf,
             xq_lo: self.gpu.alloc(nb_max * 16).expect("xq_lo"), // 4 char4/block
             xq_hi: self.gpu.alloc(nb_max * 16).expect("xq_hi"),
@@ -908,7 +916,7 @@ impl WeightAccel for RocmWeightAccel {
             .ok()
             .and_then(|x| x.parse().ok())
             .unwrap_or(cfg.n_layers);
-        let skip_sdpa = std::env::var("STRIX_SKIP_SDPA").is_ok();
+        let skip_sdpa = matches!(std::env::var("STRIX_SKIP_SDPA").as_deref(), Ok(s) if !s.is_empty() && s != "global" && s != "local");
 
         s.h.upload(h).ok()?;
 
@@ -1241,6 +1249,25 @@ impl WeightAccel for RocmWeightAccel {
             );
             self.lm_head(s.xn.ptr, s.logits.ptr);
         }
+        // Greedy fast path: softcap is monotone (cap·tanh(x/cap)), so argmax(raw)
+        // == argmax(capped). Do the argmax on-device and download just the winner —
+        // skips the softcap pass and the vocab-wide (~1 MB/token) DtoH copy.
+        if self.want_argmax {
+            self.launch(
+                "argmax_f32",
+                1,
+                1024,
+                0,
+                Args::new()
+                    .ptr(s.logits.ptr)
+                    .i(cfg.vocab as i32)
+                    .ptr(s.argmax_out.ptr)
+                    .ptr(unsafe { (s.argmax_out.ptr as *mut f32).add(1) as *mut c_void }),
+            );
+            self.gpu.sync().ok()?;
+            let idx = s.argmax_out.download::<i32>(1).ok()?;
+            return Some(vec![idx[0] as f32]);
+        }
         if !skip_lm && cfg.final_softcap > 0.0 {
             self.launch(
                 "softcap",
@@ -1256,6 +1283,13 @@ impl WeightAccel for RocmWeightAccel {
 
         self.gpu.sync().ok()?;
         s.logits.download::<f32>(cfg.vocab).ok()
+    }
+
+    fn decode_step_argmax(&mut self, h: &[f32], pos: usize) -> Option<u32> {
+        self.want_argmax = true;
+        let r = self.decode_step(h, pos);
+        self.want_argmax = false;
+        r.map(|v| v[0] as u32)
     }
 
     fn prefill_max(&self) -> usize {
@@ -1675,7 +1709,15 @@ impl WeightAccel for RocmWeightAccel {
                 Args::new().ptr(vdst).ptr(s.p_v2.ptr).i((m * kv_dim) as i32),
             );
             // causal SDPA over m queries
-            if std::env::var("STRIX_SKIP_SDPA").is_err() {
+            // STRIX_SKIP_SDPA=all|global|local — diagnostic: skip SDPA on a layer subset
+            let skip_kind = std::env::var("STRIX_SKIP_SDPA").unwrap_or_default();
+            let skip_this = match skip_kind.as_str() {
+                "" => false,
+                "global" => !lc.is_local,
+                "local" => lc.is_local,
+                _ => true, // any other value (incl. "1") = skip all
+            };
+            if !skip_this {
                 if std::env::var("STRIX_OLD_SDPA").is_ok() {
                     self.launch(
                         "sdpa_prefill",
