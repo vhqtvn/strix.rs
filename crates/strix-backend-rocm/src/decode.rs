@@ -1548,6 +1548,14 @@ impl WeightAccel for RocmWeightAccel {
             );
         };
 
+        // iGPU pacer (STRIX_GPU_PACE_MS): sync + sleep after each prefill layer so the
+        // iGPU never SUSTAINS ~100% — the trigger for this box's SoC-reset HW fault.
+        // Trades the iGPU/NPU overlap (and ~pace_ms*n_layers wall time) for periodic
+        // GPU rests. Combine with max-NPU offload. 0 = off.
+        let pace_ms = std::env::var("STRIX_GPU_PACE_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
         for l in 0..n_layers {
             let lc = &cfg.layers[l];
             let hd = lc.head_dim;
@@ -2136,6 +2144,11 @@ impl WeightAccel for RocmWeightAccel {
                     .f(eps)
                     .f(lc.output_scale),
             );
+            // pace: drain the GPU and rest, so it never sustains 100% across the chunk.
+            if pace_ms > 0 {
+                let _ = self.gpu.sync();
+                std::thread::sleep(std::time::Duration::from_millis(pace_ms));
+            }
         }
 
         // Final norm + lm_head. Normally just the LAST token (rmsnorm its row →
