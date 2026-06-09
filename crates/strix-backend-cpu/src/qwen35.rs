@@ -311,6 +311,27 @@ fn qmatmul(
     );
 }
 
+/// Batched on-the-fly dequant matmul: `out[t][o] = W·xs[t]` for m tokens (each weight
+/// row dequantized ONCE per chunk). Same per-row `dot_f32` as `qmatmul` → identical.
+fn qmatmul_batch(out: &mut [f32], xs: &[f32], m: usize, bytes: &[u8], ty: GgmlType, in_dim: usize, out_dim: usize) {
+    let bpr = (in_dim / ty.block_elems()) * ty.block_bytes();
+    let mut rt = vec![0.0f32; out_dim * m];
+    rt.par_chunks_mut(m).enumerate().for_each_init(
+        || vec![0.0f32; in_dim],
+        |scratch, (o, orow)| {
+            dequantize_into(ty, &bytes[o * bpr..o * bpr + bpr], scratch).unwrap();
+            for t in 0..m {
+                orow[t] = dot_f32(scratch, &xs[t * in_dim..(t + 1) * in_dim]);
+            }
+        },
+    );
+    for t in 0..m {
+        for o in 0..out_dim {
+            out[t * out_dim + o] = rt[o * m + t];
+        }
+    }
+}
+
 /// SIMD-friendly dot product. A plain `s += a[i]*b[i]` loop does NOT auto-vectorize
 /// (f32 add isn't associative + no fast-math), so split into 8 independent lane
 /// accumulators that LLVM lowers to vector FMAs, then reduce. `len` is a multiple of
@@ -551,6 +572,392 @@ impl Qwen35Model {
     }
 
     /// Forward one token at position `self.pos`; returns logits iff `want_logits`.
+    /// Batched prefill: same weight-read-once strategy as the Mellum forward —
+    /// projections/experts batched over all m tokens; the Gated-DeltaNet conv+scan
+    /// stays sequential per token (recurrent in time). Bit-identical per-token math.
+    fn prefill_batch(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let cfg = self.cfg.clone();
+        let m = tokens.len();
+        let hidden = cfg.hidden;
+        let eps = cfg.rms_eps;
+        let mut row = vec![0.0f32; 16384];
+
+        let emb = self.w("token_embd.weight")?;
+        let bpr_e = (hidden / emb.ty.block_elems()) * emb.ty.block_bytes();
+        let mut h = vec![0.0f32; m * hidden];
+        for (t, &tok) in tokens.iter().enumerate() {
+            dequantize_into(
+                emb.ty,
+                &emb.bytes[tok as usize * bpr_e..(tok as usize + 1) * bpr_e],
+                &mut h[t * hidden..(t + 1) * hidden],
+            )?;
+        }
+        let mut n = vec![0.0f32; m * hidden];
+
+        for il in 0..cfg.n_layer {
+            let b = |s: &str| format!("blk.{il}.{s}");
+            let an = self.vecw(&b("attn_norm.weight"))?;
+            for t in 0..m {
+                let (hs, ns) = (&h[t * hidden..(t + 1) * hidden], &mut n[t * hidden..(t + 1) * hidden]);
+                rmsnorm(ns, hs, &an, eps);
+            }
+            if cfg.is_recr(il) {
+                self.deltanet_batch(&n, m, il, &mut h)?;
+            } else {
+                self.attn_batch(&n, m, il, &mut h)?;
+            }
+            let pn = self.vecw(&b("post_attention_norm.weight"))?;
+            for t in 0..m {
+                let (hs, ns) = (&h[t * hidden..(t + 1) * hidden], &mut n[t * hidden..(t + 1) * hidden]);
+                rmsnorm(ns, hs, &pn, eps);
+            }
+            self.moe_batch(&n, m, il, &mut h)?;
+        }
+        self.pos += m;
+
+        let on = self.vecw("output_norm.weight")?;
+        let mut nh = vec![0.0f32; hidden];
+        rmsnorm(&mut nh, &h[(m - 1) * hidden..m * hidden], &on, eps);
+        let (head_key, head) = if self.gguf.tensors().contains_key("output.weight") {
+            ("output.weight", self.w("output.weight")?)
+        } else {
+            ("token_embd.weight", self.w("token_embd.weight")?)
+        };
+        let mut logits = vec![0.0f32; cfg.vocab];
+        self.mm(head_key, &mut logits, &nh, &head, &mut row);
+        Ok(logits)
+    }
+
+    /// Batched full-attention layer: q/k/v/o batched; per-token QK-norm+rope+SDPA.
+    /// Adds the projection output to `h` rows (residual).
+    fn attn_batch(&mut self, x: &[f32], m: usize, il: usize, h: &mut [f32]) -> Result<()> {
+        let cfg = self.cfg.clone();
+        let hd = cfg.head_dim;
+        let nh = cfg.n_head;
+        let nkv = cfg.n_head_kv;
+        let groups = nh / nkv;
+        let kv_dim = nkv * hd;
+        let q_dim = nh * hd;
+        let hidden = cfg.hidden;
+        let b = |s: &str| format!("blk.{il}.{s}");
+        let qn = self.vecw(&b("attn_q_norm.weight"))?;
+        let kn = self.vecw(&b("attn_k_norm.weight"))?;
+        let qg_dim = hd * 2 * nh;
+        let mut qg = vec![0.0f32; m * qg_dim];
+        let mut k = vec![0.0f32; m * kv_dim];
+        let mut v = vec![0.0f32; m * kv_dim];
+        {
+            let wq = self.w(&b("attn_q.weight"))?;
+            qmatmul_batch(&mut qg, x, m, wq.bytes, wq.ty, hidden, qg_dim);
+            let wk = self.w(&b("attn_k.weight"))?;
+            qmatmul_batch(&mut k, x, m, wk.bytes, wk.ty, hidden, kv_dim);
+            let wv = self.w(&b("attn_v.weight"))?;
+            qmatmul_batch(&mut v, x, m, wv.bytes, wv.ty, hidden, kv_dim);
+        }
+        let mut q = vec![0.0f32; m * q_dim];
+        let mut gate = vec![0.0f32; m * q_dim];
+        for t in 0..m {
+            let pos = self.pos + t;
+            for hh in 0..nh {
+                let base = t * qg_dim + hh * hd * 2;
+                let mut qh = qg[base..base + hd].to_vec();
+                let mut tmp = vec![0.0f32; hd];
+                rmsnorm(&mut tmp, &qh, &qn, cfg.rms_eps);
+                qh.copy_from_slice(&tmp);
+                partial_rope(&mut qh, pos, cfg.rope_freq_base, cfg.n_rot);
+                q[t * q_dim + hh * hd..t * q_dim + hh * hd + hd].copy_from_slice(&qh);
+                gate[t * q_dim + hh * hd..t * q_dim + hh * hd + hd]
+                    .copy_from_slice(&qg[base + hd..base + 2 * hd]);
+            }
+            for kh in 0..nkv {
+                let kb = t * kv_dim + kh * hd;
+                let mut khv = k[kb..kb + hd].to_vec();
+                let mut tmp = vec![0.0f32; hd];
+                rmsnorm(&mut tmp, &khv, &kn, cfg.rms_eps);
+                khv.copy_from_slice(&tmp);
+                partial_rope(&mut khv, pos, cfg.rope_freq_base, cfg.n_rot);
+                k[kb..kb + hd].copy_from_slice(&khv);
+            }
+        }
+        self.kc[il].extend_from_slice(&k[..m * kv_dim]);
+        self.vc[il].extend_from_slice(&v[..m * kv_dim]);
+        let kc = &self.kc[il];
+        let vc = &self.vc[il];
+        let base_pos = self.pos;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut attn_out = vec![0.0f32; m * q_dim];
+        attn_out.par_chunks_mut(q_dim).enumerate().for_each(|(t, ao)| {
+            let len = base_pos + t + 1;
+            let mut keys = vec![0.0f32; len * hd];
+            let mut vals = vec![0.0f32; len * hd];
+            let mut scratch = vec![0.0f32; len];
+            for hh in 0..nh {
+                let kvh = hh / groups;
+                for tt in 0..len {
+                    keys[tt * hd..tt * hd + hd]
+                        .copy_from_slice(&kc[tt * kv_dim + kvh * hd..tt * kv_dim + kvh * hd + hd]);
+                    vals[tt * hd..tt * hd + hd]
+                        .copy_from_slice(&vc[tt * kv_dim + kvh * hd..tt * kv_dim + kvh * hd + hd]);
+                }
+                let mut oh = vec![0.0f32; hd];
+                crate::attention::sdpa_single(
+                    &mut oh,
+                    &q[t * q_dim + hh * hd..t * q_dim + hh * hd + hd],
+                    &keys,
+                    &vals,
+                    hd,
+                    len,
+                    scale,
+                    &mut scratch,
+                );
+                for d in 0..hd {
+                    oh[d] *= sigmoid(gate[t * q_dim + hh * hd + d]);
+                }
+                ao[hh * hd..hh * hd + hd].copy_from_slice(&oh);
+            }
+        });
+        let mut o = vec![0.0f32; m * hidden];
+        {
+            let wo = self.w(&b("attn_output.weight"))?;
+            qmatmul_batch(&mut o, &attn_out, m, wo.bytes, wo.ty, q_dim, hidden);
+        }
+        for i in 0..m * hidden {
+            h[i] += o[i];
+        }
+        Ok(())
+    }
+
+    /// Batched Gated-DeltaNet layer: qkv/gate/alpha/beta projections batched; the
+    /// causal conv + delta-rule scan run sequentially per token (time recurrence).
+    fn deltanet_batch(&mut self, x: &[f32], m: usize, il: usize, h: &mut [f32]) -> Result<()> {
+        let cfg = self.cfg.clone();
+        let s_v = cfg.ssm_d_inner / cfg.ssm_dt_rank;
+        let n_vh = cfg.ssm_dt_rank;
+        let n_kh = cfg.ssm_n_group;
+        let key_dim = cfg.ssm_d_state * cfg.ssm_n_group;
+        let value_dim = cfg.ssm_d_inner;
+        let conv_dim = key_dim * 2 + value_dim;
+        let dconv = cfg.ssm_d_conv;
+        let hidden = cfg.hidden;
+        let b = |s: &str| format!("blk.{il}.{s}");
+
+        let ssm_a = self.vecw(&b("ssm_a"))?;
+        let ssm_dt = self.vecw(&b("ssm_dt.bias"))?;
+        let ssm_norm = self.vecw(&b("ssm_norm.weight"))?;
+        let conv_w = self.vecw(&b("ssm_conv1d.weight"))?;
+
+        let mut qkv = vec![0.0f32; m * conv_dim];
+        let mut z = vec![0.0f32; m * value_dim];
+        let mut beta_raw = vec![0.0f32; m * n_vh];
+        let mut alpha_raw = vec![0.0f32; m * n_vh];
+        {
+            let wqkv = self.w(&b("attn_qkv.weight"))?;
+            qmatmul_batch(&mut qkv, x, m, wqkv.bytes, wqkv.ty, hidden, conv_dim);
+            let wgate = self.w(&b("attn_gate.weight"))?;
+            qmatmul_batch(&mut z, x, m, wgate.bytes, wgate.ty, hidden, value_dim);
+            let wbeta = self.w(&b("ssm_beta.weight"))?;
+            qmatmul_batch(&mut beta_raw, x, m, wbeta.bytes, wbeta.ty, hidden, n_vh);
+            let walpha = self.w(&b("ssm_alpha.weight"))?;
+            qmatmul_batch(&mut alpha_raw, x, m, walpha.bytes, walpha.ty, hidden, n_vh);
+        }
+
+        let mut gated = vec![0.0f32; m * value_dim];
+        for t in 0..m {
+            // causal conv + state shift (same as deltanet())
+            let cs = &mut self.conv[il];
+            let qkv_t = &qkv[t * conv_dim..(t + 1) * conv_dim];
+            let mut conv_out = vec![0.0f32; conv_dim];
+            for c in 0..conv_dim {
+                let mut acc = 0.0f32;
+                for kk in 0..dconv - 1 {
+                    acc += conv_w[c * dconv + kk] * cs[c * (dconv - 1) + kk];
+                }
+                acc += conv_w[c * dconv + (dconv - 1)] * qkv_t[c];
+                conv_out[c] = silu(acc);
+                for kk in 0..dconv - 2 {
+                    cs[c * (dconv - 1) + kk] = cs[c * (dconv - 1) + kk + 1];
+                }
+                cs[c * (dconv - 1) + (dconv - 2)] = qkv_t[c];
+            }
+            let q = &conv_out[0..key_dim];
+            let kvec = &conv_out[key_dim..2 * key_dim];
+            let v = &conv_out[2 * key_dim..2 * key_dim + value_dim];
+            let mut qn = q.to_vec();
+            let mut kn = kvec.to_vec();
+            for kh in 0..n_kh {
+                l2norm(&mut qn[kh * s_v..kh * s_v + s_v], cfg.rms_eps);
+                l2norm(&mut kn[kh * s_v..kh * s_v + s_v], cfg.rms_eps);
+            }
+            let scale = 1.0 / (s_v as f32).sqrt();
+            let st_all = &mut self.ssm[il];
+            let mut core = vec![0.0f32; value_dim];
+            for vh in 0..n_vh {
+                let kh = vh % n_kh;
+                let qh = &qn[kh * s_v..kh * s_v + s_v];
+                let kk = &kn[kh * s_v..kh * s_v + s_v];
+                let vv = &v[vh * s_v..vh * s_v + s_v];
+                let g = ssm_a[vh] * softplus(alpha_raw[t * n_vh + vh] + ssm_dt[vh]);
+                let betah = sigmoid(beta_raw[t * n_vh + vh]);
+                let decay = g.exp();
+                let st = &mut st_all[vh * s_v * s_v..vh * s_v * s_v + s_v * s_v];
+                for xx in st.iter_mut() {
+                    *xx *= decay;
+                }
+                let mut delta = vec![0.0f32; s_v];
+                for j in 0..s_v {
+                    let rowj = &st[j * s_v..j * s_v + s_v];
+                    let mut sum = 0.0f32;
+                    for i in 0..s_v {
+                        sum += rowj[i] * kk[i];
+                    }
+                    delta[j] = (vv[j] - sum) * betah;
+                }
+                for j in 0..s_v {
+                    let dj = delta[j];
+                    let rowj = &mut st[j * s_v..j * s_v + s_v];
+                    for i in 0..s_v {
+                        rowj[i] += dj * kk[i];
+                    }
+                }
+                let outh = &mut core[vh * s_v..vh * s_v + s_v];
+                for j in 0..s_v {
+                    let rowj = &st[j * s_v..j * s_v + s_v];
+                    let mut sum = 0.0f32;
+                    for i in 0..s_v {
+                        sum += rowj[i] * qh[i];
+                    }
+                    outh[j] = sum * scale;
+                }
+            }
+            for vh in 0..n_vh {
+                let mut tmp = vec![0.0f32; s_v];
+                rmsnorm(&mut tmp, &core[vh * s_v..vh * s_v + s_v], &ssm_norm, cfg.rms_eps);
+                for j in 0..s_v {
+                    gated[t * value_dim + vh * s_v + j] = tmp[j] * silu(z[t * value_dim + vh * s_v + j]);
+                }
+            }
+        }
+        let mut o = vec![0.0f32; m * hidden];
+        {
+            let wout = self.w(&b("ssm_out.weight"))?;
+            qmatmul_batch(&mut o, &gated, m, wout.bytes, wout.ty, value_dim, hidden);
+        }
+        for i in 0..m * hidden {
+            h[i] += o[i];
+        }
+        Ok(())
+    }
+
+    /// Batched MoE: route per token, group by expert, batch each expert + the shared
+    /// expert; per-token accumulation matches moe()'s float association.
+    fn moe_batch(&mut self, x: &[f32], m: usize, il: usize, h: &mut [f32]) -> Result<()> {
+        let cfg = self.cfg.clone();
+        let hidden = cfg.hidden;
+        let ne = cfg.n_expert;
+        let topk = cfg.n_expert_used;
+        let eff = cfg.expert_ff;
+        let b = |s: &str| format!("blk.{il}.{s}");
+
+        let wgi = self.w(&b("ffn_gate_inp.weight"))?;
+        let mut rl = vec![0.0f32; m * ne];
+        qmatmul_batch(&mut rl, x, m, wgi.bytes, wgi.ty, hidden, ne);
+        let mut routes: Vec<Vec<(usize, f32)>> = Vec::with_capacity(m);
+        for t in 0..m {
+            let logits = &rl[t * ne..(t + 1) * ne];
+            let mx = logits.iter().cloned().fold(f32::MIN, f32::max);
+            let mut probs: Vec<f32> = logits.iter().map(|&l| (l - mx).exp()).collect();
+            let sum: f32 = probs.iter().sum();
+            for p in probs.iter_mut() {
+                *p /= sum;
+            }
+            let mut idx: Vec<usize> = (0..ne).collect();
+            idx.sort_by(|&a, &bb| probs[bb].partial_cmp(&probs[a]).unwrap());
+            idx.truncate(topk);
+            let wsum: f32 = idx.iter().map(|&e| probs[e]).sum();
+            routes.push(idx.into_iter().map(|e| (e, probs[e] / wsum)).collect());
+        }
+        let mut by_exp: Vec<Vec<(usize, usize)>> = vec![Vec::new(); ne];
+        for (t, route) in routes.iter().enumerate() {
+            for (s, &(e, _)) in route.iter().enumerate() {
+                by_exp[e].push((t, s));
+            }
+        }
+        let wge = self.w(&b("ffn_gate_exps.weight"))?;
+        let wue = self.w(&b("ffn_up_exps.weight"))?;
+        let wde = self.w(&b("ffn_down_exps.weight"))?;
+        let g_bpr = (hidden / wge.ty.block_elems()) * wge.ty.block_bytes() * eff;
+        let u_bpr = (hidden / wue.ty.block_elems()) * wue.ty.block_bytes() * eff;
+        let d_bpr = (eff / wde.ty.block_elems()) * wde.ty.block_bytes() * hidden;
+        let mut dy = vec![0.0f32; m * topk * hidden];
+        for (e, list) in by_exp.iter().enumerate() {
+            if list.is_empty() {
+                continue;
+            }
+            let me = list.len();
+            let mut xs = vec![0.0f32; me * hidden];
+            for (i, &(t, _)) in list.iter().enumerate() {
+                xs[i * hidden..(i + 1) * hidden].copy_from_slice(&x[t * hidden..(t + 1) * hidden]);
+            }
+            let mut g = vec![0.0f32; me * eff];
+            let mut u = vec![0.0f32; me * eff];
+            qmatmul_batch(&mut g, &xs, me, &wge.bytes[e * g_bpr..(e + 1) * g_bpr], wge.ty, hidden, eff);
+            qmatmul_batch(&mut u, &xs, me, &wue.bytes[e * u_bpr..(e + 1) * u_bpr], wue.ty, hidden, eff);
+            let mut act = vec![0.0f32; me * eff];
+            for i in 0..me * eff {
+                act[i] = silu(g[i]) * u[i];
+            }
+            let mut d = vec![0.0f32; me * hidden];
+            qmatmul_batch(&mut d, &act, me, &wde.bytes[e * d_bpr..(e + 1) * d_bpr], wde.ty, eff, hidden);
+            for (i, &(t, s)) in list.iter().enumerate() {
+                dy[(t * topk + s) * hidden..(t * topk + s + 1) * hidden]
+                    .copy_from_slice(&d[i * hidden..(i + 1) * hidden]);
+            }
+        }
+        // shared expert, batched
+        let sff = cfg.shared_ff;
+        let mut shared = vec![0.0f32; m * hidden];
+        if sff > 0 {
+            let wgs = self.w(&b("ffn_gate_shexp.weight"))?;
+            let wus = self.w(&b("ffn_up_shexp.weight"))?;
+            let wds = self.w(&b("ffn_down_shexp.weight"))?;
+            let wgis = self.w(&b("ffn_gate_inp_shexp.weight"))?;
+            let mut gs = vec![0.0f32; m * sff];
+            let mut us = vec![0.0f32; m * sff];
+            qmatmul_batch(&mut gs, x, m, wgs.bytes, wgs.ty, hidden, sff);
+            qmatmul_batch(&mut us, x, m, wus.bytes, wus.ty, hidden, sff);
+            let mut a = vec![0.0f32; m * sff];
+            for i in 0..m * sff {
+                a[i] = silu(gs[i]) * us[i];
+            }
+            qmatmul_batch(&mut shared, &a, m, wds.bytes, wds.ty, sff, hidden);
+            let mut sg = vec![0.0f32; m];
+            qmatmul_batch(&mut sg, x, m, wgis.bytes, wgis.ty, hidden, 1);
+            for t in 0..m {
+                let s = sigmoid(sg[t]);
+                for i in 0..hidden {
+                    shared[t * hidden + i] *= s;
+                }
+            }
+        }
+        for (t, route) in routes.iter().enumerate() {
+            let mut out = vec![0.0f32; hidden];
+            for (s, &(_, w)) in route.iter().enumerate() {
+                let dys = &dy[(t * topk + s) * hidden..(t * topk + s + 1) * hidden];
+                for i in 0..hidden {
+                    out[i] += w * dys[i];
+                }
+            }
+            for i in 0..hidden {
+                out[i] += shared[t * hidden + i];
+            }
+            let hrow = &mut h[t * hidden..(t + 1) * hidden];
+            for i in 0..hidden {
+                hrow[i] += out[i];
+            }
+        }
+        Ok(())
+    }
+
     fn forward(&mut self, token: u32, want_logits: bool) -> Result<Option<Vec<f32>>> {
         let cfg = self.cfg.clone();
         let pos = self.pos;
@@ -935,14 +1342,18 @@ impl Decoder for Qwen35Model {
             return Err(StrixError::invalid("qwen35 prefill: empty"));
         }
         self.reset();
-        for (i, &t) in tokens.iter().enumerate() {
-            let last = i == tokens.len() - 1;
-            let o = self.forward(t, last)?;
-            if last {
-                return Ok(Logits::new(o.unwrap()));
+        // STRIX_NO_BATCH_PREFILL forces the token-at-a-time reference path.
+        if std::env::var("STRIX_NO_BATCH_PREFILL").is_ok() {
+            for (i, &t) in tokens.iter().enumerate() {
+                let last = i == tokens.len() - 1;
+                let o = self.forward(t, last)?;
+                if last {
+                    return Ok(Logits::new(o.unwrap()));
+                }
             }
+            unreachable!()
         }
-        unreachable!()
+        Ok(Logits::new(self.prefill_batch(tokens)?))
     }
 
     fn decode_one(&mut self, token: u32) -> Result<Logits> {
