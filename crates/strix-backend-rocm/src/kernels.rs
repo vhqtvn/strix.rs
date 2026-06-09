@@ -567,6 +567,28 @@ extern "C" __global__ void q6_gemv(const float* __restrict__ scales,
     if (l == 0) y[row] = acc;
 }
 
+// Q8_0 GEMV. Block = 32 vals: f16 scale d + 32 int8. y[row] = sum_b d_b*sum_i(q*x).
+// Fold d_b into each term so a single wave-reduce suffices: acc_l = sum_b d_b*q[b*32+l]*x.
+// 8 waves/block (one row each), 32 lanes cooperate on one block (coalesced int8 + x).
+// grid = ceil(out_dim/8), block = 256. scales: f32[nb*out_dim], quants: int8[nb*32*out_dim].
+extern "C" __global__ void q8_0_gemv(const float* __restrict__ scales,
+                                     const signed char* __restrict__ quants,
+                                     const float* __restrict__ x,
+                                     float* __restrict__ y, int in_dim, int out_dim) {
+    int wave = threadIdx.x >> 5;  // 0..7
+    int l = threadIdx.x & 31;     // lane = value index within the 32-block
+    int row = blockIdx.x * 8 + wave;
+    if (row >= out_dim) return;
+    int nb = in_dim / 32, rb = row * nb;
+    float acc = 0.f;
+    for (int bi = 0; bi < nb; bi++) {
+        float d = scales[rb + bi];
+        acc += d * (float)quants[(rb + bi) * 32 + l] * x[bi * 32 + l];
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
+    if (l == 0) y[row] = acc;
+}
+
 // RMSNorm over n_rows rows of `dim`. grid=n_rows, block=256.
 extern "C" __global__ void rmsnorm(const float* __restrict__ x, const float* __restrict__ w,
                                    float* __restrict__ y, int dim, int has_w, float eps) {

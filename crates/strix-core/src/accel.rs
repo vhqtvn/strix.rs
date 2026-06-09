@@ -66,6 +66,12 @@ pub trait WeightAccel: Send + Sync {
     /// Adopt a Q6_K weight `[out_dim, in_dim]` (raw GGUF block bytes).
     fn upload_q6_k(&mut self, key: &str, bytes: &[u8], in_dim: usize, out_dim: usize) -> bool;
 
+    /// Adopt a Q8_0 weight `[out_dim, in_dim]` (raw GGUF block bytes). Default: not
+    /// adopted (returns false) — only backends with a Q8_0 GEMV kernel override this.
+    fn upload_q8_0(&mut self, _key: &str, _bytes: &[u8], _in_dim: usize, _out_dim: usize) -> bool {
+        false
+    }
+
     /// Compute `y = W · x` for an adopted weight. Returns `None` if `key` was not
     /// adopted, or `Some(y)` of length `out_dim`.
     fn gemv(&self, key: &str, x: &[f32]) -> Option<Vec<f32>>;

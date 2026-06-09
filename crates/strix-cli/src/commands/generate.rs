@@ -240,11 +240,7 @@ fn run_mellum(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Res
 
     let cfg = MellumCfg::from_gguf(&gguf).context("parse mellum config")?;
     eprintln!("[mellum] {}", cfg.report());
-    if gpu {
-        // Mellum is Q8_0; the accel kernels adopt only Q4_0/Q6_K, so iGPU offload needs
-        // a Q8_0 GEMV kernel first (plan P3). Stays on CPU until then.
-        eprintln!("[mellum] --gpu: Q8_0 iGPU kernel not yet implemented (plan P3) — staying on CPU");
-    }
+    // --gpu offload set up after the model is built (below).
 
     let id_src = std::env::var("STRIX_QWEN_IDS").unwrap_or_else(|_| prompt.to_string());
     let prompt_ids: Vec<u32> = id_src
@@ -267,6 +263,24 @@ fn run_mellum(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Res
         load_start.elapsed().as_secs_f64(),
         prompt_ids.len()
     );
+
+    // --gpu: Mellum is all-Q8_0 → needs the ROCm accel (STRIX_ROCM=1; Vulkan adopts
+    // nothing). Uploads dense q/k/v/o + output + per-expert slices (cap via
+    // STRIX_GPU_EXPERT_LAYERS). 12B fits resident, unlike the 35B.
+    if gpu {
+        match build_weight_accel() {
+            Some(accel) => {
+                let name = accel.name().to_string();
+                let t = Instant::now();
+                let n = model.attach_accel(accel);
+                eprintln!(
+                    "[mellum] {n} weights resident on {name} ({:.1}s upload)",
+                    t.elapsed().as_secs_f64()
+                );
+            }
+            None => eprintln!("[mellum] --gpu: no accel (build --features rocm + STRIX_ROCM=1)"),
+        }
+    }
 
     let sampler = GreedySampler;
     let prefill_start = Instant::now();

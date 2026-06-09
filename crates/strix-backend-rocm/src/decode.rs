@@ -18,6 +18,8 @@ const QK4_0: usize = 32;
 const Q4_0_BYTES: usize = 18;
 const QK_K: usize = 256;
 const Q6_K_BYTES: usize = 210;
+const QK8_0: usize = 32;
+const Q8_0_BYTES: usize = 34; // f16 d + 32 int8
 
 // --- lightweight per-kernel profiling (gated by STRIX_PROF) ---
 use std::cell::RefCell;
@@ -87,6 +89,13 @@ struct ResQ6 {
     scales: Dbuf,
     ql: Dbuf,
     qh: Dbuf,
+    in_dim: usize,
+    out_dim: usize,
+}
+
+struct ResQ8 {
+    scales: Dbuf, // f32[nb*out_dim] (one d per 32-block)
+    quants: Dbuf, // int8[nb*32*out_dim]
     in_dim: usize,
     out_dim: usize,
 }
@@ -187,6 +196,7 @@ pub struct RocmWeightAccel {
     funcs: HashMap<&'static str, hipFunction_t>,
     q4: HashMap<String, ResQ4>,
     q6: HashMap<String, ResQ6>,
+    q8: HashMap<String, ResQ8>,
     f32w: HashMap<String, Dbuf>,
     cfg: Option<GpuDecodeConfig>,
     scratch: Option<Scratch>,
@@ -260,6 +270,7 @@ impl RocmWeightAccel {
             "rmsnorm_xquant",
             "geglu_xquant",
             "q6_gemv",
+            "q8_0_gemv",
             "argmax_f32",
             "rmsnorm",
             "addnorm",
@@ -295,6 +306,7 @@ impl RocmWeightAccel {
             funcs,
             q4: HashMap::new(),
             q6: HashMap::new(),
+            q8: HashMap::new(),
             f32w: HashMap::new(),
             cfg: None,
             scratch: None,
@@ -847,6 +859,39 @@ impl WeightAccel for RocmWeightAccel {
         true
     }
 
+    fn upload_q8_0(&mut self, key: &str, bytes: &[u8], in_dim: usize, out_dim: usize) -> bool {
+        if in_dim % QK8_0 != 0 {
+            return false;
+        }
+        let nblocks = in_dim / QK8_0;
+        let total = nblocks * out_dim;
+        if bytes.len() != total * Q8_0_BYTES {
+            return false;
+        }
+        // Repack to f32 scales [total] + int8 quants [total*32] (matches q8_0_gemv).
+        let mut scales = vec![0.0f32; total];
+        let mut quants = vec![0i8; total * 32];
+        for (b, blk) in bytes.chunks_exact(Q8_0_BYTES).enumerate() {
+            scales[b] = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+            for i in 0..32 {
+                quants[b * 32 + i] = blk[2 + i] as i8;
+            }
+        }
+        let (Ok(sb), Ok(qb)) = (self.gpu.upload_new(&scales), self.gpu.upload_new(&quants)) else {
+            return false;
+        };
+        self.q8.insert(
+            key.to_string(),
+            ResQ8 {
+                scales: sb,
+                quants: qb,
+                in_dim,
+                out_dim,
+            },
+        );
+        true
+    }
+
     fn gemv(&self, key: &str, x: &[f32]) -> Option<Vec<f32>> {
         // Per-weight GEMV on a resident Q6_K / Q4_0 weight, reusing the exact kernels
         // + launch config as `lm_head`. ROCm's stream-ordered launch has near-zero
@@ -896,11 +941,32 @@ impl WeightAccel for RocmWeightAccel {
             self.gpu.sync().ok()?;
             return self.gemv_y.download::<f32>(e.out_dim).ok();
         }
+        if let Some(e) = self.q8.get(key) {
+            if x.len() != e.in_dim || e.in_dim > GEMV_MAX_IN || e.out_dim > GEMV_MAX_OUT {
+                return None;
+            }
+            self.gemv_x.upload(x).ok()?;
+            self.launch(
+                "q8_0_gemv",
+                e.out_dim.div_ceil(8) as u32,
+                256,
+                0,
+                Args::new()
+                    .ptr(e.scales.ptr)
+                    .ptr(e.quants.ptr)
+                    .ptr(self.gemv_x.ptr)
+                    .ptr(self.gemv_y.ptr)
+                    .i(e.in_dim as i32)
+                    .i(e.out_dim as i32),
+            );
+            self.gpu.sync().ok()?;
+            return self.gemv_y.download::<f32>(e.out_dim).ok();
+        }
         None
     }
 
     fn resident_count(&self) -> usize {
-        self.q4.len() + self.q6.len()
+        self.q4.len() + self.q6.len() + self.q8.len()
     }
 
     fn name(&self) -> &str {

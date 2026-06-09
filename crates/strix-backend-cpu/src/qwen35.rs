@@ -420,7 +420,8 @@ impl Qwen35Model {
             match ty {
                 GgmlType::Q4_0 => accel.upload_q4_0(key, bytes, in_dim, out_dim),
                 GgmlType::Q6K => accel.upload_q6_k(key, bytes, in_dim, out_dim),
-                _ => false, // Q8_0 (dense, in UD quant) not supported yet — stays CPU
+                GgmlType::Q8_0 => accel.upload_q8_0(key, bytes, in_dim, out_dim),
+                _ => false,
             }
         };
         for name in &names {
@@ -462,8 +463,8 @@ impl Qwen35Model {
                     continue;
                 };
                 let ty = ti.ggml_type;
-                if ty != GgmlType::Q6K && ty != GgmlType::Q4_0 {
-                    continue; // e.g. a few Q8_0 ffn_down layers → CPU
+                if !matches!(ty, GgmlType::Q6K | GgmlType::Q4_0 | GgmlType::Q8_0) {
+                    continue;
                 }
                 let bpr = (in_dim / ty.block_elems()) * ty.block_bytes() * out_dim;
                 let Ok(bytes) = self.gguf.tensor_bytes(&full) else {

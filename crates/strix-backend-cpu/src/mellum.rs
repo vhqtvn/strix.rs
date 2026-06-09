@@ -272,6 +272,10 @@ pub struct MellumModel {
     kc: Vec<Vec<f32>>,
     vc: Vec<Vec<f32>>,
     pos: usize,
+    // Optional iGPU weight accelerator (per-weight GEMV by tensor name). `None`
+    // (default / CPU build) → byte-identical CPU forward. Mellum is all-Q8_0, so this
+    // needs a Q8_0-capable accel (RocmWeightAccel). See docs/ideas/moe-accel-plan.md.
+    accel: Option<Box<dyn strix_core::WeightAccel>>,
 }
 
 impl MellumModel {
@@ -284,7 +288,116 @@ impl MellumModel {
             cfg,
             gguf,
             pos: 0,
+            accel: None,
         })
+    }
+
+    /// Attach an iGPU accelerator and upload Mellum's Q8_0 weights resident: dense
+    /// attn q/k/v/o + output, plus the per-layer MoE experts (capped by
+    /// STRIX_GPU_EXPERT_LAYERS). 12B all-Q8_0 → ~12GB, fits the iGPU. Returns the
+    /// count adopted. Needs a Q8_0-capable accel (ROCm); Vulkan adopts nothing.
+    pub fn attach_accel(&mut self, mut accel: Box<dyn strix_core::WeightAccel>) -> usize {
+        let mut n = 0usize;
+        let up = |accel: &mut Box<dyn strix_core::WeightAccel>,
+                  key: &str,
+                  bytes: &[u8],
+                  ty: GgmlType,
+                  in_dim: usize,
+                  out_dim: usize|
+         -> bool {
+            match ty {
+                GgmlType::Q4_0 => accel.upload_q4_0(key, bytes, in_dim, out_dim),
+                GgmlType::Q6K => accel.upload_q6_k(key, bytes, in_dim, out_dim),
+                GgmlType::Q8_0 => accel.upload_q8_0(key, bytes, in_dim, out_dim),
+                _ => false,
+            }
+        };
+        // dense projections + output
+        let mut names: Vec<String> = Vec::new();
+        for il in 0..self.cfg.n_layer {
+            for t in ["attn_q", "attn_k", "attn_v", "attn_output"] {
+                names.push(format!("blk.{il}.{t}.weight"));
+            }
+        }
+        if self.gguf.tensors().contains_key("output.weight") {
+            names.push("output.weight".to_string());
+        }
+        for name in &names {
+            let Some(ti) = self.gguf.tensors().get(name) else {
+                continue;
+            };
+            let (ty, in_dim) = (ti.ggml_type, ti.dims[0] as usize);
+            let out_dim: usize = ti.dims[1..].iter().map(|&d| d as usize).product();
+            if let Ok(bytes) = self.gguf.tensor_bytes(name) {
+                if up(&mut accel, name, bytes, ty, in_dim, out_dim) {
+                    n += 1;
+                }
+            }
+        }
+        // MoE experts (per-expert byte slices), capped for memory.
+        let hidden = self.cfg.hidden;
+        let eff = self.cfg.expert_ff;
+        let ne = self.cfg.n_expert;
+        let layer_cap = std::env::var("STRIX_GPU_EXPERT_LAYERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(self.cfg.n_layer);
+        let mut advise: Vec<String> = Vec::new();
+        for il in 0..self.cfg.n_layer.min(layer_cap) {
+            for (tname, in_dim, out_dim) in [
+                ("ffn_gate_exps", hidden, eff),
+                ("ffn_up_exps", hidden, eff),
+                ("ffn_down_exps", eff, hidden),
+            ] {
+                let full = format!("blk.{il}.{tname}.weight");
+                let Some(ti) = self.gguf.tensors().get(&full) else {
+                    continue;
+                };
+                let ty = ti.ggml_type;
+                if !matches!(ty, GgmlType::Q6K | GgmlType::Q4_0 | GgmlType::Q8_0) {
+                    continue;
+                }
+                let bpr = (in_dim / ty.block_elems()) * ty.block_bytes() * out_dim;
+                let Ok(bytes) = self.gguf.tensor_bytes(&full) else {
+                    continue;
+                };
+                let mut got = 0usize;
+                for e in 0..ne {
+                    let slice = &bytes[e * bpr..(e + 1) * bpr];
+                    if up(&mut accel, &format!("blk.{il}.{tname}.e{e}"), slice, ty, in_dim, out_dim) {
+                        got += 1;
+                    }
+                }
+                n += got;
+                if got == ne {
+                    advise.push(full.clone());
+                }
+            }
+        }
+        for name in &advise {
+            self.gguf.advise_dontneed(name);
+        }
+        self.accel = Some(accel);
+        n
+    }
+
+    /// GPU gemv for `key` into `out` if adopted; false ⇒ caller uses CPU.
+    fn try_gemv(&self, key: &str, x: &[f32], out: &mut [f32]) -> bool {
+        if let Some(a) = &self.accel {
+            if let Some(y) = a.gemv(key, x) {
+                if y.len() == out.len() {
+                    out.copy_from_slice(&y);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn mm(&self, key: &str, out: &mut [f32], x: &[f32], w: &W<'_>, row: &mut [f32]) {
+        if !self.try_gemv(key, x, out) {
+            qmatmul(out, x, w.bytes, w.ty, w.in_dim, row);
+        }
     }
 
     fn w(&self, name: &str) -> Result<W<'_>> {
@@ -360,13 +473,13 @@ impl MellumModel {
         let on = self.vecw("output_norm.weight")?;
         let mut nh = vec![0.0f32; hidden];
         rmsnorm(&mut nh, &h, &on, eps);
-        let head = if self.gguf.tensors().contains_key("output.weight") {
-            self.w("output.weight")?
+        let (head_key, head) = if self.gguf.tensors().contains_key("output.weight") {
+            ("output.weight", self.w("output.weight")?)
         } else {
-            self.w("token_embd.weight")?
+            ("token_embd.weight", self.w("token_embd.weight")?)
         };
         let mut logits = vec![0.0f32; cfg.vocab];
-        qmatmul(&mut logits, &nh, head.bytes, head.ty, hidden, &mut row);
+        self.mm(head_key, &mut logits, &nh, &head, &mut row);
         Ok(Some(logits))
     }
 
@@ -385,11 +498,11 @@ impl MellumModel {
         let mut v = vec![0.0f32; kv_dim];
         {
             let wq = self.w(&b("attn_q.weight"))?;
-            qmatmul(&mut q, x, wq.bytes, wq.ty, wq.in_dim, row);
+            self.mm(&b("attn_q.weight"), &mut q, x, &wq, row);
             let wk = self.w(&b("attn_k.weight"))?;
-            qmatmul(&mut k, x, wk.bytes, wk.ty, wk.in_dim, row);
+            self.mm(&b("attn_k.weight"), &mut k, x, &wk, row);
             let wv = self.w(&b("attn_v.weight"))?;
-            qmatmul(&mut v, x, wv.bytes, wv.ty, wv.in_dim, row);
+            self.mm(&b("attn_v.weight"), &mut v, x, &wv, row);
         }
 
         // RoPE config for this layer: sliding => plain, full => YaRN.
@@ -484,7 +597,7 @@ impl MellumModel {
         let mut o = vec![0.0f32; cfg.hidden];
         {
             let wo = self.w(&b("attn_output.weight"))?;
-            qmatmul(&mut o, &attn_out, wo.bytes, wo.ty, wo.in_dim, row);
+            self.mm(&b("attn_output.weight"), &mut o, &attn_out, &wo, row);
         }
         Ok(o)
     }
@@ -526,15 +639,21 @@ impl MellumModel {
         let mut dy = vec![0.0f32; hidden];
         for &e in &idx {
             let wexp = probs[e] / wsum;
-            let ge = &wge.bytes[e * gate_bpr..(e + 1) * gate_bpr];
-            let ue = &wue.bytes[e * up_bpr..(e + 1) * up_bpr];
-            let de = &wde.bytes[e * down_bpr..(e + 1) * down_bpr];
-            qmatmul(&mut g, x, ge, wge.ty, hidden, row);
-            qmatmul(&mut u, x, ue, wue.ty, hidden, row);
+            let gkey = format!("blk.{il}.ffn_gate_exps.e{e}");
+            if !self.try_gemv(&gkey, x, &mut g) {
+                qmatmul(&mut g, x, &wge.bytes[e * gate_bpr..(e + 1) * gate_bpr], wge.ty, hidden, row);
+            }
+            let ukey = format!("blk.{il}.ffn_up_exps.e{e}");
+            if !self.try_gemv(&ukey, x, &mut u) {
+                qmatmul(&mut u, x, &wue.bytes[e * up_bpr..(e + 1) * up_bpr], wue.ty, hidden, row);
+            }
             for i in 0..eff {
                 act[i] = silu(g[i]) * u[i];
             }
-            qmatmul(&mut dy, &act, de, wde.ty, eff, row);
+            let dkey = format!("blk.{il}.ffn_down_exps.e{e}");
+            if !self.try_gemv(&dkey, &act, &mut dy) {
+                qmatmul(&mut dy, &act, &wde.bytes[e * down_bpr..(e + 1) * down_bpr], wde.ty, eff, row);
+            }
             for i in 0..hidden {
                 out[i] += wexp * dy[i];
             }
