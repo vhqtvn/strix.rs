@@ -125,13 +125,21 @@ fn find_gguf(model: &Path) -> Option<PathBuf> {
 /// this path takes **raw token IDs** via `STRIX_QWEN_IDS` (comma/space separated)
 /// for now — used to validate the forward against a llama.cpp golden. If unset, it
 /// falls back to the `prompt` string parsed as whitespace/comma-separated IDs.
-/// Build a per-weight GEMV accelerator for the MoE models (Qwen35/Mellum). Prefers a
-/// Vulkan accel — `GpuWeightAccel` (wgpu) or `AshWeightAccel` (ash, `STRIX_ASH=1`) —
-/// because they implement real per-weight `gemv`. The ROCm backend's `gemv` is a no-op
-/// (decode_step-only), so it is NOT used here. `None` if no GPU / not built `--features
-/// vulkan` (the model then stays fully on CPU).
+/// Build a per-weight GEMV accelerator for the MoE models (Qwen35/Mellum). `STRIX_ROCM=1`
+/// selects the ROCm/HIP backend (near-zero per-call launch overhead — best for the
+/// hundreds of expert GEMVs/token an MoE issues); otherwise a Vulkan accel
+/// (`GpuWeightAccel` wgpu, or `AshWeightAccel` ash via `STRIX_ASH=1`). All implement
+/// per-weight `gemv` for resident Q4_0/Q6_K weights. `None` if no GPU / not built with a
+/// GPU feature (the model then stays fully on CPU).
 #[allow(unused_mut, unused_assignments, clippy::let_and_return)]
 fn build_weight_accel() -> Option<Box<dyn strix_core::WeightAccel>> {
+    #[cfg(feature = "rocm")]
+    if std::env::var("STRIX_ROCM").is_ok() {
+        if let Some(a) = strix_backend_rocm::RocmWeightAccel::new() {
+            return Some(Box::new(a) as Box<dyn strix_core::WeightAccel>);
+        }
+        eprintln!("[gpu] STRIX_ROCM set but no ROCm/HIP device available");
+    }
     #[cfg(feature = "vulkan")]
     {
         if std::env::var("STRIX_ASH").is_ok() {

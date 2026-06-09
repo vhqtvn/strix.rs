@@ -175,6 +175,12 @@ const N_SPLIT_MAX: usize = 64;
 /// Max prompt tokens per prefill call (bounds scratch; SDPA scores cap is 2048).
 const M_CHUNK: usize = 256;
 
+/// Per-weight `gemv` scratch caps (floats): x input row, y output row. Cover the
+/// MoE models — in_dim ≤ ~2304, out_dim up to vocab (~248320). gemv returns None
+/// (→ CPU fallback) for any weight exceeding these.
+const GEMV_MAX_IN: usize = 16384;
+const GEMV_MAX_OUT: usize = 262144;
+
 /// ROCm/HIP decode accelerator.
 pub struct RocmWeightAccel {
     gpu: HipGpu,
@@ -184,6 +190,10 @@ pub struct RocmWeightAccel {
     f32w: HashMap<String, Dbuf>,
     cfg: Option<GpuDecodeConfig>,
     scratch: Option<Scratch>,
+    /// Persistent per-weight `gemv` scratch (x input / y output), reused across calls
+    /// (Dbuf has no free-on-drop, so per-call alloc would leak). Sized to GEMV_MAX_*.
+    gemv_x: Dbuf,
+    gemv_y: Dbuf,
     /// f16 KV cache (STRIX_F16_KV=1): halves KV memory + decode KV traffic, at a
     /// small prefill cost (the prefill SDPA is occupancy-bound, so the h2f isn't
     /// free there). Default false (f32) — best for prefill-heavy workloads.
@@ -278,6 +288,8 @@ impl RocmWeightAccel {
         ] {
             funcs.insert(name, gpu.get_function(module, name).ok()?);
         }
+        let gemv_x = gpu.alloc(GEMV_MAX_IN * 4).ok()?;
+        let gemv_y = gpu.alloc(GEMV_MAX_OUT * 4).ok()?;
         Some(Self {
             gpu,
             funcs,
@@ -286,6 +298,8 @@ impl RocmWeightAccel {
             f32w: HashMap::new(),
             cfg: None,
             scratch: None,
+            gemv_x,
+            gemv_y,
             kv_f16: std::env::var("STRIX_F16_KV").is_ok(),
             // pinned split if STRIX_N_SPLIT set, else 0 = context-adaptive (~len/64).
             n_split: std::env::var("STRIX_N_SPLIT").ok().and_then(|s| s.parse::<usize>().ok()).map(|v| v.clamp(1, N_SPLIT_MAX)).unwrap_or(0),
@@ -833,8 +847,56 @@ impl WeightAccel for RocmWeightAccel {
         true
     }
 
-    fn gemv(&self, _key: &str, _x: &[f32]) -> Option<Vec<f32>> {
-        None // whole forward runs in decode_step
+    fn gemv(&self, key: &str, x: &[f32]) -> Option<Vec<f32>> {
+        // Per-weight GEMV on a resident Q6_K / Q4_0 weight, reusing the exact kernels
+        // + launch config as `lm_head`. ROCm's stream-ordered launch has near-zero
+        // per-call overhead (vs wgpu's ~21µs), so this suits the ~hundreds of expert
+        // GEMVs/token an MoE forward issues. Persistent gemv_x/gemv_y scratch (no
+        // per-call alloc — Dbuf doesn't free). Returns None ⇒ caller uses CPU.
+        if let Some(e) = self.q6.get(key) {
+            if x.len() != e.in_dim || e.in_dim > GEMV_MAX_IN || e.out_dim > GEMV_MAX_OUT {
+                return None;
+            }
+            self.gemv_x.upload(x).ok()?;
+            self.launch(
+                "q6_gemv",
+                e.out_dim.div_ceil(8) as u32,
+                256,
+                0,
+                Args::new()
+                    .ptr(e.scales.ptr)
+                    .ptr(e.ql.ptr)
+                    .ptr(e.qh.ptr)
+                    .ptr(self.gemv_x.ptr)
+                    .ptr(self.gemv_y.ptr)
+                    .i(e.in_dim as i32)
+                    .i(e.out_dim as i32),
+            );
+            self.gpu.sync().ok()?;
+            return self.gemv_y.download::<f32>(e.out_dim).ok();
+        }
+        if let Some(e) = self.q4.get(key) {
+            if x.len() != e.in_dim || e.in_dim > GEMV_MAX_IN || e.out_dim > GEMV_MAX_OUT {
+                return None;
+            }
+            self.gemv_x.upload(x).ok()?;
+            self.launch(
+                "q4_gemv",
+                e.out_dim as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(e.scales.ptr)
+                    .ptr(e.quants.ptr)
+                    .ptr(self.gemv_x.ptr)
+                    .ptr(self.gemv_y.ptr)
+                    .i(e.in_dim as i32)
+                    .i(e.out_dim as i32),
+            );
+            self.gpu.sync().ok()?;
+            return self.gemv_y.download::<f32>(e.out_dim).ok();
+        }
+        None
     }
 
     fn resident_count(&self) -> usize {

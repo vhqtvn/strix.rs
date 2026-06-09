@@ -442,8 +442,16 @@ impl Qwen35Model {
         let hidden = self.cfg.hidden;
         let eff = self.cfg.expert_ff;
         let ne = self.cfg.n_expert;
+        // Partial offload: cap how many layers' experts go to the GPU (rest stay CPU).
+        // The full 35B experts (~29GB repacked) don't fit on a 58GB box alongside the
+        // mmap; STRIX_GPU_EXPERT_LAYERS=N offloads only the first N layers that fit.
+        // Default = all layers (fits for smaller models / when mmap pages are dropped).
+        let layer_cap = std::env::var("STRIX_GPU_EXPERT_LAYERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(self.cfg.n_layer);
         let mut advise: Vec<String> = Vec::new();
-        for il in 0..self.cfg.n_layer {
+        for il in 0..self.cfg.n_layer.min(layer_cap) {
             for (tname, in_dim, out_dim) in [
                 ("ffn_gate_exps", hidden, eff),
                 ("ffn_up_exps", hidden, eff),
