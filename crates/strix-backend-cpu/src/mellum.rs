@@ -218,13 +218,31 @@ fn qmatmul(out: &mut [f32], x: &[f32], bytes: &[u8], ty: GgmlType, in_dim: usize
         || vec![0.0f32; in_dim],
         |scratch, (o, oref)| {
             dequantize_into(ty, &bytes[o * bpr..o * bpr + bpr], scratch).unwrap();
-            let mut s = 0.0f32;
-            for i in 0..in_dim {
-                s += scratch[i] * x[i];
-            }
-            *oref = s;
+            *oref = dot_f32(scratch, x);
         },
     );
+}
+
+/// SIMD-friendly dot product. A plain `s += a[i]*b[i]` loop does NOT auto-vectorize
+/// (f32 add isn't associative + no fast-math), so split into 8 independent lane
+/// accumulators that LLVM lowers to vector FMAs, then reduce. `len` is a multiple of
+/// 32 (block size) so the tail loop is dead in practice.
+#[inline]
+fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let mut acc = [0.0f32; 8];
+    let chunks = n / 8;
+    for c in 0..chunks {
+        let i = c * 8;
+        for k in 0..8 {
+            acc[k] += a[i + k] * b[i + k];
+        }
+    }
+    let mut s = (acc[0] + acc[1]) + (acc[2] + acc[3]) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+    for i in (chunks * 8)..n {
+        s += a[i] * b[i];
+    }
+    s
 }
 
 /// A resolved weight: raw bytes + ggml type + the row length (in_dim).
