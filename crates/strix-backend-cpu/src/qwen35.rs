@@ -376,6 +376,10 @@ pub struct Qwen35Model {
     // `None` (default / CPU build), every matmul takes the CPU path → behaviour is
     // byte-identical to the pure-CPU forward. See docs/ideas/moe-accel-plan.md (P1).
     accel: Option<Box<dyn strix_core::WeightAccel>>,
+    // Optional NPU offload of the dense projections during batched prefill
+    // (the 256-expert MoE ~30GB int8 exceeds the BO pool → experts stay CPU).
+    #[cfg(feature = "npu")]
+    npu: Option<crate::mellum_npu::QwenNpu>,
 }
 
 impl Qwen35Model {
@@ -409,7 +413,67 @@ impl Qwen35Model {
             gguf,
             pos: 0,
             accel: None,
+            #[cfg(feature = "npu")]
+            npu: None,
         })
+    }
+
+    /// Stage the dense projections (deltanet qkv/gate/ssm_out + full-attn q/o, all
+    /// Q8_0 in the UD quant) onto the NPU. Returns #staged.
+    #[cfg(feature = "npu")]
+    pub fn attach_npu(&mut self, mut npu: crate::mellum_npu::QwenNpu) -> Result<usize> {
+        let mut n = 0usize;
+        let g = &self.gguf;
+        let mut stage = |sh: &mut crate::mellum_npu::NpuShape, name: String, slot: u64| {
+            if let (Some(ti), Ok(bytes)) = (g.tensors().get(&name), g.tensor_bytes(&name)) {
+                if sh.stage_q8(slot, bytes, ti.ggml_type).is_ok() {
+                    return 1;
+                }
+            }
+            0
+        };
+        for il in 0..self.cfg.n_layer {
+            if self.cfg.is_recr(il) {
+                n += stage(&mut npu.p8192, format!("blk.{il}.attn_qkv.weight"), il as u64);
+                n += stage(&mut npu.p4096, format!("blk.{il}.attn_gate.weight"), il as u64);
+                n += stage(&mut npu.p2048, format!("blk.{il}.ssm_out.weight"), il as u64);
+            } else {
+                n += stage(&mut npu.p8192, format!("blk.{il}.attn_q.weight"), il as u64);
+                n += stage(&mut npu.p2048, format!("blk.{il}.attn_output.weight"), il as u64);
+            }
+        }
+        self.npu = Some(npu);
+        Ok(n)
+    }
+
+    /// NPU dense projection for layer `il` during batched prefill (`which`: 0 = the
+    /// 2048→8192 shape, 1 = 2048→4096, 2 = 4096→2048), chunked to M=256.
+    #[cfg(feature = "npu")]
+    fn npu_proj(&self, which: u8, il: usize, xs: &[f32], m: usize, k: usize, n: usize, out: &mut [f32]) -> bool {
+        let Some(npu) = &self.npu else { return false };
+        if m < crate::mellum_npu::M_MIN {
+            return false;
+        }
+        let sh = match which {
+            0 => &npu.p8192,
+            1 => &npu.p4096,
+            _ => &npu.p2048,
+        };
+        if sh.k != k || sh.n != n || !sh.has(il as u64) {
+            return false;
+        }
+        for c in (0..m).step_by(crate::mellum_npu::M_NPU) {
+            let mc = (m - c).min(crate::mellum_npu::M_NPU);
+            if sh.gemm(il as u64, &xs[c * k..(c + mc) * k], mc, &mut out[c * n..(c + mc) * n]).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+    #[cfg(not(feature = "npu"))]
+    #[allow(clippy::too_many_arguments)]
+    fn npu_proj(&self, _w: u8, _il: usize, _xs: &[f32], _m: usize, _k: usize, _n: usize, _o: &mut [f32]) -> bool {
+        false
     }
 
     /// Attach an iGPU weight accelerator and upload the dense Q6_K/Q4_0 projection
@@ -647,8 +711,10 @@ impl Qwen35Model {
         let mut k = vec![0.0f32; m * kv_dim];
         let mut v = vec![0.0f32; m * kv_dim];
         {
-            let wq = self.w(&b("attn_q.weight"))?;
-            qmatmul_batch(&mut qg, x, m, wq.bytes, wq.ty, hidden, qg_dim);
+            if !self.npu_proj(0, il, x, m, hidden, qg_dim, &mut qg) {
+                let wq = self.w(&b("attn_q.weight"))?;
+                qmatmul_batch(&mut qg, x, m, wq.bytes, wq.ty, hidden, qg_dim);
+            }
             let wk = self.w(&b("attn_k.weight"))?;
             qmatmul_batch(&mut k, x, m, wk.bytes, wk.ty, hidden, kv_dim);
             let wv = self.w(&b("attn_v.weight"))?;
@@ -717,7 +783,7 @@ impl Qwen35Model {
             }
         });
         let mut o = vec![0.0f32; m * hidden];
-        {
+        if !self.npu_proj(2, il, &attn_out, m, q_dim, hidden, &mut o) {
             let wo = self.w(&b("attn_output.weight"))?;
             qmatmul_batch(&mut o, &attn_out, m, wo.bytes, wo.ty, q_dim, hidden);
         }
@@ -751,10 +817,14 @@ impl Qwen35Model {
         let mut beta_raw = vec![0.0f32; m * n_vh];
         let mut alpha_raw = vec![0.0f32; m * n_vh];
         {
-            let wqkv = self.w(&b("attn_qkv.weight"))?;
-            qmatmul_batch(&mut qkv, x, m, wqkv.bytes, wqkv.ty, hidden, conv_dim);
-            let wgate = self.w(&b("attn_gate.weight"))?;
-            qmatmul_batch(&mut z, x, m, wgate.bytes, wgate.ty, hidden, value_dim);
+            if !self.npu_proj(0, il, x, m, hidden, conv_dim, &mut qkv) {
+                let wqkv = self.w(&b("attn_qkv.weight"))?;
+                qmatmul_batch(&mut qkv, x, m, wqkv.bytes, wqkv.ty, hidden, conv_dim);
+            }
+            if !self.npu_proj(1, il, x, m, hidden, value_dim, &mut z) {
+                let wgate = self.w(&b("attn_gate.weight"))?;
+                qmatmul_batch(&mut z, x, m, wgate.bytes, wgate.ty, hidden, value_dim);
+            }
             let wbeta = self.w(&b("ssm_beta.weight"))?;
             qmatmul_batch(&mut beta_raw, x, m, wbeta.bytes, wbeta.ty, hidden, n_vh);
             let walpha = self.w(&b("ssm_alpha.weight"))?;
@@ -838,7 +908,7 @@ impl Qwen35Model {
             }
         }
         let mut o = vec![0.0f32; m * hidden];
-        {
+        if !self.npu_proj(2, il, &gated, m, value_dim, hidden, &mut o) {
             let wout = self.w(&b("ssm_out.weight"))?;
             qmatmul_batch(&mut o, &gated, m, wout.bytes, wout.ty, value_dim, hidden);
         }

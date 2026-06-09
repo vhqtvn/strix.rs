@@ -183,3 +183,22 @@ impl MellumNpu {
         })
     }
 }
+
+/// Qwen3.6 NPU offload: the dense projections (deltanet qkv/gate/ssm_out + full-attn
+/// q/o — all Q8_0 in the UD quant). The 256-expert MoE (~30 GB int8) exceeds the BO
+/// pool and stays on CPU.
+pub struct QwenNpu {
+    pub p8192: NpuShape, // [2048 -> 8192] attn_qkv (deltanet) + attn_q (attn layers)
+    pub p4096: NpuShape, // [2048 -> 4096] attn_gate (deltanet)
+    pub p2048: NpuShape, // [4096 -> 2048] ssm_out (deltanet) + attn_output (attn layers)
+}
+
+impl QwenNpu {
+    pub fn open(dir: &str) -> Result<QwenNpu> {
+        Ok(QwenNpu {
+            p8192: NpuShape::open(dir, 2048, 8192, 8)?,
+            p4096: NpuShape::open(dir, 2048, 4096, 8)?,
+            p2048: NpuShape::open(dir, 4096, 2048, 8)?,
+        })
+    }
+}

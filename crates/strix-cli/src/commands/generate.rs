@@ -178,6 +178,28 @@ fn run_qwen35(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Res
         prompt_ids.len()
     );
 
+    // NPU prefill offload of the dense projections (feature npu-cpu + STRIX_NPU=1).
+    #[cfg(feature = "npu-cpu")]
+    if std::env::var("STRIX_NPU").is_ok() {
+        let dir = std::env::var("STRIX_NPU_DIR").unwrap_or_else(|_| {
+            "external/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build"
+                .into()
+        });
+        match strix_backend_cpu::mellum_npu::QwenNpu::open(&dir) {
+            Ok(npu) => {
+                let t = Instant::now();
+                match model.attach_npu(npu) {
+                    Ok(n) => eprintln!(
+                        "[qwen35moe] {n} dense projections staged on NPU ({:.1}s)",
+                        t.elapsed().as_secs_f64()
+                    ),
+                    Err(e) => eprintln!("[qwen35moe] NPU staging failed: {e}"),
+                }
+            }
+            Err(e) => eprintln!("[qwen35moe] NPU open failed ({dir}): {e}"),
+        }
+    }
+
     // --gpu: offload the dense Q6_K projections (attn q/k/v/o + lm_head) to the iGPU
     // via per-weight gemv (Vulkan). Experts/deltanet stay on CPU (P2). No-op if no
     // Vulkan accel is available.
