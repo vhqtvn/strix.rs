@@ -127,6 +127,22 @@ fn run_gguf(path: &Path, prompt: &str, max_tokens: usize, chat: bool, gpu: bool)
     let arch = gguf.architecture().unwrap_or("?").to_string();
     tracing::info!(arch = %arch, "loaded gguf");
 
+    // Qwen3.5/3.6-MoE (qwen35moe) bring-up — Phase 0: recognize + parse config +
+    // validate tensors. Forward not yet implemented (hybrid Gated-DeltaNet/MoE,
+    // see docs/qwen36-arch.md). Reports and exits rather than failing in GemmaModel.
+    if arch == "qwen35moe" {
+        match strix_backend_cpu::qwen35::p0_validate(&gguf) {
+            Ok((_cfg, report)) => {
+                println!("[qwen35moe P0] config parsed + all tensors validated ✓\n{report}");
+                println!("[qwen35moe P0] forward NOT yet implemented (P1 MoE → P2 attn → P3 gated-deltanet).");
+                return Ok(());
+            }
+            Err(e) => {
+                anyhow::bail!("qwen35moe P0 validation failed:\n{e}");
+            }
+        }
+    }
+
     let tokenizer = StrixTokenizer::from_gguf(&gguf).context("build tokenizer from gguf")?;
 
     // In chat mode wrap the prompt in the Gemma turn template. Gemma-4 uses the

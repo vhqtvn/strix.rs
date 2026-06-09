@@ -10,6 +10,7 @@ pub mod gemma;
 pub mod kv_cache;
 pub mod llama;
 pub mod ops;
+pub mod qwen35;
 
 pub use gemma::GemmaModel;
 pub use llama::LlamaModel;
