@@ -659,7 +659,7 @@ extern "C" __global__ void q8_moe_gemv_gu(const float* __restrict__ gs,
 }
 
 // Down-projection with silu+weighted-sum folded: act = silu(g)*u computed on the
-// fly, k experts serial per block, y[row] = sum_k w[k]*dot. grid=(out_dim), block=32.
+// per-expert partials to y[k][row] (wsum reduces). grid=(out_dim, k), block=32.
 extern "C" __global__ void q8_moe_down(const float* __restrict__ scales,
                                        const signed char* __restrict__ quants,
                                        const int* __restrict__ ids,
@@ -670,32 +670,29 @@ extern "C" __global__ void q8_moe_down(const float* __restrict__ scales,
     int l = threadIdx.x & 31;
     int row = blockIdx.x;
     if (row >= out_dim) return;
+    int kk = blockIdx.y;
     int nb = in_dim / 32;
-    float out = 0.f;
-    for (int kk = 0; kk < k; kk++) {
-        long long eoff = (long long)ids[kk] * out_dim * nb;
-        const float* sc = scales + eoff + (long long)row * nb;
-        const signed char* qr = quants + (eoff + (long long)row * nb) * 32;
-        const float* gk = g + (long long)kk * in_dim;
-        const float* uk = u + (long long)kk * in_dim;
-        float acc = 0.f;
-        for (int b4 = 0; b4 < nb; b4 += 4) {
-            int bi = b4 + (l >> 3);
-            float d = sc[bi];
-            int e = (l & 7) * 4;
-            const char4 q = *(const char4*)(qr + (long long)bi * 32 + e);
-            const float* gb = gk + bi * 32 + e;
-            const float* ub = uk + bi * 32 + e;
-            float a0 = gb[0] / (1.f + __expf(-gb[0])) * ub[0];
-            float a1 = gb[1] / (1.f + __expf(-gb[1])) * ub[1];
-            float a2 = gb[2] / (1.f + __expf(-gb[2])) * ub[2];
-            float a3 = gb[3] / (1.f + __expf(-gb[3])) * ub[3];
-            acc += d * (q.x * a0 + q.y * a1 + q.z * a2 + q.w * a3);
-        }
-        for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
-        if (l == 0) out += w[kk] * acc;
+    long long eoff = (long long)ids[kk] * out_dim * nb;
+    const float* sc = scales + eoff + (long long)row * nb;
+    const signed char* qr = quants + (eoff + (long long)row * nb) * 32;
+    const float* gk = g + (long long)kk * in_dim;
+    const float* uk = u + (long long)kk * in_dim;
+    float acc = 0.f;
+    for (int b4 = 0; b4 < nb; b4 += 4) {
+        int bi = b4 + (l >> 3);
+        float d = sc[bi];
+        int e = (l & 7) * 4;
+        const char4 q = *(const char4*)(qr + (long long)bi * 32 + e);
+        const float* gb = gk + bi * 32 + e;
+        const float* ub = uk + bi * 32 + e;
+        float a0 = gb[0] / (1.f + __expf(-gb[0])) * ub[0];
+        float a1 = gb[1] / (1.f + __expf(-gb[1])) * ub[1];
+        float a2 = gb[2] / (1.f + __expf(-gb[2])) * ub[2];
+        float a3 = gb[3] / (1.f + __expf(-gb[3])) * ub[3];
+        acc += d * (q.x * a0 + q.y * a1 + q.z * a2 + q.w * a3);
     }
-    if (l == 0) y[row] = out;
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
+    if (l == 0) y[(long long)kk * out_dim + row] = acc;
 }
 
 // Down-projection variant: all top-k experts in ONE launch. x = per-k act rows

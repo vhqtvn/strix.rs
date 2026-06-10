@@ -1093,9 +1093,10 @@ impl RocmWeightAccel {
                 .i(m.hidden as i32)
                 .i(m.eff as i32),
         );
-        self.launch(
+        self.launch2(
             "q8_moe_down",
             m.hidden as u32,
+            k as u32,
             32,
             0,
             Args::new()
@@ -1105,8 +1106,20 @@ impl RocmWeightAccel {
                 .ptr(self.moe_w.ptr)
                 .ptr(self.moe_g.ptr)
                 .ptr(self.moe_u.ptr)
-                .ptr(self.moe_out.ptr)
+                .ptr(self.moe_dy.ptr)
                 .i(m.eff as i32)
+                .i(m.hidden as i32)
+                .i(k as i32),
+        );
+        self.launch(
+            "moe_wsum",
+            m.hidden.div_ceil(256) as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(self.moe_dy.ptr)
+                .ptr(self.moe_w.ptr)
+                .ptr(self.moe_out.ptr)
                 .i(m.hidden as i32)
                 .i(k as i32),
         );
