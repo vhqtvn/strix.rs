@@ -267,6 +267,7 @@ pub struct RocmWeightAccel {
     pf_a: Dbuf,
     pf_b: Dbuf,
     pf_y: Dbuf,
+    pf_dy: Dbuf,
     /// f16 KV cache (STRIX_F16_KV=1): halves KV memory + decode KV traffic, at a
     /// small prefill cost (the prefill SDPA is occupancy-bound, so the h2f isn't
     /// free there). Default false (f32) — best for prefill-heavy workloads.
@@ -391,6 +392,7 @@ impl RocmWeightAccel {
         let pf_a = gpu.alloc(256 * 4096 * 4).ok()?;
         let pf_b = gpu.alloc(256 * 4096 * 4).ok()?;
         let pf_y = gpu.alloc(256 * 8192 * 4).ok()?;
+        let pf_dy = gpu.alloc(2048 * 4096 * 4).ok()?;
         let mut batch_x = Vec::new();
         let mut batch_y = Vec::new();
         for _ in 0..4 {
@@ -430,6 +432,7 @@ impl RocmWeightAccel {
             pf_a,
             pf_b,
             pf_y,
+            pf_dy,
             kv_f16: std::env::var("STRIX_F16_KV").is_ok(),
             // pinned split if STRIX_N_SPLIT set, else 0 = context-adaptive (~len/64).
             n_split: std::env::var("STRIX_N_SPLIT")
@@ -1300,7 +1303,14 @@ impl WeightAccel for RocmWeightAccel {
         true
     }
 
-    fn moe_ffn(&self, layer: usize, ids: &[i32], wexp: &[f32], x: &[f32], sgate: f32) -> Option<Vec<f32>> {
+    fn moe_ffn(
+        &self,
+        layer: usize,
+        ids: &[i32],
+        wexp: &[f32],
+        x: &[f32],
+        sgate: f32,
+    ) -> Option<Vec<f32>> {
         if let Some(m) = self.moe6.get(&layer) {
             let k = ids.len();
             if x.len() != m.hidden || wexp.len() != k || k > 16 {
@@ -1498,7 +1508,11 @@ impl WeightAccel for RocmWeightAccel {
             n_act.div_ceil(256) as u32,
             256,
             0,
-            Args::new().ptr(self.pf_a.ptr).ptr(self.pf_b.ptr).ptr(self.pf_x.ptr).i(n_act as i32),
+            Args::new()
+                .ptr(self.pf_a.ptr)
+                .ptr(self.pf_b.ptr)
+                .ptr(self.pf_x.ptr)
+                .i(n_act as i32),
         );
         self.launch2(
             "q6_gemm_rows",
@@ -1517,6 +1531,84 @@ impl WeightAccel for RocmWeightAccel {
         );
         self.gpu.sync().ok()?;
         self.pf_y.download::<f32>(m * mo.hidden).ok()
+    }
+
+    fn moe_expert_queue(
+        &self,
+        layer: usize,
+        eid: usize,
+        xs: &[f32],
+        m: usize,
+        dy_off: usize,
+    ) -> bool {
+        let Some(mo) = self.moe6.get(&layer) else {
+            return false;
+        };
+        if xs.len() != m * mo.hidden || (dy_off + m) * mo.hidden > 2048 * 4096 {
+            return false;
+        }
+        // per-call x staging at offset dy_off in pf_x (reuse pool rows; hidden<=2048, pool 256*8192)
+        let xoff = dy_off * mo.hidden;
+        if (xoff + m * mo.hidden) > 256 * 8192 {
+            return false;
+        }
+        let xptr = unsafe { (self.pf_x.ptr as *mut f32).add(xoff) } as *mut c_void;
+        if self.gpu.upload_at(&self.pf_x, xoff * 4, xs).is_err() {
+            return false;
+        }
+        let geb = mo.gate_eb as usize as *mut c_void;
+        let deb = mo.down_eb as usize as *mut c_void;
+        // pf_a/pf_b reused across queued experts — safe: the stream serializes
+        // each expert's gate→silu→down chain before the next overwrites them.
+        let a = self.pf_a.ptr;
+        let b = self.pf_b.ptr;
+        for (w, y) in [(&mo.gate, a), (&mo.up, b)] {
+            self.launch2(
+                "q6_gemm_rows",
+                mo.eff as u32,
+                m as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(w.ptr)
+                    .ptr(geb)
+                    .i(eid as i32)
+                    .ptr(xptr)
+                    .ptr(y)
+                    .i(mo.hidden as i32)
+                    .i(mo.eff as i32),
+            );
+        }
+        let n_act = m * mo.eff;
+        self.launch(
+            "moe_silu_mul",
+            n_act.div_ceil(256) as u32,
+            256,
+            0,
+            Args::new().ptr(a).ptr(b).ptr(a).i(n_act as i32),
+        );
+        let dyp = unsafe { (self.pf_dy.ptr as *mut f32).add(dy_off * mo.hidden) } as *mut c_void;
+        self.launch2(
+            "q6_gemm_rows",
+            mo.hidden as u32,
+            m as u32,
+            32,
+            0,
+            Args::new()
+                .ptr(mo.down.ptr)
+                .ptr(deb)
+                .i(eid as i32)
+                .ptr(a)
+                .ptr(dyp)
+                .i(mo.eff as i32)
+                .i(mo.hidden as i32),
+        );
+        true
+    }
+
+    fn moe_expert_flush(&self, rows: usize, hidden: usize) -> Option<Vec<f32>> {
+        self.gpu.sync().ok()?;
+        self.pf_dy.download::<f32>(rows * hidden).ok()
     }
 
     fn gemv(&self, key: &str, x: &[f32]) -> Option<Vec<f32>> {

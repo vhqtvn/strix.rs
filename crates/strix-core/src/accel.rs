@@ -106,7 +106,14 @@ pub trait WeightAccel: Send + Sync {
     /// Fused MoE FFN for one token: y = Σ_k wexp[k]·down(silu(gate)·up)(x) over the
     /// routed experts — one device round-trip. `None` if layer not adopted.
     /// `sgate`: sigmoid-gated shared-expert scale to fuse (0.0 = no shared expert).
-    fn moe_ffn(&self, _layer: usize, _ids: &[i32], _wexp: &[f32], _x: &[f32], _sgate: f32) -> Option<Vec<f32>> {
+    fn moe_ffn(
+        &self,
+        _layer: usize,
+        _ids: &[i32],
+        _wexp: &[f32],
+        _x: &[f32],
+        _sgate: f32,
+    ) -> Option<Vec<f32>> {
         None
     }
 
@@ -116,6 +123,22 @@ pub trait WeightAccel: Send + Sync {
     }
     /// Whole expert FFN for m grouped tokens (gate/up/silu/down, one sync).
     fn moe_expert_ffn(&self, _layer: usize, _e: usize, _xs: &[f32], _m: usize) -> Option<Vec<f32>> {
+        None
+    }
+    /// Queue an expert FFN without syncing; result lands at `dy_off` rows in the
+    /// device dy pool. Returns false if not resident / capacity exceeded.
+    fn moe_expert_queue(
+        &self,
+        _layer: usize,
+        _e: usize,
+        _xs: &[f32],
+        _m: usize,
+        _dy_off: usize,
+    ) -> bool {
+        false
+    }
+    /// Sync + download `rows` of hidden from the dy pool.
+    fn moe_expert_flush(&self, _rows: usize, _hidden: usize) -> Option<Vec<f32>> {
         None
     }
 

@@ -145,6 +145,17 @@ impl HipGpu {
         Ok(Dbuf { ptr, bytes })
     }
 
+    /// Upload at a byte offset into an existing buffer.
+    pub fn upload_at<T: Copy>(&self, buf: &Dbuf, byte_off: usize, data: &[T]) -> Result<()> {
+        let n = std::mem::size_of_val(data);
+        let dst = unsafe { (buf.ptr as *mut u8).add(byte_off) } as *mut c_void;
+        let r = unsafe { hipMemcpy(dst, data.as_ptr() as *const c_void, n, HIP_MEMCPY_HTOD) };
+        if r != 0 {
+            return Err(StrixError::backend(format!("hipMemcpy upload_at: {r}")));
+        }
+        Ok(())
+    }
+
     pub fn upload_new<T: Copy>(&self, data: &[T]) -> Result<Dbuf> {
         let b = self.alloc(std::mem::size_of_val(data))?;
         b.upload(data)?;

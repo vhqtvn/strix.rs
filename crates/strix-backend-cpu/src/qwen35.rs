@@ -471,7 +471,15 @@ impl Qwen35Model {
     }
 
     /// iGPU dense GEMM for batched prefill (resident Q8 weight, chunks of 256).
-    fn gpu_gemm(&self, key: &str, xs: &[f32], m: usize, in_dim: usize, out_dim: usize, out: &mut [f32]) -> bool {
+    fn gpu_gemm(
+        &self,
+        key: &str,
+        xs: &[f32],
+        m: usize,
+        in_dim: usize,
+        out_dim: usize,
+        out: &mut [f32],
+    ) -> bool {
         let Some(a) = &self.accel else { return false };
         for c in (0..m).step_by(256) {
             let mc = (m - c).min(256);
@@ -558,7 +566,12 @@ impl Qwen35Model {
                     names.push(format!("blk.{il}.{t}.weight"));
                 }
             }
-            for t in ["ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp", "ffn_gate_inp_shexp"] {
+            for t in [
+                "ffn_gate_shexp",
+                "ffn_up_shexp",
+                "ffn_down_shexp",
+                "ffn_gate_inp_shexp",
+            ] {
                 names.push(format!("blk.{il}.{t}.weight"));
             }
         }
@@ -611,16 +624,27 @@ impl Qwen35Model {
             let gname = format!("blk.{il}.ffn_gate_exps.weight");
             let uname = format!("blk.{il}.ffn_up_exps.weight");
             let dname = format!("blk.{il}.ffn_down_exps.weight");
-            let (Some(gt), Some(dt)) = (self.gguf.tensors().get(&gname), self.gguf.tensors().get(&dname)) else { continue };
+            let (Some(gt), Some(dt)) = (
+                self.gguf.tensors().get(&gname),
+                self.gguf.tensors().get(&dname),
+            ) else {
+                continue;
+            };
             let (gty, dty) = (gt.ggml_type, dt.ggml_type);
             let (Ok(gb), Ok(ub), Ok(db)) = (
                 self.gguf.tensor_bytes(&gname),
                 self.gguf.tensor_bytes(&uname),
                 self.gguf.tensor_bytes(&dname),
-            ) else { continue };
+            ) else {
+                continue;
+            };
             let ok = match (gty, dty) {
-                (GgmlType::Q6K, GgmlType::Q6K) => accel.upload_moe_q6(il, gb, ub, db, hidden, eff, ne),
-                (GgmlType::Q8_0, GgmlType::Q8_0) => accel.upload_moe_q8(il, gb, ub, db, hidden, eff, ne),
+                (GgmlType::Q6K, GgmlType::Q6K) => {
+                    accel.upload_moe_q6(il, gb, ub, db, hidden, eff, ne)
+                }
+                (GgmlType::Q8_0, GgmlType::Q8_0) => {
+                    accel.upload_moe_q8(il, gb, ub, db, hidden, eff, ne)
+                }
                 _ => false,
             };
             if ok {
@@ -769,7 +793,8 @@ impl Qwen35Model {
         let mut v = vec![0.0f32; m * kv_dim];
         {
             if !self.gpu_gemm(&b("attn_q.weight"), x, m, hidden, qg_dim, &mut qg)
-                && !self.npu_proj(0, il, x, m, hidden, qg_dim, &mut qg) {
+                && !self.npu_proj(0, il, x, m, hidden, qg_dim, &mut qg)
+            {
                 let wq = self.w(&b("attn_q.weight"))?;
                 qmatmul_batch(&mut qg, x, m, wq.bytes, wq.ty, hidden, qg_dim);
             }
@@ -846,8 +871,15 @@ impl Qwen35Model {
                 }
             });
         let mut o = vec![0.0f32; m * hidden];
-        if !self.gpu_gemm(&b("attn_output.weight"), &attn_out, m, q_dim, hidden, &mut o)
-            && !self.npu_proj(2, il, &attn_out, m, q_dim, hidden, &mut o) {
+        if !self.gpu_gemm(
+            &b("attn_output.weight"),
+            &attn_out,
+            m,
+            q_dim,
+            hidden,
+            &mut o,
+        ) && !self.npu_proj(2, il, &attn_out, m, q_dim, hidden, &mut o)
+        {
             let wo = self.w(&b("attn_output.weight"))?;
             qmatmul_batch(&mut o, &attn_out, m, wo.bytes, wo.ty, q_dim, hidden);
         }
@@ -882,12 +914,14 @@ impl Qwen35Model {
         let mut alpha_raw = vec![0.0f32; m * n_vh];
         {
             if !self.gpu_gemm(&b("attn_qkv.weight"), x, m, hidden, conv_dim, &mut qkv)
-                && !self.npu_proj(0, il, x, m, hidden, conv_dim, &mut qkv) {
+                && !self.npu_proj(0, il, x, m, hidden, conv_dim, &mut qkv)
+            {
                 let wqkv = self.w(&b("attn_qkv.weight"))?;
                 qmatmul_batch(&mut qkv, x, m, wqkv.bytes, wqkv.ty, hidden, conv_dim);
             }
             if !self.gpu_gemm(&b("attn_gate.weight"), x, m, hidden, value_dim, &mut z)
-                && !self.npu_proj(1, il, x, m, hidden, value_dim, &mut z) {
+                && !self.npu_proj(1, il, x, m, hidden, value_dim, &mut z)
+            {
                 let wgate = self.w(&b("attn_gate.weight"))?;
                 qmatmul_batch(&mut z, x, m, wgate.bytes, wgate.ty, hidden, value_dim);
             }
@@ -983,7 +1017,8 @@ impl Qwen35Model {
         }
         let mut o = vec![0.0f32; m * hidden];
         if !self.gpu_gemm(&b("ssm_out.weight"), &gated, m, value_dim, hidden, &mut o)
-            && !self.npu_proj(2, il, &gated, m, value_dim, hidden, &mut o) {
+            && !self.npu_proj(2, il, &gated, m, value_dim, hidden, &mut o)
+        {
             let wout = self.w(&b("ssm_out.weight"))?;
             qmatmul_batch(&mut o, &gated, m, wout.bytes, wout.ty, value_dim, hidden);
         }
@@ -1034,6 +1069,40 @@ impl Qwen35Model {
         let u_bpr = (hidden / wue.ty.block_elems()) * wue.ty.block_bytes() * eff;
         let d_bpr = (eff / wde.ty.block_elems()) * wde.ty.block_bytes() * hidden;
         let mut dy = vec![0.0f32; m * topk * hidden];
+        // GPU path: queue ALL experts' FFNs, one sync + one download per layer.
+        if let Some(a) = &self.accel {
+            let mut off = 0usize;
+            let mut plan: Vec<(usize, usize, usize)> = Vec::new(); // (expert, off, me)
+            let mut all = true;
+            for (e, list) in by_exp.iter().enumerate() {
+                if list.is_empty() {
+                    continue;
+                }
+                let me = list.len();
+                let mut xs = vec![0.0f32; me * hidden];
+                for (i, &(t, _)) in list.iter().enumerate() {
+                    xs[i * hidden..(i + 1) * hidden]
+                        .copy_from_slice(&x[t * hidden..(t + 1) * hidden]);
+                }
+                if !a.moe_expert_queue(il, e, &xs, me, off) {
+                    all = false;
+                    break;
+                }
+                plan.push((e, off, me));
+                off += me;
+            }
+            if all && off > 0 {
+                if let Some(d_all) = a.moe_expert_flush(off, hidden) {
+                    for &(e, o, _me) in &plan {
+                        for (i, &(t, s)) in by_exp[e].iter().enumerate() {
+                            dy[(t * topk + s) * hidden..(t * topk + s + 1) * hidden]
+                                .copy_from_slice(&d_all[(o + i) * hidden..(o + i + 1) * hidden]);
+                        }
+                    }
+                    return self.moe_finish(x, m, il, h, &routes, &dy);
+                }
+            }
+        }
         for (e, list) in by_exp.iter().enumerate() {
             if list.is_empty() {
                 continue;
@@ -1091,7 +1160,23 @@ impl Qwen35Model {
                     .copy_from_slice(&d[i * hidden..(i + 1) * hidden]);
             }
         }
-        // shared expert, batched
+        self.moe_finish(x, m, il, h, &routes, &dy)
+    }
+
+    /// Shared expert + per-token weighted accumulation (moe_batch tail).
+    fn moe_finish(
+        &self,
+        x: &[f32],
+        m: usize,
+        il: usize,
+        h: &mut [f32],
+        routes: &[Vec<(usize, f32)>],
+        dy: &[f32],
+    ) -> Result<()> {
+        let cfg = &self.cfg;
+        let hidden = cfg.hidden;
+        let topk = cfg.n_expert_used;
+        let b = |s: &str| format!("blk.{il}.{s}");
         let sff = cfg.shared_ff;
         let mut shared = vec![0.0f32; m * hidden];
         if sff > 0 {
@@ -1101,13 +1186,19 @@ impl Qwen35Model {
             let wgis = self.w(&b("ffn_gate_inp_shexp.weight"))?;
             let mut gs = vec![0.0f32; m * sff];
             let mut us = vec![0.0f32; m * sff];
-            qmatmul_batch(&mut gs, x, m, wgs.bytes, wgs.ty, hidden, sff);
-            qmatmul_batch(&mut us, x, m, wus.bytes, wus.ty, hidden, sff);
+            if !self.gpu_gemm(&b("ffn_gate_shexp.weight"), x, m, hidden, sff, &mut gs) {
+                qmatmul_batch(&mut gs, x, m, wgs.bytes, wgs.ty, hidden, sff);
+            }
+            if !self.gpu_gemm(&b("ffn_up_shexp.weight"), x, m, hidden, sff, &mut us) {
+                qmatmul_batch(&mut us, x, m, wus.bytes, wus.ty, hidden, sff);
+            }
             let mut a = vec![0.0f32; m * sff];
             for i in 0..m * sff {
                 a[i] = silu(gs[i]) * us[i];
             }
-            qmatmul_batch(&mut shared, &a, m, wds.bytes, wds.ty, sff, hidden);
+            if !self.gpu_gemm(&b("ffn_down_shexp.weight"), &a, m, sff, hidden, &mut shared) {
+                qmatmul_batch(&mut shared, &a, m, wds.bytes, wds.ty, sff, hidden);
+            }
             let mut sg = vec![0.0f32; m];
             qmatmul_batch(&mut sg, x, m, wgis.bytes, wgis.ty, hidden, 1);
             for t in 0..m {
@@ -1215,7 +1306,11 @@ impl Qwen35Model {
         {
             let mut got = false;
             if let Some(a) = &self.accel {
-                let r = a.gemv_batch(&[(&b("attn_q.weight"), x), (&b("attn_k.weight"), x), (&b("attn_v.weight"), x)]);
+                let r = a.gemv_batch(&[
+                    (&b("attn_q.weight"), x),
+                    (&b("attn_k.weight"), x),
+                    (&b("attn_v.weight"), x),
+                ]);
                 if let (Some(qv), Some(kv), Some(vv)) = (&r[0], &r[1], &r[2]) {
                     if qv.len() == qg.len() && kv.len() == k.len() && vv.len() == v.len() {
                         qg.copy_from_slice(qv);
@@ -1493,7 +1588,9 @@ impl Qwen35Model {
                 qmatmul(&mut sg, x, wgis.bytes, wgis.ty, wgis.in_dim, row);
                 sgate = sigmoid(sg[0]);
             }
-            gpu_out = a.moe_ffn(il, &ids, &wexp, x, sgate).filter(|y| y.len() == hidden);
+            gpu_out = a
+                .moe_ffn(il, &ids, &wexp, x, sgate)
+                .filter(|y| y.len() == hidden);
         }
 
         let wge = self.w(&b("ffn_gate_exps.weight"))?; // [hidden, eff, ne]
@@ -1568,7 +1665,10 @@ impl Qwen35Model {
             let mut ds = vec![0.0f32; hidden];
             let mut got = false;
             if let Some(acc) = &self.accel {
-                let r = acc.gemv_batch(&[(&b("ffn_gate_shexp.weight"), x), (&b("ffn_up_shexp.weight"), x)]);
+                let r = acc.gemv_batch(&[
+                    (&b("ffn_gate_shexp.weight"), x),
+                    (&b("ffn_up_shexp.weight"), x),
+                ]);
                 if let (Some(gv), Some(uv)) = (&r[0], &r[1]) {
                     if gv.len() == sff && uv.len() == sff {
                         gs.copy_from_slice(gv);
