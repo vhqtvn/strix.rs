@@ -733,6 +733,8 @@ impl Qwen35Model {
         }
         let mut n = vec![0.0f32; m * hidden];
 
+        let prof = std::env::var("STRIX_PREFILL_PROF").is_ok();
+        let (mut t_mix, mut t_moe) = (0.0f64, 0.0f64);
         for il in 0..cfg.n_layer {
             let b = |s: &str| format!("blk.{il}.{s}");
             let an = self.vecw(&b("attn_norm.weight"))?;
@@ -743,11 +745,13 @@ impl Qwen35Model {
                 );
                 rmsnorm(ns, hs, &an, eps);
             }
+            let t0 = std::time::Instant::now();
             if cfg.is_recr(il) {
                 self.deltanet_batch(&n, m, il, &mut h)?;
             } else {
                 self.attn_batch(&n, m, il, &mut h)?;
             }
+            t_mix += t0.elapsed().as_secs_f64();
             let pn = self.vecw(&b("post_attention_norm.weight"))?;
             for t in 0..m {
                 let (hs, ns) = (
@@ -756,7 +760,12 @@ impl Qwen35Model {
                 );
                 rmsnorm(ns, hs, &pn, eps);
             }
+            let t1 = std::time::Instant::now();
             self.moe_batch(&n, m, il, &mut h)?;
+            t_moe += t1.elapsed().as_secs_f64();
+        }
+        if prof {
+            eprintln!("[prefill prof] mixer {t_mix:.2}s | moe {t_moe:.2}s");
         }
         self.pos += m;
 
