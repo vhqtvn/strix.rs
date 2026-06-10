@@ -72,6 +72,27 @@ pub trait WeightAccel: Send + Sync {
         false
     }
 
+    /// Adopt a whole MoE layer's expert tensors in NATIVE Q8_0 layout (gate/up:
+    /// [hidden→eff]×ne; down: [eff→hidden]×ne). Default: not adopted.
+    fn upload_moe_q8(
+        &mut self,
+        _layer: usize,
+        _gate: &[u8],
+        _up: &[u8],
+        _down: &[u8],
+        _hidden: usize,
+        _eff: usize,
+        _ne: usize,
+    ) -> bool {
+        false
+    }
+
+    /// Fused MoE FFN for one token: y = Σ_k wexp[k]·down(silu(gate)·up)(x) over the
+    /// routed experts — one device round-trip. `None` if layer not adopted.
+    fn moe_ffn(&self, _layer: usize, _ids: &[i32], _wexp: &[f32], _x: &[f32]) -> Option<Vec<f32>> {
+        None
+    }
+
     /// Compute `y = W · x` for an adopted weight. Returns `None` if `key` was not
     /// adopted, or `Some(y)` of length `out_dim`.
     fn gemv(&self, key: &str, x: &[f32]) -> Option<Vec<f32>>;

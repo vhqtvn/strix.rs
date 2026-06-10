@@ -485,7 +485,8 @@ impl MellumModel {
                 }
             }
         }
-        // MoE experts (per-expert byte slices), capped for memory.
+        // MoE experts: whole-layer NATIVE Q8_0 upload (no repack) for the fused
+        // moe_ffn decode path. Falls back to nothing for non-Q8_0 layers.
         let hidden = self.cfg.hidden;
         let eff = self.cfg.expert_ff;
         let ne = self.cfg.n_expert;
@@ -495,41 +496,27 @@ impl MellumModel {
             .unwrap_or(self.cfg.n_layer);
         let mut advise: Vec<String> = Vec::new();
         for il in 0..self.cfg.n_layer.min(layer_cap) {
-            for (tname, in_dim, out_dim) in [
-                ("ffn_gate_exps", hidden, eff),
-                ("ffn_up_exps", hidden, eff),
-                ("ffn_down_exps", eff, hidden),
-            ] {
-                let full = format!("blk.{il}.{tname}.weight");
-                let Some(ti) = self.gguf.tensors().get(&full) else {
-                    continue;
-                };
-                let ty = ti.ggml_type;
-                if !matches!(ty, GgmlType::Q6K | GgmlType::Q4_0 | GgmlType::Q8_0) {
-                    continue;
-                }
-                let bpr = (in_dim / ty.block_elems()) * ty.block_bytes() * out_dim;
-                let Ok(bytes) = self.gguf.tensor_bytes(&full) else {
-                    continue;
-                };
-                let mut got = 0usize;
-                for e in 0..ne {
-                    let slice = &bytes[e * bpr..(e + 1) * bpr];
-                    if up(
-                        &mut accel,
-                        &format!("blk.{il}.{tname}.e{e}"),
-                        slice,
-                        ty,
-                        in_dim,
-                        out_dim,
-                    ) {
-                        got += 1;
-                    }
-                }
-                n += got;
-                if got == ne {
-                    advise.push(full.clone());
-                }
+            let gname = format!("blk.{il}.ffn_gate_exps.weight");
+            let uname = format!("blk.{il}.ffn_up_exps.weight");
+            let dname = format!("blk.{il}.ffn_down_exps.weight");
+            let Some(ti) = self.gguf.tensors().get(&gname) else {
+                continue;
+            };
+            if ti.ggml_type != GgmlType::Q8_0 {
+                continue;
+            }
+            let (Ok(gb), Ok(ub), Ok(db)) = (
+                self.gguf.tensor_bytes(&gname),
+                self.gguf.tensor_bytes(&uname),
+                self.gguf.tensor_bytes(&dname),
+            ) else {
+                continue;
+            };
+            if accel.upload_moe_q8(il, gb, ub, db, hidden, eff, ne) {
+                n += 1;
+                advise.push(gname);
+                advise.push(uname);
+                advise.push(dname);
             }
         }
         for name in &advise {
@@ -1239,6 +1226,17 @@ impl MellumModel {
         idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
         idx.truncate(topk);
         let wsum: f32 = idx.iter().map(|&e| probs[e]).sum();
+
+        // Fused GPU MoE: whole top-k FFN in one device round-trip (router stays CPU).
+        if let Some(a) = &self.accel {
+            let ids: Vec<i32> = idx.iter().map(|&e| e as i32).collect();
+            let wexp: Vec<f32> = idx.iter().map(|&e| probs[e] / wsum).collect();
+            if let Some(y) = a.moe_ffn(il, &ids, &wexp, x) {
+                if y.len() == hidden {
+                    return Ok(y);
+                }
+            }
+        }
 
         let wge = self.w(&b("ffn_gate_exps.weight"))?; // [hidden, eff, ne]
         let wue = self.w(&b("ffn_up_exps.weight"))?;

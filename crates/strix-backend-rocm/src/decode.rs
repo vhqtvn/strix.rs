@@ -100,6 +100,18 @@ struct ResQ8 {
     out_dim: usize,
 }
 
+/// A whole MoE layer resident in NATIVE Q8_0 bytes (no repack): the full 3D
+/// gate/up/down expert tensors + per-token scratch for the fused decode path.
+struct ResMoe {
+    gate: Dbuf,
+    up: Dbuf,
+    down: Dbuf,
+    hidden: usize,
+    eff: usize,
+    gate_eb: i64, // bytes per expert
+    down_eb: i64,
+}
+
 /// Per-launch kernel argument buffer (stable storage the launch points into).
 struct Args {
     vals: Vec<[u8; 8]>,
@@ -204,6 +216,15 @@ pub struct RocmWeightAccel {
     /// (Dbuf has no free-on-drop, so per-call alloc would leak). Sized to GEMV_MAX_*.
     gemv_x: Dbuf,
     gemv_y: Dbuf,
+    /// Fused-MoE residency (by layer) + per-token scratch (ids/wexp/g/u/act/dy/out).
+    moe: HashMap<usize, ResMoe>,
+    moe_ids: Dbuf,
+    moe_w: Dbuf,
+    moe_g: Dbuf,
+    moe_u: Dbuf,
+    moe_act: Dbuf,
+    moe_dy: Dbuf,
+    moe_out: Dbuf,
     /// f16 KV cache (STRIX_F16_KV=1): halves KV memory + decode KV traffic, at a
     /// small prefill cost (the prefill SDPA is occupancy-bound, so the h2f isn't
     /// free there). Default false (f32) — best for prefill-heavy workloads.
@@ -271,6 +292,9 @@ impl RocmWeightAccel {
             "geglu_xquant",
             "q6_gemv",
             "q8_0_gemv",
+            "q8_moe_gemv",
+            "moe_silu_mul",
+            "moe_wsum",
             "argmax_f32",
             "rmsnorm",
             "addnorm",
@@ -301,6 +325,14 @@ impl RocmWeightAccel {
         }
         let gemv_x = gpu.alloc(GEMV_MAX_IN * 4).ok()?;
         let gemv_y = gpu.alloc(GEMV_MAX_OUT * 4).ok()?;
+        // Fused-MoE scratch: top-k ≤ 16, eff/hidden ≤ 4096.
+        let moe_ids = gpu.alloc(16 * 4).ok()?;
+        let moe_w = gpu.alloc(16 * 4).ok()?;
+        let moe_g = gpu.alloc(16 * 4096 * 4).ok()?;
+        let moe_u = gpu.alloc(16 * 4096 * 4).ok()?;
+        let moe_act = gpu.alloc(16 * 4096 * 4).ok()?;
+        let moe_dy = gpu.alloc(16 * 4096 * 4).ok()?;
+        let moe_out = gpu.alloc(4096 * 4).ok()?;
         Some(Self {
             gpu,
             funcs,
@@ -312,6 +344,14 @@ impl RocmWeightAccel {
             scratch: None,
             gemv_x,
             gemv_y,
+            moe: HashMap::new(),
+            moe_ids,
+            moe_w,
+            moe_g,
+            moe_u,
+            moe_act,
+            moe_dy,
+            moe_out,
             kv_f16: std::env::var("STRIX_F16_KV").is_ok(),
             // pinned split if STRIX_N_SPLIT set, else 0 = context-adaptive (~len/64).
             n_split: std::env::var("STRIX_N_SPLIT").ok().and_then(|s| s.parse::<usize>().ok()).map(|v| v.clamp(1, N_SPLIT_MAX)).unwrap_or(0),
@@ -890,6 +930,117 @@ impl WeightAccel for RocmWeightAccel {
             },
         );
         true
+    }
+
+    fn upload_moe_q8(
+        &mut self,
+        layer: usize,
+        gate: &[u8],
+        up: &[u8],
+        down: &[u8],
+        hidden: usize,
+        eff: usize,
+        ne: usize,
+    ) -> bool {
+        if hidden % QK8_0 != 0 || eff % QK8_0 != 0 || eff > 4096 || hidden > 4096 {
+            return false;
+        }
+        let gate_eb = (hidden / QK8_0) * Q8_0_BYTES * eff;
+        let down_eb = (eff / QK8_0) * Q8_0_BYTES * hidden;
+        if gate.len() != gate_eb * ne || up.len() != gate_eb * ne || down.len() != down_eb * ne {
+            return false;
+        }
+        let (Ok(gb), Ok(ub), Ok(db)) = (
+            self.gpu.upload_new(gate),
+            self.gpu.upload_new(up),
+            self.gpu.upload_new(down),
+        ) else {
+            return false;
+        };
+        self.moe.insert(
+            layer,
+            ResMoe {
+                gate: gb,
+                up: ub,
+                down: db,
+                hidden,
+                eff,
+                gate_eb: gate_eb as i64,
+                down_eb: down_eb as i64,
+            },
+        );
+        true
+    }
+
+    fn moe_ffn(&self, layer: usize, ids: &[i32], wexp: &[f32], x: &[f32]) -> Option<Vec<f32>> {
+        let m = self.moe.get(&layer)?;
+        let k = ids.len();
+        if x.len() != m.hidden || wexp.len() != k || k > 16 {
+            return None;
+        }
+        self.gemv_x.upload(x).ok()?;
+        self.moe_ids.upload(ids).ok()?;
+        self.moe_w.upload(wexp).ok()?;
+        // ebytes passed as a pointer-sized arg (Args packs 8 bytes either way)
+        let geb = m.gate_eb as usize as *mut c_void;
+        let deb = m.down_eb as usize as *mut c_void;
+        let gemv = |w: &Dbuf, eb: *mut c_void, x: *mut c_void, y: *mut c_void, in_d: usize, out_d: usize| {
+            self.launch2(
+                "q8_moe_gemv",
+                out_d.div_ceil(8) as u32,
+                k as u32,
+                256,
+                0,
+                Args::new()
+                    .ptr(w.ptr)
+                    .ptr(eb)
+                    .ptr(self.moe_ids.ptr)
+                    .ptr(x)
+                    .ptr(y)
+                    .i(in_d as i32)
+                    .i(out_d as i32),
+            );
+        };
+        gemv(&m.gate, geb, self.gemv_x.ptr, self.moe_g.ptr, m.hidden, m.eff);
+        gemv(&m.up, geb, self.gemv_x.ptr, self.moe_u.ptr, m.hidden, m.eff);
+        let n_act = k * m.eff;
+        self.launch(
+            "moe_silu_mul",
+            n_act.div_ceil(256) as u32,
+            256,
+            0,
+            Args::new().ptr(self.moe_g.ptr).ptr(self.moe_u.ptr).ptr(self.moe_act.ptr).i(n_act as i32),
+        );
+        // down: per-expert act rows (x stride eff): reuse q8_moe_gemv with x per-k
+        // → q8_moe_gemv expects ONE x for all k; act differs per k. Pass via a per-k
+        // x base: handled in kernel by k row offset — q8_moe_gemv reads x[bi*32+l] only,
+        // so call the down GEMV once per expert (still launches not syncs — cheap).
+        for e in 0..k {
+            self.launch2(
+                "q8_moe_gemv",
+                m.hidden.div_ceil(8) as u32,
+                1,
+                256,
+                0,
+                Args::new()
+                    .ptr(m.down.ptr)
+                    .ptr(deb)
+                    .ptr(unsafe { (self.moe_ids.ptr as *mut i32).add(e) } as *mut c_void)
+                    .ptr(unsafe { (self.moe_act.ptr as *mut f32).add(e * m.eff) } as *mut c_void)
+                    .ptr(unsafe { (self.moe_dy.ptr as *mut f32).add(e * m.hidden) } as *mut c_void)
+                    .i(m.eff as i32)
+                    .i(m.hidden as i32),
+            );
+        }
+        self.launch(
+            "moe_wsum",
+            m.hidden.div_ceil(256) as u32,
+            256,
+            0,
+            Args::new().ptr(self.moe_dy.ptr).ptr(self.moe_w.ptr).ptr(self.moe_out.ptr).i(m.hidden as i32).i(k as i32),
+        );
+        self.gpu.sync().ok()?;
+        self.moe_out.download::<f32>(m.hidden).ok()
     }
 
     fn gemv(&self, key: &str, x: &[f32]) -> Option<Vec<f32>> {

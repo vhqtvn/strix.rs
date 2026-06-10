@@ -589,6 +589,51 @@ extern "C" __global__ void q8_0_gemv(const float* __restrict__ scales,
     if (l == 0) y[row] = acc;
 }
 
+// ===== Fused MoE decode (native Q8_0, top-k experts in ONE launch each) =====
+// Weights stay in NATIVE GGUF Q8_0 layout (34 B/block: f16 d + 32 i8), the FULL
+// 3D experts tensor resident as one buffer; the kernel indexes expert e at byte
+// offset e*ebytes. ids[k]: routed experts.
+//
+// y[k][row] = expert ids[k] row · x.  grid=(ceil(out/8), k), block=256 (8 waves).
+extern "C" __global__ void q8_moe_gemv(const unsigned char* __restrict__ w, long long ebytes,
+                                       const int* __restrict__ ids,
+                                       const float* __restrict__ x,
+                                       float* __restrict__ y, int in_dim, int out_dim) {
+    int wave = threadIdx.x >> 5, l = threadIdx.x & 31;
+    int row = blockIdx.x * 8 + wave, k = blockIdx.y;
+    if (row >= out_dim) return;
+    const unsigned char* we = w + (long long)ids[k] * ebytes;
+    int nb = in_dim / 32;
+    const unsigned char* rowp = we + (long long)row * nb * 34;
+    float acc = 0.f;
+    for (int bi = 0; bi < nb; bi++) {
+        const unsigned char* blk = rowp + bi * 34;
+        float d = h2f(*(const unsigned short*)blk);
+        acc += d * (float)((const signed char*)blk)[2 + l] * x[bi * 32 + l];
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
+    if (l == 0) y[(long long)k * out_dim + row] = acc;
+}
+
+// act[k][i] = silu(g[k][i]) * u[k][i]; n = k*eff.
+extern "C" __global__ void moe_silu_mul(const float* __restrict__ g, const float* __restrict__ u,
+                                        float* __restrict__ act, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float gv = g[i];
+    act[i] = (gv / (1.f + __expf(-gv))) * u[i];
+}
+
+// out[o] = sum_k wexp[k]*dy[k][o] — deterministic accumulation in routed order.
+extern "C" __global__ void moe_wsum(const float* __restrict__ dy, const float* __restrict__ wexp,
+                                    float* __restrict__ out, int n, int k) {
+    int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= n) return;
+    float s = 0.f;
+    for (int e = 0; e < k; e++) s += wexp[e] * dy[(long long)e * n + o];
+    out[o] = s;
+}
+
 // RMSNorm over n_rows rows of `dim`. grid=n_rows, block=256.
 extern "C" __global__ void rmsnorm(const float* __restrict__ x, const float* __restrict__ w,
                                    float* __restrict__ y, int dim, int has_w, float eps) {
