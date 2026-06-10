@@ -137,6 +137,10 @@ pub trait WeightAccel: Send + Sync {
     ) -> bool {
         false
     }
+    /// Q8 planar variant of [`WeightAccel::moe_expert_queue`].
+    fn moe_expert_queue_q8(&self, _layer: usize, _e: usize, _xs: &[f32], _m: usize, _dy_off: usize) -> bool {
+        false
+    }
     /// Sync + download `rows` of hidden from the dy pool.
     fn moe_expert_flush(&self, _rows: usize, _hidden: usize) -> Option<Vec<f32>> {
         None

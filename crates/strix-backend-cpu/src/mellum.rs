@@ -703,6 +703,21 @@ impl MellumModel {
         Ok(a.mlm_logits())
     }
 
+    /// iGPU dense GEMM for batched prefill (chunks of 256). False = fall back.
+    fn gpu_gemm(&self, key: &str, xs: &[f32], m: usize, in_dim: usize, out_dim: usize, out: &mut [f32]) -> bool {
+        let Some(a) = &self.accel else { return false };
+        for c in (0..m).step_by(256) {
+            let mc = (m - c).min(256);
+            match a.prefill_q8_gemm(key, &xs[c * in_dim..(c + mc) * in_dim], mc) {
+                Some(y) if y.len() == mc * out_dim => {
+                    out[c * out_dim..(c + mc) * out_dim].copy_from_slice(&y);
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
     /// True if an NPU expert call would be used for `me` rows (drives the NPU/CPU split).
     #[cfg(feature = "npu")]
     fn npu_can_exp(&self, me: usize) -> bool {
@@ -922,15 +937,18 @@ impl MellumModel {
                 rmsnorm(ns, hs, &an, eps);
             }
             {
-                if !self.npu_mm(il, 0, &n, m, hidden, q_dim, &mut q) {
+                if !self.gpu_gemm(&b("attn_q.weight"), &n, m, hidden, q_dim, &mut q)
+                    && !self.npu_mm(il, 0, &n, m, hidden, q_dim, &mut q) {
                     let wq = self.w(&b("attn_q.weight"))?;
                     qmatmul_batch(&mut q, &n, m, wq.bytes, wq.ty, hidden, q_dim);
                 }
-                if !self.npu_mm(il, 2, &n, m, hidden, kv_dim, &mut k) {
+                if !self.gpu_gemm(&b("attn_k.weight"), &n, m, hidden, kv_dim, &mut k)
+                    && !self.npu_mm(il, 2, &n, m, hidden, kv_dim, &mut k) {
                     let wk = self.w(&b("attn_k.weight"))?;
                     qmatmul_batch(&mut k, &n, m, wk.bytes, wk.ty, hidden, kv_dim);
                 }
-                if !self.npu_mm(il, 3, &n, m, hidden, kv_dim, &mut v) {
+                if !self.gpu_gemm(&b("attn_v.weight"), &n, m, hidden, kv_dim, &mut v)
+                    && !self.npu_mm(il, 3, &n, m, hidden, kv_dim, &mut v) {
                     let wv = self.w(&b("attn_v.weight"))?;
                     qmatmul_batch(&mut v, &n, m, wv.bytes, wv.ty, hidden, kv_dim);
                 }
@@ -1024,7 +1042,8 @@ impl MellumModel {
                         ao[hh * hd..hh * hd + hd].copy_from_slice(&oh);
                     }
                 });
-            if !self.npu_mm(il, 1, &attn_out, m, q_dim, hidden, &mut o) {
+            if !self.gpu_gemm(&b("attn_output.weight"), &attn_out, m, q_dim, hidden, &mut o)
+                && !self.npu_mm(il, 1, &attn_out, m, q_dim, hidden, &mut o) {
                 let wo = self.w(&b("attn_output.weight"))?;
                 qmatmul_batch(&mut o, &attn_out, m, wo.bytes, wo.ty, q_dim, hidden);
             }
@@ -1078,6 +1097,41 @@ impl MellumModel {
             let d_bpr = (eff / wde.ty.block_elems()) * wde.ty.block_bytes() * hidden;
             // dy[t][slot] holds the down-output for token t's slot-th routed expert
             let mut dy = vec![0.0f32; m * topk * hidden];
+            // iGPU path: queue ALL experts (planar Q8 GEMM), one sync + download/layer.
+            let mut gpu_done = false;
+            if let Some(a) = &self.accel {
+                let mut off = 0usize;
+                let mut plan: Vec<(usize, usize)> = Vec::new();
+                let mut all = true;
+                for (e, list) in by_exp.iter().enumerate() {
+                    if list.is_empty() {
+                        continue;
+                    }
+                    let me = list.len();
+                    let mut xs = vec![0.0f32; me * hidden];
+                    for (i, &(t, _)) in list.iter().enumerate() {
+                        xs[i * hidden..(i + 1) * hidden]
+                            .copy_from_slice(&n[t * hidden..(t + 1) * hidden]);
+                    }
+                    if !a.moe_expert_queue_q8(il, e, &xs, me, off) {
+                        all = false;
+                        break;
+                    }
+                    plan.push((e, off));
+                    off += me;
+                }
+                if all && off > 0 {
+                    if let Some(d_all) = a.moe_expert_flush(off, hidden) {
+                        for &(e, o) in &plan {
+                            for (i, &(t, s)) in by_exp[e].iter().enumerate() {
+                                dy[(t * topk + s) * hidden..(t * topk + s + 1) * hidden]
+                                    .copy_from_slice(&d_all[(o + i) * hidden..(o + i + 1) * hidden]);
+                            }
+                        }
+                        gpu_done = true;
+                    }
+                }
+            }
             // Process one expert end-to-end (gather → gate/up → silu·mul → down →
             // scatter). `on_npu` selects NPU or CPU matmuls.
             let dyp = SendPtrF(dy.as_mut_ptr());
@@ -1160,18 +1214,20 @@ impl MellumModel {
             let (npu_list, cpu_list): (Vec<usize>, Vec<usize>) = (0..ne)
                 .filter(|&e| !by_exp[e].is_empty())
                 .partition(|&e| self.npu_can_exp(by_exp[e].len()));
-            rayon::join(
-                || {
-                    for &e in &npu_list {
-                        run_expert(e, &by_exp[e], true);
-                    }
-                },
-                || {
-                    cpu_list
-                        .par_iter()
-                        .for_each(|&e| run_expert(e, &by_exp[e], false));
-                },
-            );
+            if !gpu_done {
+                rayon::join(
+                    || {
+                        for &e in &npu_list {
+                            run_expert(e, &by_exp[e], true);
+                        }
+                    },
+                    || {
+                        cpu_list
+                            .par_iter()
+                            .for_each(|&e| run_expert(e, &by_exp[e], false));
+                    },
+                );
+            }
             // per-token accumulate in routed order into a zeroed buffer, then add to h
             // (exactly moe()'s float association: out = Σ w·d, then h + out).
             for (t, route) in routes.iter().enumerate() {

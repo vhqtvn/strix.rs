@@ -388,9 +388,9 @@ impl RocmWeightAccel {
         let mlm_v = gpu.alloc(1024 * 4).ok()?;
         let mlm_attn = gpu.alloc(8192 * 4).ok()?;
         let mlm_rl = gpu.alloc(256 * 4).ok()?;
-        let pf_x = gpu.alloc(256 * 8192 * 4).ok()?;
-        let pf_a = gpu.alloc(256 * 4096 * 4).ok()?;
-        let pf_b = gpu.alloc(256 * 4096 * 4).ok()?;
+        let pf_x = gpu.alloc(2048 * 4096 * 4).ok()?;
+        let pf_a = gpu.alloc(2048 * 1024 * 4).ok()?;
+        let pf_b = gpu.alloc(2048 * 1024 * 4).ok()?;
         let pf_y = gpu.alloc(256 * 8192 * 4).ok()?;
         let pf_dy = gpu.alloc(2048 * 4096 * 4).ok()?;
         let mut batch_x = Vec::new();
@@ -1552,7 +1552,7 @@ impl WeightAccel for RocmWeightAccel {
         }
         // per-call x staging at offset dy_off in pf_x (reuse pool rows; hidden<=2048, pool 256*8192)
         let xoff = dy_off * mo.hidden;
-        if (xoff + m * mo.hidden) > 256 * 8192 {
+        if (xoff + m * mo.hidden) > 2048 * 4096 {
             return false;
         }
         let xptr = unsafe { (self.pf_x.ptr as *mut f32).add(xoff) } as *mut c_void;
@@ -1607,6 +1607,58 @@ impl WeightAccel for RocmWeightAccel {
                 .i(mo.eff as i32)
                 .i(mo.hidden as i32)
                 .i(m as i32),
+        );
+        true
+    }
+
+    fn moe_expert_queue_q8(&self, layer: usize, eid: usize, xs: &[f32], m: usize, dy_off: usize) -> bool {
+        let Some(mo) = self.moe.get(&layer) else { return false };
+        if xs.len() != m * mo.hidden || (dy_off + m) * mo.hidden > 2048 * 4096 {
+            return false;
+        }
+        let xoff = dy_off * mo.hidden;
+        if (xoff + m * mo.hidden) > 2048 * 4096 || self.gpu.upload_at(&self.pf_x, xoff * 4, xs).is_err() {
+            return false;
+        }
+        let xptr = unsafe { (self.pf_x.ptr as *mut f32).add(xoff) } as *mut c_void;
+        let nb = mo.hidden / 32;
+        let eoff = eid * mo.eff * nb;
+        for (sb, qb2, y) in [
+            (&mo.gate_s, &mo.gate_q, self.pf_a.ptr),
+            (&mo.up_s, &mo.up_q, self.pf_b.ptr),
+        ] {
+            let sp = unsafe { (sb.ptr as *mut f32).add(eoff) } as *mut c_void;
+            let qp = unsafe { (qb2.ptr as *mut i8).add(eoff * 32) } as *mut c_void;
+            self.launch2(
+                "q8_gemm_rows",
+                mo.eff as u32,
+                m.div_ceil(16) as u32,
+                32,
+                0,
+                Args::new().ptr(sp).ptr(qp).ptr(xptr).ptr(y)
+                    .i(mo.hidden as i32).i(mo.eff as i32).i(m as i32),
+            );
+        }
+        let n_act = m * mo.eff;
+        self.launch(
+            "moe_silu_mul",
+            n_act.div_ceil(256) as u32,
+            256,
+            0,
+            Args::new().ptr(self.pf_a.ptr).ptr(self.pf_b.ptr).ptr(self.pf_b.ptr).i(n_act as i32),
+        );
+        let nbd = mo.eff / 32;
+        let ds = unsafe { (mo.down_s.ptr as *mut f32).add(eid * mo.hidden * nbd) } as *mut c_void;
+        let dq = unsafe { (mo.down_q.ptr as *mut i8).add(eid * mo.hidden * nbd * 32) } as *mut c_void;
+        let dyp = unsafe { (self.pf_dy.ptr as *mut f32).add(dy_off * mo.hidden) } as *mut c_void;
+        self.launch2(
+            "q8_gemm_rows",
+            mo.hidden as u32,
+            m.div_ceil(16) as u32,
+            32,
+            0,
+            Args::new().ptr(ds).ptr(dq).ptr(self.pf_b.ptr).ptr(dyp)
+                .i(mo.eff as i32).i(mo.hidden as i32).i(m as i32),
         );
         true
     }
