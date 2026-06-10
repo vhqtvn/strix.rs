@@ -1114,7 +1114,6 @@ impl MellumModel {
                                 h[t * hidden + hph] += out[t * hidden + hph];
                             }
                         }
-                        self.pos += 0; // no-op; keeps structure clear
                         continue;
                     }
                 }
