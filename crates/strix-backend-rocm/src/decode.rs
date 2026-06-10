@@ -273,6 +273,7 @@ pub struct RocmWeightAccel {
     mlm_arg: Dbuf,
     mlm_xd: Dbuf,
     mlm_int8: bool,
+    use_wmma: bool,
     mlm_graph: Option<*mut std::os::raw::c_void>,
     mlm_seq: usize,
     batch_x: Vec<Dbuf>,
@@ -374,6 +375,7 @@ impl RocmWeightAccel {
             "xquant8_rows",
             "q8i_gemm_rows32",
             "q8i_gemm_lds",
+            "q8w_gemm",
             "q8i_gemm_lds2",
             "q6_gemm_rows",
             "q6_gemm_moe",
@@ -505,6 +507,7 @@ impl RocmWeightAccel {
             mlm_arg,
             mlm_xd,
             mlm_int8: std::env::var("STRIX_NO_INT8").is_err(),
+            use_wmma: std::env::var("STRIX_NO_WMMA").is_err(),
             mlm_graph: None,
             mlm_seq: 0,
             batch_x,
@@ -1210,13 +1213,7 @@ impl RocmWeightAccel {
         let kb = self.pf_a.ptr;
         let vb = self.pf_b.ptr;
         for (w, y, od) in [(&wq, qb, q_dim), (&wk, kb, kv_dim), (&wv, vb, kv_dim)] {
-            self.launch2(
-                "q8i_gemm_lds2",
-                od.div_ceil(16) as u32,
-                m.div_ceil(32) as u32,
-                256,
-                0,
-                Args::new()
+            self.q8i_gemm(od as u32, m as u32, Args::new()
                     .ptr(w.scales.ptr)
                     .ptr(w.quants.ptr)
                     .ptr(xq)
@@ -1288,13 +1285,7 @@ impl RocmWeightAccel {
         );
         let (aq, ad) = self.pf_quant(attn, m, q_dim);
         let outp = unsafe { (self.pf_y.ptr as *mut f32).add(m * q_dim) } as *mut c_void;
-        self.launch2(
-            "q8i_gemm_lds2",
-            hidden.div_ceil(16) as u32,
-            m.div_ceil(32) as u32,
-            256,
-            0,
-            Args::new()
+        self.q8i_gemm(hidden as u32, m as u32, Args::new()
                 .ptr(wo.scales.ptr)
                 .ptr(wo.quants.ptr)
                 .ptr(aq)
@@ -1377,13 +1368,7 @@ impl RocmWeightAccel {
                 let sp = unsafe { (sb.ptr as *mut f32).add(eoff) } as *mut c_void;
                 let qp = unsafe { (qb2.ptr as *mut i8).add(eoff * 32) } as *mut c_void;
                 let yp = unsafe { (y as *mut f32).add(off * eff) } as *mut c_void;
-                self.launch2(
-                    "q8i_gemm_lds2",
-                    eff.div_ceil(16) as u32,
-                    me.div_ceil(32) as u32,
-                    256,
-                    0,
-                    Args::new()
+                self.q8i_gemm(eff as u32, me as u32, Args::new()
                         .ptr(sp)
                         .ptr(qp)
                         .ptr(sq)
@@ -1418,13 +1403,7 @@ impl RocmWeightAccel {
             let sq = unsafe { (aq as *mut u8).add(off * eff) } as *mut c_void;
             let sd = unsafe { (ad as *mut f32).add(off * enb) } as *mut c_void;
             let yp = unsafe { (self.pf_dy.ptr as *mut f32).add(off * hidden) } as *mut c_void;
-            self.launch2(
-                "q8i_gemm_lds2",
-                hidden.div_ceil(16) as u32,
-                me.div_ceil(32) as u32,
-                256,
-                0,
-                Args::new()
+            self.q8i_gemm(hidden as u32, me as u32, Args::new()
                     .ptr(sp)
                     .ptr(qp)
                     .ptr(sq)
@@ -1463,6 +1442,16 @@ impl RocmWeightAccel {
                 .i(slots as i32),
         );
         Some(())
+    }
+
+
+    /// int8 GEMM launch: WMMA tile (default) or LDS2 fallback (STRIX_NO_WMMA).
+    fn q8i_gemm(&self, out: u32, m: u32, args: Args) {
+        if self.use_wmma {
+            self.launch2("q8w_gemm", out.div_ceil(16), m.div_ceil(16), 32, 0, args);
+        } else {
+            self.launch2("q8i_gemm_lds2", out.div_ceil(16), m.div_ceil(32), 256, 0, args);
+        }
     }
 
     fn launch(&self, name: &str, grid: u32, block: u32, shared: u32, args: Args) {
@@ -2755,13 +2744,7 @@ impl WeightAccel for RocmWeightAccel {
         self.pf_x.upload(xs).ok()?;
         if self.mlm_int8 {
             let (xq, xd) = self.pf_quant(self.pf_x.ptr, m, e.in_dim);
-            self.launch2(
-                "q8i_gemm_lds2",
-                e.out_dim.div_ceil(16) as u32,
-                m.div_ceil(32) as u32,
-                256,
-                0,
-                Args::new()
+            self.q8i_gemm(e.out_dim as u32, m as u32, Args::new()
                     .ptr(e.scales.ptr)
                     .ptr(e.quants.ptr)
                     .ptr(xq)
@@ -2960,13 +2943,7 @@ impl WeightAccel for RocmWeightAccel {
             let sp = unsafe { (sb.ptr as *mut f32).add(eoff) } as *mut c_void;
             let qp = unsafe { (qb2.ptr as *mut i8).add(eoff * 32) } as *mut c_void;
             if let Some((xq, xd)) = xqd {
-                self.launch2(
-                    "q8i_gemm_lds2",
-                    mo.eff.div_ceil(16) as u32,
-                    m.div_ceil(32) as u32,
-                    256,
-                    0,
-                    Args::new()
+                self.q8i_gemm(mo.eff as u32, m as u32, Args::new()
                         .ptr(sp)
                         .ptr(qp)
                         .ptr(xq)
@@ -3013,13 +2990,7 @@ impl WeightAccel for RocmWeightAccel {
         let dyp = unsafe { (self.pf_dy.ptr as *mut f32).add(dy_off * mo.hidden) } as *mut c_void;
         if self.mlm_int8 {
             let (xq, xd) = self.pf_quant(self.pf_b.ptr, m, mo.eff);
-            self.launch2(
-                "q8i_gemm_lds2",
-                mo.hidden.div_ceil(16) as u32,
-                m.div_ceil(32) as u32,
-                256,
-                0,
-                Args::new()
+            self.q8i_gemm(mo.hidden as u32, m as u32, Args::new()
                     .ptr(ds)
                     .ptr(dq)
                     .ptr(xq)
@@ -3146,13 +3117,7 @@ impl WeightAccel for RocmWeightAccel {
             let qp = unsafe { (e.quants.ptr as *mut i8).add(base * nb * 32) } as *mut c_void;
             if self.mlm_int8 {
                 let (xq, xd) = self.pf_quant(self.pf_x.ptr, m, e.in_dim);
-                self.launch2(
-                    "q8i_gemm_lds2",
-                    oc.div_ceil(16) as u32,
-                    m.div_ceil(32) as u32,
-                    256,
-                    0,
-                    Args::new()
+                self.q8i_gemm(oc as u32, m as u32, Args::new()
                         .ptr(sp)
                         .ptr(qp)
                         .ptr(xq)

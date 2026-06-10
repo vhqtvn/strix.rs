@@ -1224,6 +1224,57 @@ extern "C" __global__ void f32_gemv_rows(const float* __restrict__ w, const floa
     if (l == 0) y[(long long)t * out_dim + row] = acc;
 }
 
+
+// ===== WMMA int8 GEMM (RDNA3 v_wmma_i32_16x16x16_iu8, wave32) =====
+// y[t][row] = W X^T. A = 16 weight rows, B = 16 tokens. Per K-32 block, two WMMA
+// ops accumulate i32; scales applied per block. Lane t<16 holds full 16B K rows
+// (lanes 16-31 replicated). C: lane t, elem l -> row t%16, col 2l + t/16.
+typedef int v4i __attribute__((vector_size(16)));
+typedef int v8i __attribute__((vector_size(32)));
+extern "C" __global__ void q8w_gemm(const float* __restrict__ scales,
+                                    const signed char* __restrict__ quants,
+                                    const signed char* __restrict__ xq,
+                                    const float* __restrict__ xd,
+                                    float* __restrict__ y, int in_dim, int out_dim, int m) {
+    int lane = threadIdx.x & 31, t = lane & 15, hs = lane >> 4;
+    int row0 = blockIdx.x * 16, tok0 = blockIdx.y * 16;
+    int nb = in_dim / 32;
+    int rrow = row0 + t;
+    int rtok = tok0 + t;
+    bool rok = rrow < out_dim, tok_ok = rtok < m;
+    float facc[8] = {0.f};
+    for (int blk = 0; blk < nb; blk++) {
+        v4i a0 = {0, 0, 0, 0}, a1 = {0, 0, 0, 0}, b0 = {0, 0, 0, 0}, b1 = {0, 0, 0, 0};
+        if (rok) {
+            const int* wp = (const int*)(quants + ((long long)rrow * nb + blk) * 32);
+            a0[0] = wp[0]; a0[1] = wp[1]; a0[2] = wp[2]; a0[3] = wp[3];
+            a1[0] = wp[4]; a1[1] = wp[5]; a1[2] = wp[6]; a1[3] = wp[7];
+        }
+        if (tok_ok) {
+            const int* xp = (const int*)(xq + (long long)rtok * in_dim + blk * 32);
+            b0[0] = xp[0]; b0[1] = xp[1]; b0[2] = xp[2]; b0[3] = xp[3];
+            b1[0] = xp[4]; b1[1] = xp[5]; b1[2] = xp[6]; b1[3] = xp[7];
+        }
+        v8i acc = {0, 0, 0, 0, 0, 0, 0, 0};
+        acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, acc, true);
+        acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, acc, true);
+        // scale: row = t (A row), col j -> token tok0 + 2l + hs
+        float dw = rok ? scales[(long long)rrow * nb + blk] : 0.f;
+        #pragma unroll
+        for (int l = 0; l < 8; l++) {
+            int col = 2 * l + hs;
+            int tok = tok0 + col;
+            float dx = tok < m ? xd[(long long)tok * nb + blk] : 0.f;
+            facc[l] += dw * dx * (float)acc[l];
+        }
+    }
+    #pragma unroll
+    for (int l = 0; l < 8; l++) {
+        int tok = tok0 + 2 * l + hs;
+        if (rok && tok < m) y[(long long)tok * out_dim + rrow] = facc[l];
+    }
+}
+
 // ===== Native-Q6_K MoE GEMV (NO repack: 210 B/superblock as in the GGUF) =====
 // w = full 3D expert tensor (native bytes), expert stride ebytes. Per superblock:
 // ql[128] qh[64] sc[16xi8] d[f16]. 8 waves/block, 32 lanes on the SAME superblock
