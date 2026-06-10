@@ -534,7 +534,7 @@ impl MellumModel {
         }
         // Norm weights + router (for the fused on-GPU decode path).
         for il in 0..self.cfg.n_layer {
-            for t in ["attn_norm", "ffn_norm"] {
+            for t in ["attn_norm", "ffn_norm", "attn_q_norm", "attn_k_norm"] {
                 let name = format!("blk.{il}.{t}.weight");
                 if let Ok(w) = self.vecw(&name) {
                     accel.upload_f32(&name, &w);

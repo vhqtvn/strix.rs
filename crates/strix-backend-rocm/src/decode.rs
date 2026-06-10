@@ -491,6 +491,47 @@ impl RocmWeightAccel {
         })
     }
 
+    /// Profiled variant: sync after attn and after MoE; prints per-layer wall once/token.
+    fn mlm_layer_prof(&mut self, il: usize, pos: usize, win: usize, topk: usize) -> bool {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static T_ATTN: AtomicU64 = AtomicU64::new(0);
+        static T_MOE: AtomicU64 = AtomicU64::new(0);
+        let t0 = std::time::Instant::now();
+        if !self.mlm_attn_part(il, pos, win) {
+            return false;
+        }
+        let _ = self.gpu.sync();
+        T_ATTN.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let rl_dim = self.q8[&format!("blk.{il}.ffn_gate_inp.weight")].out_dim;
+        let t1 = std::time::Instant::now();
+        self.launch(
+            "topk_router",
+            1,
+            32,
+            0,
+            Args::new().ptr(self.mlm_rl.ptr).i(rl_dim as i32).i(topk as i32).ptr(self.moe_ids.ptr).ptr(self.moe_w.ptr),
+        );
+        let Some(m) = self.moe.get(&il) else { return false };
+        self.moe_launches(m, topk, self.mlm_n.ptr);
+        self.launch(
+            "vec_add",
+            m.hidden.div_ceil(256) as u32,
+            256,
+            0,
+            Args::new().ptr(self.mlm_h.ptr).ptr(self.moe_out.ptr).i(m.hidden as i32),
+        );
+        let _ = self.gpu.sync();
+        T_MOE.fetch_add(t1.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if il == 27 {
+            println!(
+                "[mlm prof] attn {:.1}ms moe {:.1}ms (cum)",
+                T_ATTN.load(Ordering::Relaxed) as f64 / 1e3,
+                T_MOE.load(Ordering::Relaxed) as f64 / 1e3
+            );
+        }
+        true
+    }
+
     /// Attn + ffn-norm + router-launch portion of a fused Mellum layer (no sync).
     fn mlm_attn_part(&mut self, il: usize, pos: usize, win: usize) -> bool {
         let (
@@ -1540,6 +1581,10 @@ impl WeightAccel for RocmWeightAccel {
     /// Full layer with on-GPU router top-k + queued MoE — NO sync. Caller syncs once
     /// per token at lm_head. Requires the same residency as mlm_layer.
     fn mlm_layer_nosync(&mut self, il: usize, pos: usize, win: usize, topk: usize) -> bool {
+        if std::env::var("STRIX_MLM_PROF").is_ok() {
+            return self.mlm_layer_prof(il, pos, win, topk);
+        }
+
         let Some(rl_dim) = self
             .q8
             .get(&format!("blk.{il}.ffn_gate_inp.weight"))
