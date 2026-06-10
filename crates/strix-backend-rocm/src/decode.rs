@@ -348,6 +348,8 @@ impl RocmWeightAccel {
             "q8_0_gemv",
             "q8_moe_gemv",
             "q8_moe_gemv_rows",
+            "q8_moe_gemv_gu",
+            "q8_moe_down",
             "q6_moe_gemv",
             "q8_gemm_rows",
             "q6_gemm_rows",
@@ -1072,62 +1074,39 @@ impl RocmWeightAccel {
     /// No-sync fused-MoE launches for layer `layer` over k routed experts
     /// (ids/wexp already uploaded): x → moe_out. Caller syncs.
     fn moe_launches(&self, m: &ResMoe, k: usize, x: *mut c_void) {
-        for (ws, wq, y) in [
-            (&m.gate_s, &m.gate_q, self.moe_g.ptr),
-            (&m.up_s, &m.up_q, self.moe_u.ptr),
-        ] {
-            self.launch2(
-                "q8_moe_gemv",
-                m.eff as u32,
-                k as u32,
-                32,
-                0,
-                Args::new()
-                    .ptr(ws.ptr)
-                    .ptr(wq.ptr)
-                    .ptr(self.moe_ids.ptr)
-                    .ptr(x)
-                    .ptr(y)
-                    .i(m.hidden as i32)
-                    .i(m.eff as i32),
-            );
-        }
-        let n_act = k * m.eff;
-        self.launch(
-            "moe_silu_mul",
-            n_act.div_ceil(256) as u32,
-            256,
+        self.launch3(
+            "q8_moe_gemv_gu",
+            m.eff as u32,
+            k as u32,
+            2,
+            32,
             0,
             Args::new()
+                .ptr(m.gate_s.ptr)
+                .ptr(m.gate_q.ptr)
+                .ptr(m.up_s.ptr)
+                .ptr(m.up_q.ptr)
+                .ptr(self.moe_ids.ptr)
+                .ptr(x)
                 .ptr(self.moe_g.ptr)
                 .ptr(self.moe_u.ptr)
-                .ptr(self.moe_act.ptr)
-                .i(n_act as i32),
+                .i(m.hidden as i32)
+                .i(m.eff as i32),
         );
-        self.launch2(
-            "q8_moe_gemv_rows",
+        self.launch(
+            "q8_moe_down",
             m.hidden as u32,
-            k as u32,
             32,
             0,
             Args::new()
                 .ptr(m.down_s.ptr)
                 .ptr(m.down_q.ptr)
                 .ptr(self.moe_ids.ptr)
-                .ptr(self.moe_act.ptr)
-                .ptr(self.moe_dy.ptr)
-                .i(m.eff as i32)
-                .i(m.hidden as i32),
-        );
-        self.launch(
-            "moe_wsum",
-            m.hidden.div_ceil(256) as u32,
-            256,
-            0,
-            Args::new()
-                .ptr(self.moe_dy.ptr)
                 .ptr(self.moe_w.ptr)
+                .ptr(self.moe_g.ptr)
+                .ptr(self.moe_u.ptr)
                 .ptr(self.moe_out.ptr)
+                .i(m.eff as i32)
                 .i(m.hidden as i32)
                 .i(k as i32),
         );
