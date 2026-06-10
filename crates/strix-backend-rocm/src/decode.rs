@@ -1455,7 +1455,7 @@ impl RocmWeightAccel {
     /// int8 GEMM launch: WMMA tile (default) or LDS2 fallback (STRIX_NO_WMMA).
     fn q8i_gemm(&self, out: u32, m: u32, args: Args) {
         if self.use_wmma {
-            if m >= 24 { self.launch2("q8w_gemm32", out.div_ceil(256), m.div_ceil(32), 256, 0, args); } else { self.launch2("q8w_gemm", out.div_ceil(128), m.div_ceil(16), 256, 0, args); }
+            if m >= 24 { self.launch2("q8w_gemm32", out.div_ceil(128), m.div_ceil(32), 256, 0, args); } else { self.launch2("q8w_gemm", out.div_ceil(128), m.div_ceil(16), 256, 0, args); }
         } else {
             self.launch2("q8i_gemm_lds2", out.div_ceil(16), m.div_ceil(32), 256, 0, args);
         }
