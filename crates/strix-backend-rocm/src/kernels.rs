@@ -678,13 +678,13 @@ extern "C" __global__ void q8_gemm_rows(const float* __restrict__ scales,
                                         const float* __restrict__ xs,
                                         float* __restrict__ y, int in_dim, int out_dim, int m) {
     int l = threadIdx.x & 31;
-    int row = blockIdx.x, t0 = blockIdx.y * 8;
+    int row = blockIdx.x, t0 = blockIdx.y * 16;
     if (row >= out_dim) return;
     int tm = m - t0;
-    if (tm > 8) tm = 8;
+    if (tm > 16) tm = 16;
     int nb = in_dim / 32, rb = row * nb;
     int e = (l & 7) * 4;
-    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    float acc[16] = {0.f};
     for (int b4 = 0; b4 < nb; b4 += 4) {
         int bi = b4 + (l >> 3);
         float d = scales[rb + bi];
@@ -709,16 +709,16 @@ extern "C" __global__ void q6_gemm_rows(const unsigned char* __restrict__ w, lon
                                         int eid, const float* __restrict__ xs,
                                         float* __restrict__ y, int in_dim, int out_dim, int m) {
     int l = threadIdx.x & 31;
-    int row = blockIdx.x, t0 = blockIdx.y * 8;
+    int row = blockIdx.x, t0 = blockIdx.y * 16;
     if (row >= out_dim) return;
     int tm = m - t0;
-    if (tm > 8) tm = 8;
+    if (tm > 16) tm = 16;
     int nb = in_dim / 256;
     const unsigned char* rowp = w + (long long)eid * ebytes + (long long)row * nb * 210;
     int p0 = 4 * l;
     int lo = p0 < 64;
     int qb = lo ? p0 : p0 - 64;
-    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    float acc[16] = {0.f};
     for (int bi = 0; bi < nb; bi++) {
         const unsigned char* blk = rowp + bi * 210;
         const signed char* sc = (const signed char*)(blk + 192);

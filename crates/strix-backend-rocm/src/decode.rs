@@ -676,7 +676,7 @@ impl RocmWeightAccel {
         if let Some(e) = self.q6.get("token_embd.weight") {
             self.launch(
                 "q6_gemv",
-                e.out_dim.div_ceil(8) as u32,
+                e.out_dim.div_ceil(16) as u32,
                 256,
                 0,
                 Args::new()
@@ -1462,7 +1462,7 @@ impl WeightAccel for RocmWeightAccel {
         self.launch2(
             "q8_gemm_rows",
             e.out_dim as u32,
-            m.div_ceil(8) as u32,
+            m.div_ceil(16) as u32,
             32,
             0,
             Args::new()
@@ -1490,7 +1490,7 @@ impl WeightAccel for RocmWeightAccel {
             self.launch2(
                 "q6_gemm_rows",
                 mo.eff as u32,
-                m.div_ceil(8) as u32,
+                m.div_ceil(16) as u32,
                 32,
                 0,
                 Args::new()
@@ -1519,7 +1519,7 @@ impl WeightAccel for RocmWeightAccel {
         self.launch2(
             "q6_gemm_rows",
             mo.hidden as u32,
-            m.div_ceil(8) as u32,
+            m.div_ceil(16) as u32,
             32,
             0,
             Args::new()
@@ -1569,7 +1569,7 @@ impl WeightAccel for RocmWeightAccel {
             self.launch2(
                 "q6_gemm_rows",
                 mo.eff as u32,
-                m.div_ceil(8) as u32,
+                m.div_ceil(16) as u32,
                 32,
                 0,
                 Args::new()
@@ -1595,7 +1595,7 @@ impl WeightAccel for RocmWeightAccel {
         self.launch2(
             "q6_gemm_rows",
             mo.hidden as u32,
-            m.div_ceil(8) as u32,
+            m.div_ceil(16) as u32,
             32,
             0,
             Args::new()
@@ -1629,7 +1629,7 @@ impl WeightAccel for RocmWeightAccel {
             self.gemv_x.upload(x).ok()?;
             self.launch(
                 "q6_gemv",
-                e.out_dim.div_ceil(8) as u32,
+                e.out_dim.div_ceil(16) as u32,
                 256,
                 0,
                 Args::new()
@@ -2758,7 +2758,7 @@ impl WeightAccel for RocmWeightAccel {
                     self.launch2(
                         "sdpa_prefill_f",
                         n_heads as u32,
-                        m.div_ceil(8) as u32,
+                        m.div_ceil(16) as u32,
                         256,
                         (2 * hd * 4) as u32,
                         Args::new()
