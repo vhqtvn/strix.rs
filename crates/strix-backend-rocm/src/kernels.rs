@@ -1273,18 +1273,22 @@ extern "C" __global__ void q8w_gemm(const float* __restrict__ scales,
             w8i_t acc = {0, 0, 0, 0, 0, 0, 0, 0};
             acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, acc, true);
             acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, acc, true);
-            float dw = rok ? scales[(long long)rrow * nb + blk] : 0.f;
+            // C transposed vs assumption: lane t holds TOKEN t, cols are weight rows.
+            float dx = bd[t][bi];
             #pragma unroll
             for (int l = 0; l < 8; l++) {
-                int col = 2 * l + hs;
-                facc[l] += dw * bd[col][bi] * (float)acc[l];
+                int r = row0 + 2 * l + hs;
+                float dw = r < out_dim ? scales[(long long)r * nb + blk] : 0.f;
+                facc[l] += dw * dx * (float)acc[l];
             }
         }
     }
+    int tok = tok0 + t;
+    if (tok >= m) return;
     #pragma unroll
     for (int l = 0; l < 8; l++) {
-        int tok = tok0 + 2 * l + hs;
-        if (rok && tok < m) y[(long long)tok * out_dim + rrow] = facc[l];
+        int r = row0 + 2 * l + hs;
+        if (r < out_dim) y[(long long)tok * out_dim + r] = facc[l];
     }
 }
 
