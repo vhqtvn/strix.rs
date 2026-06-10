@@ -972,6 +972,55 @@ extern "C" __global__ void q8i_gemm_rows32(const float* __restrict__ scales,
     }
 }
 
+
+// LDS-staged int8 GEMM (llama.cpp MMQ shape): 8 rows/block share a 32-token x
+// LDS tile; per pass stage 128 K-elems of acts+scales, each wave dots its row.
+// grid=(ceil(out/8), ceil(m/32)), block=256 (8 waves).
+extern "C" __global__ void q8i_gemm_lds(const float* __restrict__ scales,
+                                        const signed char* __restrict__ quants,
+                                        const signed char* __restrict__ xq,
+                                        const float* __restrict__ xd,
+                                        float* __restrict__ y, int in_dim, int out_dim, int m) {
+    int tid = threadIdx.x, l = tid & 31, w = tid >> 5;
+    int row = blockIdx.x * 8 + w, t0 = blockIdx.y * 32;
+    int tm = m - t0; if (tm > 32) tm = 32;
+    int nb = in_dim / 32, rb = row * nb;
+    __shared__ int   xs[32][32];   // 32 tokens x 128 i8
+    __shared__ float sd[32][4];    // 32 tokens x 4 block scales
+    int e = (l & 7) * 4;
+    float acc[32] = {0.f};
+    for (int b4 = 0; b4 < nb; b4 += 4) {
+        __syncthreads();
+        {   // stage: thread covers token t=tid/8, 16B chunk c=tid%8 -> 4 ints
+            int t = tid >> 3, c = tid & 7;
+            if (t < tm) {
+                const int* src = (const int*)(xq + (long long)(t0 + t) * in_dim + b4 * 32) + c * 4;
+                xs[t][c * 4 + 0] = src[0];
+                xs[t][c * 4 + 1] = src[1];
+                xs[t][c * 4 + 2] = src[2];
+                xs[t][c * 4 + 3] = src[3];
+                if (c < 4) sd[t][c] = xd[(long long)(t0 + t) * nb + b4 + c];
+            }
+        }
+        __syncthreads();
+        if (row >= out_dim) continue;
+        int bi = b4 + (l >> 3);
+        float dw = scales[rb + bi];
+        const int w4 = *(const int*)(quants + ((long long)(rb + bi) * 32 + e));
+        int xo = ((l >> 3) * 32 + e) >> 2;
+        for (int j = 0; j < tm; j++) {
+            int si = __builtin_amdgcn_sudot4(true, w4, true, xs[j][xo], 0, false);
+            acc[j] += dw * sd[j][l >> 3] * (float)si;
+        }
+    }
+    if (row >= out_dim) return;
+    for (int j = 0; j < tm; j++) {
+        float a = acc[j];
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_down(a, o);
+        if (l == 0) y[(long long)(t0 + j) * out_dim + row] = a;
+    }
+}
+
 // ===== Native-Q6_K MoE GEMV (NO repack: 210 B/superblock as in the GGUF) =====
 // w = full 3D expert tensor (native bytes), expert stride ebytes. Per superblock:
 // ql[128] qh[64] sc[16xi8] d[f16]. 8 waves/block, 32 lanes on the SAME superblock

@@ -368,6 +368,7 @@ impl RocmWeightAccel {
             "q8_gemm_rows32",
             "xquant8_rows",
             "q8i_gemm_rows32",
+            "q8i_gemm_lds",
             "q6_gemm_rows",
             "q6_gemm_moe",
             "moe_silu_mul",
@@ -2418,10 +2419,10 @@ impl WeightAccel for RocmWeightAccel {
         if self.mlm_int8 {
             let (xq, xd) = self.pf_quant(self.pf_x.ptr, m, e.in_dim);
             self.launch2(
-                "q8i_gemm_rows32",
-                e.out_dim as u32,
+                "q8i_gemm_lds",
+                e.out_dim.div_ceil(8) as u32,
                 m.div_ceil(32) as u32,
-                32,
+                256,
                 0,
                 Args::new()
                     .ptr(e.scales.ptr)
@@ -2623,10 +2624,10 @@ impl WeightAccel for RocmWeightAccel {
             let qp = unsafe { (qb2.ptr as *mut i8).add(eoff * 32) } as *mut c_void;
             if let Some((xq, xd)) = xqd {
                 self.launch2(
-                    "q8i_gemm_rows32",
-                    mo.eff as u32,
+                    "q8i_gemm_lds",
+                    mo.eff.div_ceil(8) as u32,
                     m.div_ceil(32) as u32,
-                    32,
+                    256,
                     0,
                     Args::new()
                         .ptr(sp)
@@ -2676,10 +2677,10 @@ impl WeightAccel for RocmWeightAccel {
         if self.mlm_int8 {
             let (xq, xd) = self.pf_quant(self.pf_b.ptr, m, mo.eff);
             self.launch2(
-                "q8i_gemm_rows32",
-                mo.hidden as u32,
+                "q8i_gemm_lds",
+                mo.hidden.div_ceil(8) as u32,
                 m.div_ceil(32) as u32,
-                32,
+                256,
                 0,
                 Args::new()
                     .ptr(ds)
@@ -2809,10 +2810,10 @@ impl WeightAccel for RocmWeightAccel {
             if self.mlm_int8 {
                 let (xq, xd) = self.pf_quant(self.pf_x.ptr, m, e.in_dim);
                 self.launch2(
-                    "q8i_gemm_rows32",
-                    oc as u32,
+                    "q8i_gemm_lds",
+                    oc.div_ceil(8) as u32,
                     m.div_ceil(32) as u32,
-                    32,
+                    256,
                     0,
                     Args::new()
                         .ptr(sp)
