@@ -283,6 +283,8 @@ pub struct RocmWeightAccel {
     pf_dy: Dbuf,
     pf_tab: Dbuf,
     pf_act: Dbuf,
+    pf_xq: Dbuf,
+    pf_xd: Dbuf,
     /// f16 KV cache (STRIX_F16_KV=1): halves KV memory + decode KV traffic, at a
     /// small prefill cost (the prefill SDPA is occupancy-bound, so the h2f isn't
     /// free there). Default false (f32) — best for prefill-heavy workloads.
@@ -364,6 +366,8 @@ impl RocmWeightAccel {
             "q6_moe_gemv",
             "q8_gemm_rows",
             "q8_gemm_rows32",
+            "xquant8_rows",
+            "q8i_gemm_rows32",
             "q6_gemm_rows",
             "q6_gemm_moe",
             "moe_silu_mul",
@@ -434,6 +438,8 @@ impl RocmWeightAccel {
         let pf_dy = gpu.alloc(2048 * 4096 * 4).ok()?;
         let pf_tab = gpu.alloc(512 * 16).ok()?;
         let pf_act = gpu.alloc(2048 * 1024 * 4).ok()?;
+        let pf_xq = gpu.alloc(2048 * 4096).ok()?;
+        let pf_xd = gpu.alloc(2048 * 128 * 4).ok()?;
         let mut batch_x = Vec::new();
         let mut batch_y = Vec::new();
         for _ in 0..4 {
@@ -488,6 +494,8 @@ impl RocmWeightAccel {
             pf_dy,
             pf_tab,
             pf_act,
+            pf_xq,
+            pf_xd,
             kv_f16: std::env::var("STRIX_F16_KV").is_ok(),
             // pinned split if STRIX_N_SPLIT set, else 0 = context-adaptive (~len/64).
             n_split: std::env::var("STRIX_N_SPLIT")
@@ -1157,6 +1165,25 @@ impl RocmWeightAccel {
                 .i(e.in_dim as i32)
                 .i(e.out_dim as i32),
         );
+    }
+
+    /// Quantize m rows (in_dim each) to i8 + per-32 scales in pf_xq/pf_xd.
+    fn pf_quant(&self, x: *mut c_void, m: usize, in_dim: usize) -> (*mut c_void, *mut c_void) {
+        let nb = in_dim / 32;
+        self.launch2(
+            "xquant8_rows",
+            nb as u32,
+            m as u32,
+            32,
+            0,
+            Args::new()
+                .ptr(x)
+                .ptr(self.pf_xq.ptr)
+                .ptr(self.pf_xd.ptr)
+                .i(nb as i32)
+                .i(m as i32),
+        );
+        (self.pf_xq.ptr, self.pf_xd.ptr)
     }
 
     /// No-sync RMSNorm on resident buffers (single row).
@@ -2388,21 +2415,41 @@ impl WeightAccel for RocmWeightAccel {
             return None;
         }
         self.pf_x.upload(xs).ok()?;
-        self.launch2(
-            "q8_gemm_rows32",
-            e.out_dim as u32,
-            m.div_ceil(32) as u32,
-            32,
-            0,
-            Args::new()
-                .ptr(e.scales.ptr)
-                .ptr(e.quants.ptr)
-                .ptr(self.pf_x.ptr)
-                .ptr(self.pf_y.ptr)
-                .i(e.in_dim as i32)
-                .i(e.out_dim as i32)
-                .i(m as i32),
-        );
+        if self.mlm_int8 {
+            let (xq, xd) = self.pf_quant(self.pf_x.ptr, m, e.in_dim);
+            self.launch2(
+                "q8i_gemm_rows32",
+                e.out_dim as u32,
+                m.div_ceil(32) as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(e.scales.ptr)
+                    .ptr(e.quants.ptr)
+                    .ptr(xq)
+                    .ptr(xd)
+                    .ptr(self.pf_y.ptr)
+                    .i(e.in_dim as i32)
+                    .i(e.out_dim as i32)
+                    .i(m as i32),
+            );
+        } else {
+            self.launch2(
+                "q8_gemm_rows32",
+                e.out_dim as u32,
+                m.div_ceil(32) as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(e.scales.ptr)
+                    .ptr(e.quants.ptr)
+                    .ptr(self.pf_x.ptr)
+                    .ptr(self.pf_y.ptr)
+                    .i(e.in_dim as i32)
+                    .i(e.out_dim as i32)
+                    .i(m as i32),
+            );
+        }
         self.gpu.sync().ok()?;
         self.pf_y.download::<f32>(m * e.out_dim).ok()
     }
@@ -2563,27 +2610,51 @@ impl WeightAccel for RocmWeightAccel {
         let xptr = unsafe { (self.pf_x.ptr as *mut f32).add(xoff) } as *mut c_void;
         let nb = mo.hidden / 32;
         let eoff = eid * mo.eff * nb;
+        let xqd = if self.mlm_int8 {
+            Some(self.pf_quant(xptr, m, mo.hidden))
+        } else {
+            None
+        };
         for (sb, qb2, y) in [
             (&mo.gate_s, &mo.gate_q, self.pf_a.ptr),
             (&mo.up_s, &mo.up_q, self.pf_b.ptr),
         ] {
             let sp = unsafe { (sb.ptr as *mut f32).add(eoff) } as *mut c_void;
             let qp = unsafe { (qb2.ptr as *mut i8).add(eoff * 32) } as *mut c_void;
-            self.launch2(
-                "q8_gemm_rows32",
-                mo.eff as u32,
-                m.div_ceil(32) as u32,
-                32,
-                0,
-                Args::new()
-                    .ptr(sp)
-                    .ptr(qp)
-                    .ptr(xptr)
-                    .ptr(y)
-                    .i(mo.hidden as i32)
-                    .i(mo.eff as i32)
-                    .i(m as i32),
-            );
+            if let Some((xq, xd)) = xqd {
+                self.launch2(
+                    "q8i_gemm_rows32",
+                    mo.eff as u32,
+                    m.div_ceil(32) as u32,
+                    32,
+                    0,
+                    Args::new()
+                        .ptr(sp)
+                        .ptr(qp)
+                        .ptr(xq)
+                        .ptr(xd)
+                        .ptr(y)
+                        .i(mo.hidden as i32)
+                        .i(mo.eff as i32)
+                        .i(m as i32),
+                );
+            } else {
+                self.launch2(
+                    "q8_gemm_rows32",
+                    mo.eff as u32,
+                    m.div_ceil(32) as u32,
+                    32,
+                    0,
+                    Args::new()
+                        .ptr(sp)
+                        .ptr(qp)
+                        .ptr(xptr)
+                        .ptr(y)
+                        .i(mo.hidden as i32)
+                        .i(mo.eff as i32)
+                        .i(m as i32),
+                );
+            }
         }
         let n_act = m * mo.eff;
         self.launch(
@@ -2602,21 +2673,41 @@ impl WeightAccel for RocmWeightAccel {
         let dq =
             unsafe { (mo.down_q.ptr as *mut i8).add(eid * mo.hidden * nbd * 32) } as *mut c_void;
         let dyp = unsafe { (self.pf_dy.ptr as *mut f32).add(dy_off * mo.hidden) } as *mut c_void;
-        self.launch2(
-            "q8_gemm_rows32",
-            mo.hidden as u32,
-            m.div_ceil(32) as u32,
-            32,
-            0,
-            Args::new()
-                .ptr(ds)
-                .ptr(dq)
-                .ptr(self.pf_b.ptr)
-                .ptr(dyp)
-                .i(mo.eff as i32)
-                .i(mo.hidden as i32)
-                .i(m as i32),
-        );
+        if self.mlm_int8 {
+            let (xq, xd) = self.pf_quant(self.pf_b.ptr, m, mo.eff);
+            self.launch2(
+                "q8i_gemm_rows32",
+                mo.hidden as u32,
+                m.div_ceil(32) as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(ds)
+                    .ptr(dq)
+                    .ptr(xq)
+                    .ptr(xd)
+                    .ptr(dyp)
+                    .i(mo.eff as i32)
+                    .i(mo.hidden as i32)
+                    .i(m as i32),
+            );
+        } else {
+            self.launch2(
+                "q8_gemm_rows32",
+                mo.hidden as u32,
+                m.div_ceil(32) as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(ds)
+                    .ptr(dq)
+                    .ptr(self.pf_b.ptr)
+                    .ptr(dyp)
+                    .i(mo.eff as i32)
+                    .i(mo.hidden as i32)
+                    .i(m as i32),
+            );
+        }
         true
     }
 
@@ -2715,21 +2806,41 @@ impl WeightAccel for RocmWeightAccel {
             let oc = (e.out_dim - base).min(chunk);
             let sp = unsafe { (e.scales.ptr as *mut f32).add(base * nb) } as *mut c_void;
             let qp = unsafe { (e.quants.ptr as *mut i8).add(base * nb * 32) } as *mut c_void;
-            self.launch2(
-                "q8_gemm_rows32",
-                oc as u32,
-                m.div_ceil(32) as u32,
-                32,
-                0,
-                Args::new()
-                    .ptr(sp)
-                    .ptr(qp)
-                    .ptr(self.pf_x.ptr)
-                    .ptr(self.pf_y.ptr)
-                    .i(e.in_dim as i32)
-                    .i(oc as i32)
-                    .i(m as i32),
-            );
+            if self.mlm_int8 {
+                let (xq, xd) = self.pf_quant(self.pf_x.ptr, m, e.in_dim);
+                self.launch2(
+                    "q8i_gemm_rows32",
+                    oc as u32,
+                    m.div_ceil(32) as u32,
+                    32,
+                    0,
+                    Args::new()
+                        .ptr(sp)
+                        .ptr(qp)
+                        .ptr(xq)
+                        .ptr(xd)
+                        .ptr(self.pf_y.ptr)
+                        .i(e.in_dim as i32)
+                        .i(oc as i32)
+                        .i(m as i32),
+                );
+            } else {
+                self.launch2(
+                    "q8_gemm_rows32",
+                    oc as u32,
+                    m.div_ceil(32) as u32,
+                    32,
+                    0,
+                    Args::new()
+                        .ptr(sp)
+                        .ptr(qp)
+                        .ptr(self.pf_x.ptr)
+                        .ptr(self.pf_y.ptr)
+                        .i(e.in_dim as i32)
+                        .i(oc as i32)
+                        .i(m as i32),
+                );
+            }
             self.gpu.sync().ok()?;
             let y = self.pf_y.download::<f32>(m * oc).ok()?;
             for t in 0..m {

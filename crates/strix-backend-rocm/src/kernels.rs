@@ -923,6 +923,55 @@ extern "C" __global__ void q8i_moe_down(const float* __restrict__ ds, const sign
     if (l == 0) y[(long long)kk * out_dim + row] = acc;
 }
 
+
+// quantize m rows to per-32-block i8 + scales: grid=(nb, m), block=32
+extern "C" __global__ void xquant8_rows(const float* __restrict__ x, signed char* __restrict__ xq,
+                                        float* __restrict__ xd, int nb, int m) {
+    int blk = blockIdx.x, r = blockIdx.y, t = threadIdx.x;
+    if (blk >= nb || r >= m) return;
+    long long off = (long long)r * nb * 32 + blk * 32;
+    float xv = x[off + t];
+    float a = fabsf(xv);
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor(a, o));
+    float d = a / 127.f;
+    float inv = d > 0.f ? 1.f / d : 0.f;
+    int qi = (int)rintf(xv * inv);
+    xq[off + t] = (signed char)max(-127, min(127, qi));
+    if (t == 0) xd[(long long)r * nb + blk] = d;
+}
+
+// int8 32-token GEMM tile: same shape as q8_gemm_rows32, acts i8 + per-block scales.
+extern "C" __global__ void q8i_gemm_rows32(const float* __restrict__ scales,
+                                           const signed char* __restrict__ quants,
+                                           const signed char* __restrict__ xq,
+                                           const float* __restrict__ xd,
+                                           float* __restrict__ y, int in_dim, int out_dim, int m) {
+    int l = threadIdx.x & 31;
+    int row = blockIdx.x, t0 = blockIdx.y * 32;
+    if (row >= out_dim) return;
+    int tm = m - t0;
+    if (tm > 32) tm = 32;
+    int nb = in_dim / 32, rb = row * nb;
+    int e = (l & 7) * 4;
+    float acc[32] = {0.f};
+    for (int b4 = 0; b4 < nb; b4 += 4) {
+        int bi = b4 + (l >> 3);
+        float dw = scales[rb + bi];
+        const int w4 = *(const int*)(quants + ((long long)(rb + bi) * 32 + e));
+        long long xo = (long long)bi * 32 + e;
+        for (int j = 0; j < tm; j++) {
+            const int x4 = *(const int*)(xq + (long long)(t0 + j) * in_dim + xo);
+            int si = __builtin_amdgcn_sudot4(true, w4, true, x4, 0, false);
+            acc[j] += dw * xd[(long long)(t0 + j) * nb + bi] * (float)si;
+        }
+    }
+    for (int j = 0; j < tm; j++) {
+        float a = acc[j];
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_down(a, o);
+        if (l == 0) y[(long long)(t0 + j) * out_dim + row] = a;
+    }
+}
+
 // ===== Native-Q6_K MoE GEMV (NO repack: 210 B/superblock as in the GGUF) =====
 // w = full 3D expert tensor (native bytes), expert stride ebytes. Per superblock:
 // ql[128] qh[64] sc[16xi8] d[f16]. 8 waves/block, 32 lanes on the SAME superblock
