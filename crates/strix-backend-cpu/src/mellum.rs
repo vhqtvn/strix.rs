@@ -558,6 +558,12 @@ impl MellumModel {
         }
         // fused decode is safe only with every MoE layer resident
         self.fused_ok = advise.len() == self.cfg.n_layer * 3;
+        if self.fused_ok {
+            let kv_dim = self.cfg.n_head_kv * self.cfg.head_dim;
+            if !accel.mlm_prepare(self.cfg.n_layer, kv_dim, 2048) {
+                self.fused_ok = false;
+            }
+        }
         self.accel = Some(accel);
         n
     }
@@ -1614,7 +1620,7 @@ impl Decoder for MellumModel {
             if let Some(l) = self.forward_fused(token)? {
                 return Ok(Logits::new(l));
             }
-            self.fused_ok = false; // fell through before any state change → safe
+            // transient bail (e.g. first-token alloc) → CPU for this token, retry next
         }
         Ok(Logits::new(self.forward(token, true)?.unwrap()))
     }
