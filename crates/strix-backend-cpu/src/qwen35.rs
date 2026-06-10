@@ -937,18 +937,23 @@ impl Qwen35Model {
             let cs = &mut self.conv[il];
             let qkv_t = &qkv[t * conv_dim..(t + 1) * conv_dim];
             let mut conv_out = vec![0.0f32; conv_dim];
-            for c in 0..conv_dim {
-                let mut acc = 0.0f32;
-                for kk in 0..dconv - 1 {
-                    acc += conv_w[c * dconv + kk] * cs[c * (dconv - 1) + kk];
-                }
-                acc += conv_w[c * dconv + (dconv - 1)] * qkv_t[c];
-                conv_out[c] = silu(acc);
-                for kk in 0..dconv - 2 {
-                    cs[c * (dconv - 1) + kk] = cs[c * (dconv - 1) + kk + 1];
-                }
-                cs[c * (dconv - 1) + (dconv - 2)] = qkv_t[c];
-            }
+            // channels are independent (state slice per channel) — parallelize
+            conv_out
+                .par_iter_mut()
+                .zip(cs.par_chunks_mut(dconv - 1))
+                .enumerate()
+                .for_each(|(c, (co, csb))| {
+                    let mut acc = 0.0f32;
+                    for kk in 0..dconv - 1 {
+                        acc += conv_w[c * dconv + kk] * csb[kk];
+                    }
+                    acc += conv_w[c * dconv + (dconv - 1)] * qkv_t[c];
+                    *co = silu(acc);
+                    for kk in 0..dconv - 2 {
+                        csb[kk] = csb[kk + 1];
+                    }
+                    csb[dconv - 2] = qkv_t[c];
+                });
             let q = &conv_out[0..key_dim];
             let kvec = &conv_out[key_dim..2 * key_dim];
             let v = &conv_out[2 * key_dim..2 * key_dim + value_dim];
