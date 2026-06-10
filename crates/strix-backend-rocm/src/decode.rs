@@ -596,9 +596,9 @@ impl RocmWeightAccel {
         ] {
             self.launch2(
                 "q8_moe_gemv",
-                m.eff.div_ceil(8) as u32,
+                m.eff as u32,
                 k as u32,
-                256,
+                32,
                 0,
                 Args::new()
                     .ptr(ws.ptr)
@@ -625,9 +625,9 @@ impl RocmWeightAccel {
         for e in 0..k {
             self.launch2(
                 "q8_moe_gemv",
-                m.hidden.div_ceil(8) as u32,
+                m.hidden as u32,
                 1,
-                256,
+                32,
                 0,
                 Args::new()
                     .ptr(m.down_s.ptr)

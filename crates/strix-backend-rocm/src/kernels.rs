@@ -605,8 +605,8 @@ extern "C" __global__ void q8_moe_gemv(const float* __restrict__ scales,
                                        const int* __restrict__ ids,
                                        const float* __restrict__ x,
                                        float* __restrict__ y, int in_dim, int out_dim) {
-    int wave = threadIdx.x >> 5, l = threadIdx.x & 31;
-    int row = blockIdx.x * 8 + wave, k = blockIdx.y;
+    int l = threadIdx.x & 31;
+    int row = blockIdx.x, k = blockIdx.y;
     if (row >= out_dim) return;
     int nb = in_dim / 32;
     long long eoff = (long long)ids[k] * out_dim * nb;
