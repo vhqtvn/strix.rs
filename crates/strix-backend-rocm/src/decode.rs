@@ -268,6 +268,8 @@ pub struct RocmWeightAccel {
     pf_b: Dbuf,
     pf_y: Dbuf,
     pf_dy: Dbuf,
+    pf_tab: Dbuf,
+    pf_act: Dbuf,
     /// f16 KV cache (STRIX_F16_KV=1): halves KV memory + decode KV traffic, at a
     /// small prefill cost (the prefill SDPA is occupancy-bound, so the h2f isn't
     /// free there). Default false (f32) — best for prefill-heavy workloads.
@@ -339,6 +341,7 @@ impl RocmWeightAccel {
             "q6_moe_gemv",
             "q8_gemm_rows",
             "q6_gemm_rows",
+            "q6_gemm_moe",
             "moe_silu_mul",
             "moe_wsum",
             "vec_add",
@@ -393,6 +396,8 @@ impl RocmWeightAccel {
         let pf_b = gpu.alloc(2048 * 1024 * 4).ok()?;
         let pf_y = gpu.alloc(256 * 8192 * 4).ok()?;
         let pf_dy = gpu.alloc(2048 * 4096 * 4).ok()?;
+        let pf_tab = gpu.alloc(512 * 16).ok()?;
+        let pf_act = gpu.alloc(2048 * 1024 * 4).ok()?;
         let mut batch_x = Vec::new();
         let mut batch_y = Vec::new();
         for _ in 0..4 {
@@ -433,6 +438,8 @@ impl RocmWeightAccel {
             pf_b,
             pf_y,
             pf_dy,
+            pf_tab,
+            pf_act,
             kv_f16: std::env::var("STRIX_F16_KV").is_ok(),
             // pinned split if STRIX_N_SPLIT set, else 0 = context-adaptive (~len/64).
             n_split: std::env::var("STRIX_N_SPLIT")
@@ -1611,13 +1618,24 @@ impl WeightAccel for RocmWeightAccel {
         true
     }
 
-    fn moe_expert_queue_q8(&self, layer: usize, eid: usize, xs: &[f32], m: usize, dy_off: usize) -> bool {
-        let Some(mo) = self.moe.get(&layer) else { return false };
+    fn moe_expert_queue_q8(
+        &self,
+        layer: usize,
+        eid: usize,
+        xs: &[f32],
+        m: usize,
+        dy_off: usize,
+    ) -> bool {
+        let Some(mo) = self.moe.get(&layer) else {
+            return false;
+        };
         if xs.len() != m * mo.hidden || (dy_off + m) * mo.hidden > 2048 * 4096 {
             return false;
         }
         let xoff = dy_off * mo.hidden;
-        if (xoff + m * mo.hidden) > 2048 * 4096 || self.gpu.upload_at(&self.pf_x, xoff * 4, xs).is_err() {
+        if (xoff + m * mo.hidden) > 2048 * 4096
+            || self.gpu.upload_at(&self.pf_x, xoff * 4, xs).is_err()
+        {
             return false;
         }
         let xptr = unsafe { (self.pf_x.ptr as *mut f32).add(xoff) } as *mut c_void;
@@ -1635,8 +1653,14 @@ impl WeightAccel for RocmWeightAccel {
                 m.div_ceil(16) as u32,
                 32,
                 0,
-                Args::new().ptr(sp).ptr(qp).ptr(xptr).ptr(y)
-                    .i(mo.hidden as i32).i(mo.eff as i32).i(m as i32),
+                Args::new()
+                    .ptr(sp)
+                    .ptr(qp)
+                    .ptr(xptr)
+                    .ptr(y)
+                    .i(mo.hidden as i32)
+                    .i(mo.eff as i32)
+                    .i(m as i32),
             );
         }
         let n_act = m * mo.eff;
@@ -1645,11 +1669,16 @@ impl WeightAccel for RocmWeightAccel {
             n_act.div_ceil(256) as u32,
             256,
             0,
-            Args::new().ptr(self.pf_a.ptr).ptr(self.pf_b.ptr).ptr(self.pf_b.ptr).i(n_act as i32),
+            Args::new()
+                .ptr(self.pf_a.ptr)
+                .ptr(self.pf_b.ptr)
+                .ptr(self.pf_b.ptr)
+                .i(n_act as i32),
         );
         let nbd = mo.eff / 32;
         let ds = unsafe { (mo.down_s.ptr as *mut f32).add(eid * mo.hidden * nbd) } as *mut c_void;
-        let dq = unsafe { (mo.down_q.ptr as *mut i8).add(eid * mo.hidden * nbd * 32) } as *mut c_void;
+        let dq =
+            unsafe { (mo.down_q.ptr as *mut i8).add(eid * mo.hidden * nbd * 32) } as *mut c_void;
         let dyp = unsafe { (self.pf_dy.ptr as *mut f32).add(dy_off * mo.hidden) } as *mut c_void;
         self.launch2(
             "q8_gemm_rows",
@@ -1657,10 +1686,97 @@ impl WeightAccel for RocmWeightAccel {
             m.div_ceil(16) as u32,
             32,
             0,
-            Args::new().ptr(ds).ptr(dq).ptr(self.pf_b.ptr).ptr(dyp)
-                .i(mo.eff as i32).i(mo.hidden as i32).i(m as i32),
+            Args::new()
+                .ptr(ds)
+                .ptr(dq)
+                .ptr(self.pf_b.ptr)
+                .ptr(dyp)
+                .i(mo.eff as i32)
+                .i(mo.hidden as i32)
+                .i(m as i32),
         );
         true
+    }
+
+    /// Whole-layer multi-expert FFN (Q6 native): xs_all = gathered token rows
+    /// (expert-major), plan = (expert id, rows). 3 launches + 1 sync + 1 download.
+    fn moe_layer_ffn(
+        &self,
+        layer: usize,
+        plan: &[(i32, i32)],
+        xs_all: &[f32],
+        rows: usize,
+    ) -> Option<Vec<f32>> {
+        let mo = self.moe6.get(&layer)?;
+        if xs_all.len() != rows * mo.hidden || rows > 2048 {
+            return None;
+        }
+        // entry table: per 16-row tile of each expert group
+        let mut tab: Vec<[i32; 4]> = Vec::new();
+        let mut off = 0i32;
+        for &(eid, me) in plan {
+            let mut t0 = 0i32;
+            while t0 < me {
+                let tm = (me - t0).min(16);
+                tab.push([eid, off + t0, off + t0, tm]);
+                t0 += 16;
+            }
+            off += me;
+        }
+        if tab.len() > 512 {
+            return None;
+        }
+        self.pf_x.upload(xs_all).ok()?;
+        self.pf_tab.upload(&tab).ok()?;
+        let geb = mo.gate_eb as usize as *mut c_void;
+        let deb = mo.down_eb as usize as *mut c_void;
+        let gy = tab.len() as u32;
+        for (w, y) in [(&mo.gate, self.pf_a.ptr), (&mo.up, self.pf_b.ptr)] {
+            self.launch2(
+                "q6_gemm_moe",
+                mo.eff as u32,
+                gy,
+                32,
+                0,
+                Args::new()
+                    .ptr(w.ptr)
+                    .ptr(geb)
+                    .ptr(self.pf_tab.ptr)
+                    .ptr(self.pf_x.ptr)
+                    .ptr(y)
+                    .i(mo.hidden as i32)
+                    .i(mo.eff as i32),
+            );
+        }
+        let n_act = rows * mo.eff;
+        self.launch(
+            "moe_silu_mul",
+            n_act.div_ceil(256) as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(self.pf_a.ptr)
+                .ptr(self.pf_b.ptr)
+                .ptr(self.pf_act.ptr)
+                .i(n_act as i32),
+        );
+        self.launch2(
+            "q6_gemm_moe",
+            mo.hidden as u32,
+            gy,
+            32,
+            0,
+            Args::new()
+                .ptr(mo.down.ptr)
+                .ptr(deb)
+                .ptr(self.pf_tab.ptr)
+                .ptr(self.pf_act.ptr)
+                .ptr(self.pf_dy.ptr)
+                .i(mo.eff as i32)
+                .i(mo.hidden as i32),
+        );
+        self.gpu.sync().ok()?;
+        self.pf_dy.download::<f32>(rows * mo.hidden).ok()
     }
 
     fn moe_expert_flush(&self, rows: usize, hidden: usize) -> Option<Vec<f32>> {

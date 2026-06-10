@@ -753,6 +753,58 @@ extern "C" __global__ void q6_gemm_rows(const unsigned char* __restrict__ w, lon
     }
 }
 
+// Table-driven multi-expert Q6 GEMM: one launch per (gate|up|down) per layer.
+// table[gy] = {eid, xrow0, yrow0, mrows}: blockIdx.y processes up to 16 rows of one
+// expert's token group, reading the expert's native Q6 weight rows once.
+extern "C" __global__ void q6_gemm_moe(const unsigned char* __restrict__ w, long long ebytes,
+                                       const int4* __restrict__ table,
+                                       const float* __restrict__ xs,
+                                       float* __restrict__ y, int in_dim, int out_dim) {
+    int l = threadIdx.x & 31;
+    int row = blockIdx.x;
+    if (row >= out_dim) return;
+    int4 e = table[blockIdx.y];
+    int eid = e.x, xrow0 = e.y, yrow0 = e.z, tm = e.w;
+    int nb = in_dim / 256;
+    const unsigned char* rowp = w + (long long)eid * ebytes + (long long)row * nb * 210;
+    int p0 = 4 * l;
+    int lo = p0 < 64;
+    int qb = lo ? p0 : p0 - 64;
+    float acc[16] = {0.f};
+    for (int bi = 0; bi < nb; bi++) {
+        const unsigned char* blk = rowp + bi * 210;
+        const signed char* sc = (const signed char*)(blk + 192);
+        float d = h2f(*(const unsigned short*)(blk + 208));
+        int xb = bi * 256;
+        for (int half = 0; half < 2; half++) {
+            const unsigned char* ql = blk + half * 64;
+            const unsigned char* qh = blk + 128 + half * 32;
+            unsigned q4b, h4b;
+            __builtin_memcpy(&q4b, ql + qb, 4);
+            __builtin_memcpy(&h4b, qh + (p0 & 31), 4);
+            int hsh = (p0 >> 5) * 2;
+            float sq[4];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                int p = p0 + j;
+                int qn = (q4b >> (8 * j)) & 0xFF;
+                int qv = (lo ? (qn & 0xF) : (qn >> 4)) | ((((h4b >> (8 * j)) >> hsh) & 3) << 4);
+                sq[j] = d * (float)sc[half * 8 + p / 16] * (float)(qv - 32);
+            }
+            int xo = xb + half * 128 + p0;
+            for (int t = 0; t < tm; t++) {
+                const float* x = xs + (long long)(xrow0 + t) * in_dim + xo;
+                acc[t] += sq[0] * x[0] + sq[1] * x[1] + sq[2] * x[2] + sq[3] * x[3];
+            }
+        }
+    }
+    for (int t = 0; t < tm; t++) {
+        float a = acc[t];
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_down(a, o);
+        if (l == 0) y[(long long)(yrow0 + t) * out_dim + row] = a;
+    }
+}
+
 // act[k][i] = silu(g[k][i]) * u[k][i]; n = k*eff.
 extern "C" __global__ void moe_silu_mul(const float* __restrict__ g, const float* __restrict__ u,
                                         float* __restrict__ act, int n) {

@@ -1123,38 +1123,33 @@ impl Qwen35Model {
         let u_bpr = (hidden / wue.ty.block_elems()) * wue.ty.block_bytes() * eff;
         let d_bpr = (eff / wde.ty.block_elems()) * wde.ty.block_bytes() * hidden;
         let mut dy = vec![0.0f32; m * topk * hidden];
-        // GPU path: queue ALL experts' FFNs, one sync + one download per layer.
+        // GPU path: ONE multi-expert GEMM set per layer (3 launches + 1 sync).
         if let Some(a) = &self.accel {
+            let rows: usize = by_exp.iter().map(|l| l.len()).sum();
+            let mut xs_all = vec![0.0f32; rows * hidden];
+            let mut plan: Vec<(i32, i32)> = Vec::new();
             let mut off = 0usize;
-            let mut plan: Vec<(usize, usize, usize)> = Vec::new(); // (expert, off, me)
-            let mut all = true;
             for (e, list) in by_exp.iter().enumerate() {
                 if list.is_empty() {
                     continue;
                 }
-                let me = list.len();
-                let mut xs = vec![0.0f32; me * hidden];
-                for (i, &(t, _)) in list.iter().enumerate() {
-                    xs[i * hidden..(i + 1) * hidden]
+                for &(t, _) in list {
+                    xs_all[off * hidden..(off + 1) * hidden]
                         .copy_from_slice(&x[t * hidden..(t + 1) * hidden]);
+                    off += 1;
                 }
-                if !a.moe_expert_queue(il, e, &xs, me, off) {
-                    all = false;
-                    break;
-                }
-                plan.push((e, off, me));
-                off += me;
+                plan.push((e as i32, list.len() as i32));
             }
-            if all && off > 0 {
-                if let Some(d_all) = a.moe_expert_flush(off, hidden) {
-                    for &(e, o, _me) in &plan {
-                        for (i, &(t, s)) in by_exp[e].iter().enumerate() {
-                            dy[(t * topk + s) * hidden..(t * topk + s + 1) * hidden]
-                                .copy_from_slice(&d_all[(o + i) * hidden..(o + i + 1) * hidden]);
-                        }
+            if let Some(d_all) = a.moe_layer_ffn(il, &plan, &xs_all, rows) {
+                let mut o = 0usize;
+                for list in by_exp.iter() {
+                    for &(t, s) in list {
+                        dy[(t * topk + s) * hidden..(t * topk + s + 1) * hidden]
+                            .copy_from_slice(&d_all[o * hidden..(o + 1) * hidden]);
+                        o += 1;
                     }
-                    return self.moe_finish(x, m, il, h, &routes, &dy);
                 }
+                return self.moe_finish(x, m, il, h, &routes, &dy);
             }
         }
         for (e, list) in by_exp.iter().enumerate() {

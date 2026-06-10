@@ -137,8 +137,26 @@ pub trait WeightAccel: Send + Sync {
     ) -> bool {
         false
     }
+    /// Whole-layer multi-expert FFN: plan = (expert id, row count); xs_all gathered
+    /// expert-major. Returns dy rows. None ⇒ per-expert fallback.
+    fn moe_layer_ffn(
+        &self,
+        _layer: usize,
+        _plan: &[(i32, i32)],
+        _xs: &[f32],
+        _rows: usize,
+    ) -> Option<Vec<f32>> {
+        None
+    }
     /// Q8 planar variant of [`WeightAccel::moe_expert_queue`].
-    fn moe_expert_queue_q8(&self, _layer: usize, _e: usize, _xs: &[f32], _m: usize, _dy_off: usize) -> bool {
+    fn moe_expert_queue_q8(
+        &self,
+        _layer: usize,
+        _e: usize,
+        _xs: &[f32],
+        _m: usize,
+        _dy_off: usize,
+    ) -> bool {
         false
     }
     /// Sync + download `rows` of hidden from the dy pool.
