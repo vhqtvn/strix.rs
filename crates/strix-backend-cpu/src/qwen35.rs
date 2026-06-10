@@ -543,6 +543,9 @@ impl Qwen35Model {
                     names.push(format!("blk.{il}.{t}.weight"));
                 }
             }
+            for t in ["ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp"] {
+                names.push(format!("blk.{il}.{t}.weight"));
+            }
         }
         if self.gguf.tensors().contains_key("output.weight") {
             names.push("output.weight".to_string());
@@ -1524,12 +1527,27 @@ impl Qwen35Model {
             let mut us = vec![0.0f32; sff];
             let mut a = vec![0.0f32; sff];
             let mut ds = vec![0.0f32; hidden];
-            qmatmul(&mut gs, x, wgs.bytes, wgs.ty, wgs.in_dim, row);
-            qmatmul(&mut us, x, wus.bytes, wus.ty, wus.in_dim, row);
+            let mut got = false;
+            if let Some(acc) = &self.accel {
+                let r = acc.gemv_batch(&[(&b("ffn_gate_shexp.weight"), x), (&b("ffn_up_shexp.weight"), x)]);
+                if let (Some(gv), Some(uv)) = (&r[0], &r[1]) {
+                    if gv.len() == sff && uv.len() == sff {
+                        gs.copy_from_slice(gv);
+                        us.copy_from_slice(uv);
+                        got = true;
+                    }
+                }
+            }
+            if !got {
+                qmatmul(&mut gs, x, wgs.bytes, wgs.ty, wgs.in_dim, row);
+                qmatmul(&mut us, x, wus.bytes, wus.ty, wus.in_dim, row);
+            }
             for i in 0..sff {
                 a[i] = silu(gs[i]) * us[i];
             }
-            qmatmul(&mut ds, &a, wds.bytes, wds.ty, wds.in_dim, row);
+            if !self.try_gemv(&b("ffn_down_shexp.weight"), &a, &mut ds) {
+                qmatmul(&mut ds, &a, wds.bytes, wds.ty, wds.in_dim, row);
+            }
             let mut sg = [0.0f32; 1];
             qmatmul(&mut sg, x, wgis.bytes, wgis.ty, wgis.in_dim, row);
             let sgate = sigmoid(sg[0]);
