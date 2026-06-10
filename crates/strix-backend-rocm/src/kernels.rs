@@ -1023,6 +1023,68 @@ extern "C" __global__ void q8i_gemm_lds(const float* __restrict__ scales,
     }
 }
 
+
+// 2 rows/wave variant: each LDS read feeds 2 weight rows (halves LDS traffic).
+// grid=(ceil(out/16), ceil(m/32)), block=256 (8 waves x 2 rows).
+extern "C" __global__ void q8i_gemm_lds2(const float* __restrict__ scales,
+                                         const signed char* __restrict__ quants,
+                                         const signed char* __restrict__ xq,
+                                         const float* __restrict__ xd,
+                                         float* __restrict__ y, int in_dim, int out_dim, int m) {
+    int tid = threadIdx.x, l = tid & 31, w = tid >> 5;
+    int r0 = blockIdx.x * 16 + w * 2, t0 = blockIdx.y * 32;
+    int tm = m - t0; if (tm > 32) tm = 32;
+    int nb = in_dim / 32;
+    __shared__ int   xs[32][64];
+    __shared__ float sd[32][8];
+    int e = (l & 7) * 4;
+    float acc0[32] = {0.f}, acc1[32] = {0.f};
+    int has_r1 = r0 + 1 < out_dim;
+    for (int b8 = 0; b8 < nb; b8 += 8) {
+        __syncthreads();
+        {
+            int t = tid >> 3, c = tid & 7;
+            if (t < tm) {
+                const int* src = (const int*)(xq + (long long)(t0 + t) * in_dim + b8 * 32) + c * 8;
+                #pragma unroll
+                for (int q = 0; q < 8; q++) xs[t][c * 8 + q] = src[q];
+                sd[t][c] = b8 + c < nb ? xd[(long long)(t0 + t) * nb + b8 + c] : 0.f;
+            }
+        }
+        __syncthreads();
+        if (r0 >= out_dim) continue;
+        int bi0 = b8 + (l >> 3);
+        int has1 = bi0 + 4 < nb;
+        long long rb0 = (long long)r0 * nb, rb1 = rb0 + nb;
+        float a0 = scales[rb0 + bi0];
+        float a1 = has1 ? scales[rb0 + bi0 + 4] : 0.f;
+        float b0 = has_r1 ? scales[rb1 + bi0] : 0.f;
+        float b1 = (has_r1 && has1) ? scales[rb1 + bi0 + 4] : 0.f;
+        const int wa0 = *(const int*)(quants + ((rb0 + bi0) * 32 + e));
+        const int wa1 = has1 ? *(const int*)(quants + ((rb0 + bi0 + 4) * 32 + e)) : 0;
+        const int wb0 = has_r1 ? *(const int*)(quants + ((rb1 + bi0) * 32 + e)) : 0;
+        const int wb1 = (has_r1 && has1) ? *(const int*)(quants + ((rb1 + bi0 + 4) * 32 + e)) : 0;
+        int xo = ((l >> 3) * 32 + e) >> 2;
+        for (int j = 0; j < tm; j++) {
+            int x0 = xs[j][xo], x1 = xs[j][xo + 32];
+            float s0 = sd[j][l >> 3], s1 = sd[j][(l >> 3) + 4];
+            acc0[j] += a0 * s0 * (float)__builtin_amdgcn_sudot4(true, wa0, true, x0, 0, false)
+                     + a1 * s1 * (float)__builtin_amdgcn_sudot4(true, wa1, true, x1, 0, false);
+            acc1[j] += b0 * s0 * (float)__builtin_amdgcn_sudot4(true, wb0, true, x0, 0, false)
+                     + b1 * s1 * (float)__builtin_amdgcn_sudot4(true, wb1, true, x1, 0, false);
+        }
+    }
+    if (r0 >= out_dim) return;
+    for (int j = 0; j < tm; j++) {
+        float a = acc0[j];
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_down(a, o);
+        if (l == 0) y[(long long)(t0 + j) * out_dim + r0] = a;
+        float b = acc1[j];
+        for (int o = 16; o > 0; o >>= 1) b += __shfl_down(b, o);
+        if (l == 0 && has_r1) y[(long long)(t0 + j) * out_dim + r0 + 1] = b;
+    }
+}
+
 // ===== Native-Q6_K MoE GEMV (NO repack: 210 B/superblock as in the GGUF) =====
 // w = full 3D expert tensor (native bytes), expert stride ebytes. Per superblock:
 // ql[128] qh[64] sc[16xi8] d[f16]. 8 waves/block, 32 lanes on the SAME superblock

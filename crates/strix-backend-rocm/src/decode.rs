@@ -369,6 +369,7 @@ impl RocmWeightAccel {
             "xquant8_rows",
             "q8i_gemm_rows32",
             "q8i_gemm_lds",
+            "q8i_gemm_lds2",
             "q6_gemm_rows",
             "q6_gemm_moe",
             "moe_silu_mul",
@@ -2419,8 +2420,8 @@ impl WeightAccel for RocmWeightAccel {
         if self.mlm_int8 {
             let (xq, xd) = self.pf_quant(self.pf_x.ptr, m, e.in_dim);
             self.launch2(
-                "q8i_gemm_lds",
-                e.out_dim.div_ceil(8) as u32,
+                "q8i_gemm_lds2",
+                e.out_dim.div_ceil(16) as u32,
                 m.div_ceil(32) as u32,
                 256,
                 0,
@@ -2624,8 +2625,8 @@ impl WeightAccel for RocmWeightAccel {
             let qp = unsafe { (qb2.ptr as *mut i8).add(eoff * 32) } as *mut c_void;
             if let Some((xq, xd)) = xqd {
                 self.launch2(
-                    "q8i_gemm_lds",
-                    mo.eff.div_ceil(8) as u32,
+                    "q8i_gemm_lds2",
+                    mo.eff.div_ceil(16) as u32,
                     m.div_ceil(32) as u32,
                     256,
                     0,
@@ -2677,8 +2678,8 @@ impl WeightAccel for RocmWeightAccel {
         if self.mlm_int8 {
             let (xq, xd) = self.pf_quant(self.pf_b.ptr, m, mo.eff);
             self.launch2(
-                "q8i_gemm_lds",
-                mo.hidden.div_ceil(8) as u32,
+                "q8i_gemm_lds2",
+                mo.hidden.div_ceil(16) as u32,
                 m.div_ceil(32) as u32,
                 256,
                 0,
@@ -2810,8 +2811,8 @@ impl WeightAccel for RocmWeightAccel {
             if self.mlm_int8 {
                 let (xq, xd) = self.pf_quant(self.pf_x.ptr, m, e.in_dim);
                 self.launch2(
-                    "q8i_gemm_lds",
-                    oc.div_ceil(8) as u32,
+                    "q8i_gemm_lds2",
+                    oc.div_ceil(16) as u32,
                     m.div_ceil(32) as u32,
                     256,
                     0,
