@@ -1490,7 +1490,7 @@ impl WeightAccel for RocmWeightAccel {
             self.launch2(
                 "q6_gemm_rows",
                 mo.eff as u32,
-                m as u32,
+                m.div_ceil(8) as u32,
                 32,
                 0,
                 Args::new()
@@ -1500,7 +1500,8 @@ impl WeightAccel for RocmWeightAccel {
                     .ptr(self.pf_x.ptr)
                     .ptr(y)
                     .i(mo.hidden as i32)
-                    .i(mo.eff as i32),
+                    .i(mo.eff as i32)
+                    .i(m as i32),
             );
         }
         let n_act = m * mo.eff;
@@ -1518,7 +1519,7 @@ impl WeightAccel for RocmWeightAccel {
         self.launch2(
             "q6_gemm_rows",
             mo.hidden as u32,
-            m as u32,
+            m.div_ceil(8) as u32,
             32,
             0,
             Args::new()
@@ -1528,7 +1529,8 @@ impl WeightAccel for RocmWeightAccel {
                 .ptr(self.pf_x.ptr)
                 .ptr(self.pf_y.ptr)
                 .i(mo.eff as i32)
-                .i(mo.hidden as i32),
+                .i(mo.hidden as i32)
+                .i(m as i32),
         );
         self.gpu.sync().ok()?;
         self.pf_y.download::<f32>(m * mo.hidden).ok()
@@ -1567,7 +1569,7 @@ impl WeightAccel for RocmWeightAccel {
             self.launch2(
                 "q6_gemm_rows",
                 mo.eff as u32,
-                m as u32,
+                m.div_ceil(8) as u32,
                 32,
                 0,
                 Args::new()
@@ -1577,7 +1579,8 @@ impl WeightAccel for RocmWeightAccel {
                     .ptr(xptr)
                     .ptr(y)
                     .i(mo.hidden as i32)
-                    .i(mo.eff as i32),
+                    .i(mo.eff as i32)
+                    .i(m as i32),
             );
         }
         let n_act = m * mo.eff;
@@ -1592,7 +1595,7 @@ impl WeightAccel for RocmWeightAccel {
         self.launch2(
             "q6_gemm_rows",
             mo.hidden as u32,
-            m as u32,
+            m.div_ceil(8) as u32,
             32,
             0,
             Args::new()
@@ -1602,7 +1605,8 @@ impl WeightAccel for RocmWeightAccel {
                 .ptr(a)
                 .ptr(dyp)
                 .i(mo.eff as i32)
-                .i(mo.hidden as i32),
+                .i(mo.hidden as i32)
+                .i(m as i32),
         );
         true
     }
