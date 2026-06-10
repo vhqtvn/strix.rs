@@ -1187,10 +1187,14 @@ extern "C" __global__ void sdpa_rows(const float* __restrict__ q, const float* _
     if (wlen > 2048) wlen = 2048;
     __shared__ float scores[2048];
     __shared__ float red[256];
+    __shared__ float qs[256];
+    for (int d = t; d < hd; d += 256) qs[d] = qr[d];
+    __syncthreads();
     for (int i = t; i < wlen; i += 256) {
         float s = 0.f;
-        long long kb = ((long long)(ws + i) * n_kv + kvh) * hd;
-        for (int d = 0; d < hd; d++) s += qr[d] * kc[kb + d];
+        const float* kr = kc + ((long long)(ws + i) * n_kv + kvh) * hd;
+        #pragma unroll 8
+        for (int d = 0; d < hd; d++) s += qs[d] * kr[d];
         scores[i] = s * scale;
     }
     __syncthreads();
