@@ -2603,42 +2603,19 @@ impl WeightAccel for RocmWeightAccel {
             return false;
         }
         let xoff = dy_off * mo.hidden;
-        if (xoff + m * mo.hidden) > 2048 * 4096 {
+        if (xoff + m * mo.hidden) > 2048 * 4096
+            || self.gpu.upload_at(&self.pf_x, xoff * 4, xs).is_err()
+        {
             return false;
         }
+        let xptr = unsafe { (self.pf_x.ptr as *mut f32).add(xoff) } as *mut c_void;
         let nb = mo.hidden / 32;
         let eoff = eid * mo.eff * nb;
         let xqd = if self.mlm_int8 {
-            // CPU-side per-32 quantize: upload i8 acts + f32 scales (4x fewer HtoD bytes)
-            let nblk = m * nb;
-            let mut q = vec![0i8; nblk * 32];
-            let mut d = vec![0f32; nblk];
-            for b in 0..nblk {
-                let src = &xs[b * 32..b * 32 + 32];
-                let amax = src.iter().fold(0f32, |a, &v| a.max(v.abs()));
-                let sc = amax / 127.0;
-                let inv = if sc > 0.0 { 1.0 / sc } else { 0.0 };
-                d[b] = sc;
-                for j in 0..32 {
-                    q[b * 32 + j] = (src[j] * inv).round_ties_even().clamp(-127.0, 127.0) as i8;
-                }
-            }
-            if self.gpu.upload_at(&self.pf_xq, xoff, &q).is_err()
-                || self.gpu.upload_at(&self.pf_xd, dy_off * nb * 4, &d).is_err()
-            {
-                return false;
-            }
-            Some((
-                unsafe { (self.pf_xq.ptr as *mut u8).add(xoff) } as *mut c_void,
-                unsafe { (self.pf_xd.ptr as *mut f32).add(dy_off * nb) } as *mut c_void,
-            ))
+            Some(self.pf_quant(xptr, m, mo.hidden))
         } else {
-            if self.gpu.upload_at(&self.pf_x, xoff * 4, xs).is_err() {
-                return false;
-            }
             None
         };
-        let xptr = unsafe { (self.pf_x.ptr as *mut f32).add(xoff) } as *mut c_void;
         for (sb, qb2, y) in [
             (&mo.gate_s, &mo.gate_q, self.pf_a.ptr),
             (&mo.up_s, &mo.up_q, self.pf_b.ptr),
