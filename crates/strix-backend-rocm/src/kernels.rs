@@ -638,26 +638,34 @@ extern "C" __global__ void q6_moe_gemv(const unsigned char* __restrict__ w, long
     if (row >= out_dim) return;
     int nb = in_dim / 256;
     const unsigned char* rowp = w + (long long)ids[k] * ebytes + (long long)row * nb * 210;
-    int is = l / 16;
+    // lane l covers positions 4l..4l+3 per half: one unaligned u32 ql load (or hi
+    // nibbles of same bytes for p>=64) + one u32 qh load -> coalesced.
+    int p0 = 4 * l;             // 0..124
+    int lo = p0 < 64;           // lanes 0..15: low nibbles, 16..31: high nibbles
+    int qb = lo ? p0 : p0 - 64; // ql byte base for the 4 positions
     float acc = 0.f;
     for (int bi = 0; bi < nb; bi++) {
         const unsigned char* blk = rowp + bi * 210;
-        const unsigned char* ql = blk;
-        const unsigned char* qh = blk + 128;
         const signed char* sc = (const signed char*)(blk + 192);
         float d = h2f(*(const unsigned short*)(blk + 208));
         int xb = bi * 256;
         for (int half = 0; half < 2; half++) {
-            int q0 = ql[half * 64 + l], q1 = ql[half * 64 + l + 32];
-            int hh = qh[half * 32 + l];
-            int v1 = ((q0 & 0xF) | ((hh & 3) << 4)) - 32;
-            int v2 = ((q1 & 0xF) | (((hh >> 2) & 3) << 4)) - 32;
-            int v3 = ((q0 >> 4) | (((hh >> 4) & 3) << 4)) - 32;
-            int v4 = ((q1 >> 4) | (((hh >> 6) & 3) << 4)) - 32;
-            int pos = half * 128 + l, si = half * 8 + is;
-            acc += d * (sc[si] * v1 * x[xb + pos] + sc[si + 2] * v2 * x[xb + pos + 32]
-                      + sc[si + 4] * v3 * x[xb + pos + 64] + sc[si + 6] * v4 * x[xb + pos + 96]);
-    }
+            const unsigned char* ql = blk + half * 64;
+            const unsigned char* qh = blk + 128 + half * 32;
+            unsigned q4b, h4b;
+            __builtin_memcpy(&q4b, ql + qb, 4);
+            __builtin_memcpy(&h4b, qh + (p0 & 31), 4);
+            int hsh = (p0 >> 5) * 2;
+            float a4 = 0.f;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                int p = p0 + j;
+                int qn = (q4b >> (8 * j)) & 0xFF;
+                int qv = (lo ? (qn & 0xF) : (qn >> 4)) | ((((h4b >> (8 * j)) >> hsh) & 3) << 4);
+                a4 += sc[half * 8 + p / 16] * (qv - 32) * x[xb + half * 128 + p];
+            }
+            acc += d * a4;
+        }
     }
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
     if (l == 0) y[(long long)k * out_dim + row] = acc;
