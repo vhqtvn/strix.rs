@@ -491,7 +491,7 @@ impl RocmWeightAccel {
             mlm_xq,
             mlm_arg,
             mlm_xd,
-            mlm_int8: std::env::var("STRIX_INT8").is_ok(),
+            mlm_int8: std::env::var("STRIX_NO_INT8").is_err(),
             mlm_graph: None,
             mlm_seq: 0,
             batch_x,
