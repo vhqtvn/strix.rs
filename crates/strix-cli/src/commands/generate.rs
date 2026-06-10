@@ -350,10 +350,26 @@ fn run_mellum(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Res
     if lookup {
         // Lossless n-gram lookup speculation: propose continuation from history,
         // verify all candidates in ONE batched forward, accept matching prefix.
-        let gamma = 8usize;
+        // Small-K speculation (Cascade-style): MoE verify reads the expert UNION, so
+        // bytes grow with K. K=3 → union ~1.6-2x bytes; net win iff acceptance is good.
+        // Utility gate: 4 zero-acceptance rounds in a row → plain decode for 96 tokens.
+        let gamma = std::env::var("STRIX_GAMMA")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3usize);
+        let mut zero_rounds = 0usize;
+        let mut plain_left = 0usize;
         let mut ctx: Vec<u32> = prompt_ids.clone();
         ctx.push(next);
         while generated.len() < max_tokens {
+            if plain_left > 0 {
+                plain_left -= 1;
+                let l = model.decode_one(next).context("mellum decode")?;
+                next = sampler.sample(&l)?;
+                generated.push(next);
+                ctx.push(next);
+                continue;
+            }
             // propose: longest n-gram (3..1) suffix match in history
             let mut prop: Vec<u32> = Vec::new();
             'find: for n in (1..=3usize).rev() {
@@ -392,6 +408,15 @@ fn run_mellum(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Res
             ctx.push(next);
             // rollback the rejected suffix (we forwarded all gamma candidates)
             model.rollback(pos0 + acc + 1);
+            if acc == 0 {
+                zero_rounds += 1;
+                if zero_rounds >= 4 {
+                    zero_rounds = 0;
+                    plain_left = 96;
+                }
+            } else {
+                zero_rounds = 0;
+            }
         }
     } else {
         for _ in 1..max_tokens {

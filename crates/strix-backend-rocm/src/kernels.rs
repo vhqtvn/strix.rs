@@ -1236,36 +1236,51 @@ extern "C" __global__ void q8w_gemm(const float* __restrict__ scales,
                                     const signed char* __restrict__ xq,
                                     const float* __restrict__ xd,
                                     float* __restrict__ y, int in_dim, int out_dim, int m) {
-    int lane = threadIdx.x & 31, t = lane & 15, hs = lane >> 4;
-    int row0 = blockIdx.x * 16, tok0 = blockIdx.y * 16;
+    int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, t = lane & 15, hs = lane >> 4;
+    int row0 = blockIdx.x * 128 + w * 16, tok0 = blockIdx.y * 16;
     int nb = in_dim / 32;
     int rrow = row0 + t;
-    int rtok = tok0 + t;
-    bool rok = rrow < out_dim, tok_ok = rtok < m;
+    bool rok = rrow < out_dim;
+    __shared__ int bt[16][64];      // 16 tokens x 256 i8 (8 K-blocks)
+    __shared__ float bd[16][8];
     float facc[8] = {0.f};
-    for (int blk = 0; blk < nb; blk++) {
-        v4i a0 = {0, 0, 0, 0}, a1 = {0, 0, 0, 0}, b0 = {0, 0, 0, 0}, b1 = {0, 0, 0, 0};
-        if (rok) {
-            const int* wp = (const int*)(quants + ((long long)rrow * nb + blk) * 32);
-            a0[0] = wp[0]; a0[1] = wp[1]; a0[2] = wp[2]; a0[3] = wp[3];
-            a1[0] = wp[4]; a1[1] = wp[5]; a1[2] = wp[6]; a1[3] = wp[7];
+    for (int b8 = 0; b8 < nb; b8 += 8) {
+        __syncthreads();
+        {
+            int tk = tid >> 4, c = tid & 15;   // 16 threads per token, 4 ints each
+            if (tok0 + tk < m) {
+                const int* xp = (const int*)(xq + (long long)(tok0 + tk) * in_dim + b8 * 32) + c * 4;
+                #pragma unroll
+                for (int q = 0; q < 4; q++) bt[tk][c * 4 + q] = xp[q];
+                if (c < 8) bd[tk][c] = b8 + c < nb ? xd[(long long)(tok0 + tk) * nb + b8 + c] : 0.f;
+            } else if (tok0 + tk < 16 + tok0) {
+                #pragma unroll
+                for (int q = 0; q < 4; q++) bt[tk][c * 4 + q] = 0;
+                if (c < 8) bd[tk][c] = 0.f;
+            }
         }
-        if (tok_ok) {
-            const int* xp = (const int*)(xq + (long long)rtok * in_dim + blk * 32);
-            b0[0] = xp[0]; b0[1] = xp[1]; b0[2] = xp[2]; b0[3] = xp[3];
-            b1[0] = xp[4]; b1[1] = xp[5]; b1[2] = xp[6]; b1[3] = xp[7];
-        }
-        v8i acc = {0, 0, 0, 0, 0, 0, 0, 0};
-        acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, acc, true);
-        acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, acc, true);
-        // scale: row = t (A row), col j -> token tok0 + 2l + hs
-        float dw = rok ? scales[(long long)rrow * nb + blk] : 0.f;
-        #pragma unroll
-        for (int l = 0; l < 8; l++) {
-            int col = 2 * l + hs;
-            int tok = tok0 + col;
-            float dx = tok < m ? xd[(long long)tok * nb + blk] : 0.f;
-            facc[l] += dw * dx * (float)acc[l];
+        __syncthreads();
+        int bmax = nb - b8 < 8 ? nb - b8 : 8;
+        for (int bi = 0; bi < bmax; bi++) {
+            int blk = b8 + bi;
+            v4i a0 = {0, 0, 0, 0}, a1 = {0, 0, 0, 0};
+            if (rok) {
+                const int* wp = (const int*)(quants + ((long long)rrow * nb + blk) * 32);
+                a0[0] = wp[0]; a0[1] = wp[1]; a0[2] = wp[2]; a0[3] = wp[3];
+                a1[0] = wp[4]; a1[1] = wp[5]; a1[2] = wp[6]; a1[3] = wp[7];
+            }
+            v4i b0, b1;
+            #pragma unroll
+            for (int q = 0; q < 4; q++) { b0[q] = bt[t][bi * 8 + q]; b1[q] = bt[t][bi * 8 + 4 + q]; }
+            v8i acc = {0, 0, 0, 0, 0, 0, 0, 0};
+            acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, acc, true);
+            acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, acc, true);
+            float dw = rok ? scales[(long long)rrow * nb + blk] : 0.f;
+            #pragma unroll
+            for (int l = 0; l < 8; l++) {
+                int col = 2 * l + hs;
+                facc[l] += dw * bd[col][bi] * (float)acc[l];
+            }
         }
     }
     #pragma unroll
