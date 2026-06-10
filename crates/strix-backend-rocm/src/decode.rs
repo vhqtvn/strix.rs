@@ -796,7 +796,11 @@ impl RocmWeightAccel {
                 onb as u32,
                 32,
                 0,
-                Args::new().ptr(self.mlm_attn.ptr).ptr(xqo).ptr(xdo).i(onb as i32),
+                Args::new()
+                    .ptr(self.mlm_attn.ptr)
+                    .ptr(xqo)
+                    .ptr(xdo)
+                    .i(onb as i32),
             );
             self.launch(
                 "q8i_gemv",
@@ -1092,7 +1096,11 @@ impl RocmWeightAccel {
                 onb as u32,
                 32,
                 0,
-                Args::new().ptr(self.mlm_attn.ptr).ptr(xqo).ptr(xdo).i(onb as i32),
+                Args::new()
+                    .ptr(self.mlm_attn.ptr)
+                    .ptr(xqo)
+                    .ptr(xdo)
+                    .i(onb as i32),
             );
             self.launch(
                 "q8i_gemv",

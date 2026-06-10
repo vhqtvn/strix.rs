@@ -250,11 +250,9 @@ impl GgufFile {
             // SAFETY: `self.mmap` is a read-only shared file mapping; MADV_DONTNEED only
             // discards cached pages, which re-fault from the file on next read.
             unsafe {
-                let _ = self.mmap.unchecked_advise_range(
-                    memmap2::UncheckedAdvice::DontNeed,
-                    a,
-                    b - a,
-                );
+                let _ =
+                    self.mmap
+                        .unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, a, b - a);
             }
         }
     }
