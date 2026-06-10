@@ -8,7 +8,14 @@
 //! (with correct shapes). The forward (P1 MoE, P2 attn, P3 gated-deltanet) is TODO.
 
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 use strix_core::backend::Decoder;
+static PROF_GEMM: AtomicU64 = AtomicU64::new(0);
+static PROF_SCAN: AtomicU64 = AtomicU64::new(0);
+static PROF_SDPA: AtomicU64 = AtomicU64::new(0);
+fn padd(c: &AtomicU64, t: std::time::Instant) {
+    c.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
 use strix_core::error::{Result, StrixError};
 use strix_core::sampler::Logits;
 use strix_models::ggml_quant::{dequantize_into, GgmlType};
@@ -361,6 +368,11 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     }
     s
 }
+
+/// Shareable raw f32 pointer for disjoint-index parallel writes.
+struct SendPtrF(*mut f32);
+unsafe impl Sync for SendPtrF {}
+unsafe impl Send for SendPtrF {}
 
 /// A resolved weight: raw bytes + ggml type + the row length (in_dim).
 struct W<'a> {
@@ -765,7 +777,12 @@ impl Qwen35Model {
             t_moe += t1.elapsed().as_secs_f64();
         }
         if prof {
-            eprintln!("[prefill prof] mixer {t_mix:.2}s | moe {t_moe:.2}s");
+            eprintln!(
+                "[prefill prof] mixer {t_mix:.2}s (dn-gemm {:.2}s scan {:.2}s sdpa {:.2}s) | moe {t_moe:.2}s",
+                PROF_GEMM.load(Ordering::Relaxed) as f64 / 1e6,
+                PROF_SCAN.load(Ordering::Relaxed) as f64 / 1e6,
+                PROF_SDPA.load(Ordering::Relaxed) as f64 / 1e6,
+            );
         }
         self.pos += m;
 
@@ -844,6 +861,7 @@ impl Qwen35Model {
         let base_pos = self.pos;
         let scale = 1.0 / (hd as f32).sqrt();
         let mut attn_out = vec![0.0f32; m * q_dim];
+        let tsd = std::time::Instant::now();
         attn_out
             .par_chunks_mut(q_dim)
             .enumerate()
@@ -922,6 +940,7 @@ impl Qwen35Model {
         let mut beta_raw = vec![0.0f32; m * n_vh];
         let mut alpha_raw = vec![0.0f32; m * n_vh];
         {
+            let tp = std::time::Instant::now();
             if !self.gpu_gemm(&b("attn_qkv.weight"), x, m, hidden, conv_dim, &mut qkv)
                 && !self.npu_proj(0, il, x, m, hidden, conv_dim, &mut qkv)
             {
@@ -938,97 +957,118 @@ impl Qwen35Model {
             qmatmul_batch(&mut beta_raw, x, m, wbeta.bytes, wbeta.ty, hidden, n_vh);
             let walpha = self.w(&b("ssm_alpha.weight"))?;
             qmatmul_batch(&mut alpha_raw, x, m, walpha.bytes, walpha.ty, hidden, n_vh);
+            padd(&PROF_GEMM, tp);
         }
 
-        let mut gated = vec![0.0f32; m * value_dim];
-        for t in 0..m {
-            // causal conv + state shift (same as deltanet())
+        let tscan = std::time::Instant::now();
+        // Phase A: conv for ALL tokens — per channel serial over t, parallel channels.
+        let mut conv_all = vec![0.0f32; m * conv_dim];
+        {
             let cs = &mut self.conv[il];
-            let qkv_t = &qkv[t * conv_dim..(t + 1) * conv_dim];
-            let mut conv_out = vec![0.0f32; conv_dim];
-            // channels are independent (state slice per channel) — parallelize
-            conv_out
-                .par_iter_mut()
-                .zip(cs.par_chunks_mut(dconv - 1))
+            let cap = SendPtrF(conv_all.as_mut_ptr());
+            let cap = &cap;
+            cs.par_chunks_mut(dconv - 1)
                 .enumerate()
-                .for_each(|(c, (co, csb))| {
-                    let mut acc = 0.0f32;
-                    for kk in 0..dconv - 1 {
-                        acc += conv_w[c * dconv + kk] * csb[kk];
+                .for_each(|(c, csb)| {
+                    for t in 0..m {
+                        let xv = qkv[t * conv_dim + c];
+                        let mut acc = 0.0f32;
+                        for kk in 0..dconv - 1 {
+                            acc += conv_w[c * dconv + kk] * csb[kk];
+                        }
+                        acc += conv_w[c * dconv + (dconv - 1)] * xv;
+                        unsafe { *cap.0.add(t * conv_dim + c) = silu(acc) };
+                        for kk in 0..dconv - 2 {
+                            csb[kk] = csb[kk + 1];
+                        }
+                        csb[dconv - 2] = xv;
                     }
-                    acc += conv_w[c * dconv + (dconv - 1)] * qkv_t[c];
-                    *co = silu(acc);
-                    for kk in 0..dconv - 2 {
-                        csb[kk] = csb[kk + 1];
-                    }
-                    csb[dconv - 2] = qkv_t[c];
                 });
-            let q = &conv_out[0..key_dim];
-            let kvec = &conv_out[key_dim..2 * key_dim];
-            let v = &conv_out[2 * key_dim..2 * key_dim + value_dim];
-            let mut qn = q.to_vec();
-            let mut kn = kvec.to_vec();
-            for kh in 0..n_kh {
-                l2norm(&mut qn[kh * s_v..kh * s_v + s_v], cfg.rms_eps);
-                l2norm(&mut kn[kh * s_v..kh * s_v + s_v], cfg.rms_eps);
-            }
-            let scale = 1.0 / (s_v as f32).sqrt();
-            // v-heads are independent: scan all 32 in parallel (state slices disjoint).
-            let st_all = &mut self.ssm[il];
-            let mut core = vec![0.0f32; value_dim];
-            core.par_chunks_mut(s_v)
-                .zip(st_all.par_chunks_mut(s_v * s_v))
+        }
+        // Phase B: per-token q/k L2 norms (parallel over tokens).
+        let mut qn_all = vec![0.0f32; m * key_dim];
+        let mut kn_all = vec![0.0f32; m * key_dim];
+        qn_all
+            .par_chunks_mut(key_dim)
+            .zip(kn_all.par_chunks_mut(key_dim))
+            .enumerate()
+            .for_each(|(t, (qn, kn))| {
+                qn.copy_from_slice(&conv_all[t * conv_dim..t * conv_dim + key_dim]);
+                kn.copy_from_slice(&conv_all[t * conv_dim + key_dim..t * conv_dim + 2 * key_dim]);
+                for kh in 0..n_kh {
+                    l2norm(&mut qn[kh * s_v..kh * s_v + s_v], cfg.rms_eps);
+                    l2norm(&mut kn[kh * s_v..kh * s_v + s_v], cfg.rms_eps);
+                }
+            });
+        // Phase C: delta-rule scan — heads parallel, tokens serial per head.
+        let scale = 1.0 / (s_v as f32).sqrt();
+        let mut core_all = vec![0.0f32; m * value_dim];
+        {
+            let cap = SendPtrF(core_all.as_mut_ptr());
+            let cap = &cap;
+            self.ssm[il]
+                .par_chunks_mut(s_v * s_v)
                 .enumerate()
-                .for_each(|(vh, (outh, st))| {
+                .for_each(|(vh, st)| {
                     let kh = vh % n_kh;
-                    let qh = &qn[kh * s_v..kh * s_v + s_v];
-                    let kk = &kn[kh * s_v..kh * s_v + s_v];
-                    let vv = &v[vh * s_v..vh * s_v + s_v];
-                    let g = ssm_a[vh] * softplus(alpha_raw[t * n_vh + vh] + ssm_dt[vh]);
-                    let betah = sigmoid(beta_raw[t * n_vh + vh]);
-                    let decay = g.exp();
-                    for xx in st.iter_mut() {
-                        *xx *= decay;
-                    }
                     let mut delta = vec![0.0f32; s_v];
-                    for j in 0..s_v {
-                        let rowj = &st[j * s_v..j * s_v + s_v];
-                        let mut sum = 0.0f32;
-                        for i in 0..s_v {
-                            sum += rowj[i] * kk[i];
+                    for t in 0..m {
+                        let qh = &qn_all[t * key_dim + kh * s_v..t * key_dim + kh * s_v + s_v];
+                        let kk = &kn_all[t * key_dim + kh * s_v..t * key_dim + kh * s_v + s_v];
+                        let vv = &conv_all[t * conv_dim + 2 * key_dim + vh * s_v
+                            ..t * conv_dim + 2 * key_dim + vh * s_v + s_v];
+                        let g = ssm_a[vh] * softplus(alpha_raw[t * n_vh + vh] + ssm_dt[vh]);
+                        let betah = sigmoid(beta_raw[t * n_vh + vh]);
+                        let decay = g.exp();
+                        for xx in st.iter_mut() {
+                            *xx *= decay;
                         }
-                        delta[j] = (vv[j] - sum) * betah;
-                    }
-                    for j in 0..s_v {
-                        let dj = delta[j];
-                        let rowj = &mut st[j * s_v..j * s_v + s_v];
-                        for i in 0..s_v {
-                            rowj[i] += dj * kk[i];
+                        for j in 0..s_v {
+                            let rowj = &st[j * s_v..j * s_v + s_v];
+                            let mut sum = 0.0f32;
+                            for i in 0..s_v {
+                                sum += rowj[i] * kk[i];
+                            }
+                            delta[j] = (vv[j] - sum) * betah;
                         }
-                    }
-                    for j in 0..s_v {
-                        let rowj = &st[j * s_v..j * s_v + s_v];
-                        let mut sum = 0.0f32;
-                        for i in 0..s_v {
-                            sum += rowj[i] * qh[i];
+                        for j in 0..s_v {
+                            let dj = delta[j];
+                            let rowj = &mut st[j * s_v..j * s_v + s_v];
+                            for i in 0..s_v {
+                                rowj[i] += dj * kk[i];
+                            }
                         }
-                        outh[j] = sum * scale;
+                        for j in 0..s_v {
+                            let rowj = &st[j * s_v..j * s_v + s_v];
+                            let mut sum = 0.0f32;
+                            for i in 0..s_v {
+                                sum += rowj[i] * qh[i];
+                            }
+                            unsafe { *cap.0.add(t * value_dim + vh * s_v + j) = sum * scale };
+                        }
                     }
                 });
-            for vh in 0..n_vh {
+        }
+        // Phase D: gated norm (parallel over t,heads).
+        let mut gated = vec![0.0f32; m * value_dim];
+        gated
+            .par_chunks_mut(s_v)
+            .enumerate()
+            .for_each(|(idx, gout)| {
+                let t = idx / n_vh;
+                let vh = idx % n_vh;
                 let mut tmp = vec![0.0f32; s_v];
                 rmsnorm(
                     &mut tmp,
-                    &core[vh * s_v..vh * s_v + s_v],
+                    &core_all[t * value_dim + vh * s_v..t * value_dim + vh * s_v + s_v],
                     &ssm_norm,
                     cfg.rms_eps,
                 );
                 for j in 0..s_v {
-                    gated[t * value_dim + vh * s_v + j] =
-                        tmp[j] * silu(z[t * value_dim + vh * s_v + j]);
+                    gout[j] = tmp[j] * silu(z[t * value_dim + vh * s_v + j]);
                 }
-            }
-        }
+            });
+        padd(&PROF_SCAN, tscan);
         let mut o = vec![0.0f32; m * hidden];
         if !self.gpu_gemm(&b("ssm_out.weight"), &gated, m, value_dim, hidden, &mut o)
             && !self.npu_proj(2, il, &gated, m, value_dim, hidden, &mut o)

@@ -704,7 +704,15 @@ impl MellumModel {
     }
 
     /// iGPU dense GEMM for batched prefill (chunks of 256). False = fall back.
-    fn gpu_gemm(&self, key: &str, xs: &[f32], m: usize, in_dim: usize, out_dim: usize, out: &mut [f32]) -> bool {
+    fn gpu_gemm(
+        &self,
+        key: &str,
+        xs: &[f32],
+        m: usize,
+        in_dim: usize,
+        out_dim: usize,
+        out: &mut [f32],
+    ) -> bool {
         let Some(a) = &self.accel else { return false };
         for c in (0..m).step_by(256) {
             let mc = (m - c).min(256);
@@ -938,17 +946,20 @@ impl MellumModel {
             }
             {
                 if !self.gpu_gemm(&b("attn_q.weight"), &n, m, hidden, q_dim, &mut q)
-                    && !self.npu_mm(il, 0, &n, m, hidden, q_dim, &mut q) {
+                    && !self.npu_mm(il, 0, &n, m, hidden, q_dim, &mut q)
+                {
                     let wq = self.w(&b("attn_q.weight"))?;
                     qmatmul_batch(&mut q, &n, m, wq.bytes, wq.ty, hidden, q_dim);
                 }
                 if !self.gpu_gemm(&b("attn_k.weight"), &n, m, hidden, kv_dim, &mut k)
-                    && !self.npu_mm(il, 2, &n, m, hidden, kv_dim, &mut k) {
+                    && !self.npu_mm(il, 2, &n, m, hidden, kv_dim, &mut k)
+                {
                     let wk = self.w(&b("attn_k.weight"))?;
                     qmatmul_batch(&mut k, &n, m, wk.bytes, wk.ty, hidden, kv_dim);
                 }
                 if !self.gpu_gemm(&b("attn_v.weight"), &n, m, hidden, kv_dim, &mut v)
-                    && !self.npu_mm(il, 3, &n, m, hidden, kv_dim, &mut v) {
+                    && !self.npu_mm(il, 3, &n, m, hidden, kv_dim, &mut v)
+                {
                     let wv = self.w(&b("attn_v.weight"))?;
                     qmatmul_batch(&mut v, &n, m, wv.bytes, wv.ty, hidden, kv_dim);
                 }
@@ -1042,8 +1053,15 @@ impl MellumModel {
                         ao[hh * hd..hh * hd + hd].copy_from_slice(&oh);
                     }
                 });
-            if !self.gpu_gemm(&b("attn_output.weight"), &attn_out, m, q_dim, hidden, &mut o)
-                && !self.npu_mm(il, 1, &attn_out, m, q_dim, hidden, &mut o) {
+            if !self.gpu_gemm(
+                &b("attn_output.weight"),
+                &attn_out,
+                m,
+                q_dim,
+                hidden,
+                &mut o,
+            ) && !self.npu_mm(il, 1, &attn_out, m, q_dim, hidden, &mut o)
+            {
                 let wo = self.w(&b("attn_output.weight"))?;
                 qmatmul_batch(&mut o, &attn_out, m, wo.bytes, wo.ty, q_dim, hidden);
             }
@@ -1125,7 +1143,9 @@ impl MellumModel {
                         for &(e, o) in &plan {
                             for (i, &(t, s)) in by_exp[e].iter().enumerate() {
                                 dy[(t * topk + s) * hidden..(t * topk + s + 1) * hidden]
-                                    .copy_from_slice(&d_all[(o + i) * hidden..(o + i + 1) * hidden]);
+                                    .copy_from_slice(
+                                        &d_all[(o + i) * hidden..(o + i + 1) * hidden],
+                                    );
                             }
                         }
                         gpu_done = true;
