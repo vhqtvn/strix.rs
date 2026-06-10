@@ -724,6 +724,35 @@ extern "C" __global__ void q8_moe_gemv_rows(const float* __restrict__ scales,
     if (l == 0) y[(long long)k * out_dim + row] = acc;
 }
 
+
+// q/k/v in ONE launch via grid.x concat: rows [0,oq) -> q, [oq,oq+okv) -> k,
+// [oq+okv, oq+2*okv) -> v. No idle blocks. grid=(oq+2*okv), block=32.
+extern "C" __global__ void q8_qkv_gemv(const float* __restrict__ qs, const signed char* __restrict__ qq,
+                                       const float* __restrict__ ks, const signed char* __restrict__ kq,
+                                       const float* __restrict__ vs, const signed char* __restrict__ vq,
+                                       const float* __restrict__ x,
+                                       float* __restrict__ yq, float* __restrict__ yk, float* __restrict__ yv,
+                                       int in_dim, int oq, int okv) {
+    int l = threadIdx.x & 31;
+    int row = blockIdx.x;
+    const float* scales; const signed char* quants; float* y;
+    if (row < oq) { scales = qs; quants = qq; y = yq; }
+    else if (row < oq + okv) { scales = ks; quants = kq; y = yk; row -= oq; }
+    else { scales = vs; quants = vq; y = yv; row -= oq + okv; }
+    int nb = in_dim / 32, rb = row * nb;
+    float acc = 0.f;
+    for (int b4 = 0; b4 < nb; b4 += 4) {
+        int bi = b4 + (l >> 3);
+        float d = scales[rb + bi];
+        int e = (l & 7) * 4;
+        const char4 q = *(const char4*)(quants + ((long long)(rb + bi) * 32 + e));
+        const float* xb = x + bi * 32 + e;
+        acc += d * (q.x * xb[0] + q.y * xb[1] + q.z * xb[2] + q.w * xb[3]);
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
+    if (l == 0) y[row] = acc;
+}
+
 // ===== Native-Q6_K MoE GEMV (NO repack: 210 B/superblock as in the GGUF) =====
 // w = full 3D expert tensor (native bytes), expert stride ebytes. Per superblock:
 // ql[128] qh[64] sc[16xi8] d[f16]. 8 waves/block, 32 lanes on the SAME superblock

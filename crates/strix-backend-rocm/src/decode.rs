@@ -350,6 +350,7 @@ impl RocmWeightAccel {
             "q8_moe_gemv_rows",
             "q8_moe_gemv_gu",
             "q8_moe_down",
+            "q8_qkv_gemv",
             "q6_moe_gemv",
             "q8_gemm_rows",
             "q6_gemm_rows",
@@ -617,9 +618,26 @@ impl RocmWeightAccel {
             (self.mlm_cs.ptr, self.mlm_sn.ptr)
         };
         self.norm_launch(self.mlm_h.ptr, nw.ptr, self.mlm_n.ptr, hidden);
-        self.q8_launch(wq, self.mlm_n.ptr, self.mlm_q.ptr);
-        self.q8_launch(wk, self.mlm_n.ptr, self.mlm_k.ptr);
-        self.q8_launch(wv, self.mlm_n.ptr, self.mlm_v.ptr);
+        self.launch(
+            "q8_qkv_gemv",
+            (q_dim + 2 * kv_dim) as u32,
+            32,
+            0,
+            Args::new()
+                .ptr(wq.scales.ptr)
+                .ptr(wq.quants.ptr)
+                .ptr(wk.scales.ptr)
+                .ptr(wk.quants.ptr)
+                .ptr(wv.scales.ptr)
+                .ptr(wv.quants.ptr)
+                .ptr(self.mlm_n.ptr)
+                .ptr(self.mlm_q.ptr)
+                .ptr(self.mlm_k.ptr)
+                .ptr(self.mlm_v.ptr)
+                .i(hidden as i32)
+                .i(q_dim as i32)
+                .i(kv_dim as i32),
+        );
         self.launch(
             "rmsnorm",
             nh as u32,
@@ -806,9 +824,26 @@ impl RocmWeightAccel {
             }
         }
         self.norm_launch(self.mlm_h.ptr, nw.ptr, self.mlm_n.ptr, hidden);
-        self.q8_launch(wq, self.mlm_n.ptr, self.mlm_q.ptr);
-        self.q8_launch(wk, self.mlm_n.ptr, self.mlm_k.ptr);
-        self.q8_launch(wv, self.mlm_n.ptr, self.mlm_v.ptr);
+        self.launch(
+            "q8_qkv_gemv",
+            (q_dim + 2 * kv_dim) as u32,
+            32,
+            0,
+            Args::new()
+                .ptr(wq.scales.ptr)
+                .ptr(wq.quants.ptr)
+                .ptr(wk.scales.ptr)
+                .ptr(wk.quants.ptr)
+                .ptr(wv.scales.ptr)
+                .ptr(wv.quants.ptr)
+                .ptr(self.mlm_n.ptr)
+                .ptr(self.mlm_q.ptr)
+                .ptr(self.mlm_k.ptr)
+                .ptr(self.mlm_v.ptr)
+                .i(hidden as i32)
+                .i(q_dim as i32)
+                .i(kv_dim as i32),
+        );
         self.launch(
             "rmsnorm",
             nh as u32,
