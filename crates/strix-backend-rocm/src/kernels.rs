@@ -1306,7 +1306,9 @@ extern "C" __global__ void q8w_gemm32(const float* __restrict__ scales,
     bool rok = rrow < out_dim;
     __shared__ int bt[32][32];
     __shared__ float bd[32][4];
+    __shared__ float ws[4][128];
     float f0[8] = {0.f}, f1[8] = {0.f};
+    int rbase = blockIdx.x * 128;
     for (int b4 = 0; b4 < nb; b4 += 4) {
         __syncthreads();
         {
@@ -1320,6 +1322,14 @@ extern "C" __global__ void q8w_gemm32(const float* __restrict__ scales,
                 #pragma unroll
                 for (int q = 0; q < 4; q++) bt[tk][c * 4 + q] = 0;
                 if (c < 4) bd[tk][c] = 0.f;
+            }
+            // stage A scales: 128 rows x up to 4 blocks
+            int rr = tid & 127, bb = tid >> 7;
+            #pragma unroll
+            for (int half = 0; half < 2; half++) {
+                int blk = b4 + bb + 2 * half;
+                int r = rbase + rr;
+                ws[bb + 2 * half][rr] = (r < out_dim && blk < nb) ? scales[(long long)r * nb + blk] : 0.f;
             }
         }
         __syncthreads();
@@ -1344,10 +1354,10 @@ extern "C" __global__ void q8w_gemm32(const float* __restrict__ scales,
             acc1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, c0, acc1, true);
             acc1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, c1, acc1, true);
             float dx0 = bd[t][bi], dx1 = bd[t + 16][bi];
+            int rl0 = w * 16 + hs;
             #pragma unroll
             for (int l = 0; l < 8; l++) {
-                int r = row0 + 2 * l + hs;
-                float dw = r < out_dim ? scales[(long long)r * nb + blk] : 0.f;
+                float dw = ws[bi][rl0 + 2 * l];
                 f0[l] += dw * dx0 * (float)acc0[l];
                 f1[l] += dw * dx1 * (float)acc1[l];
             }
