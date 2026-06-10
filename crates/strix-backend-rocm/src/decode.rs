@@ -347,6 +347,7 @@ impl RocmWeightAccel {
             "q6_gemv",
             "q8_0_gemv",
             "q8_moe_gemv",
+            "q8_moe_gemv_rows",
             "q6_moe_gemv",
             "q8_gemm_rows",
             "q6_gemm_rows",
@@ -1103,23 +1104,21 @@ impl RocmWeightAccel {
                 .ptr(self.moe_act.ptr)
                 .i(n_act as i32),
         );
-        for e in 0..k {
-            self.launch2(
-                "q8_moe_gemv",
-                m.hidden as u32,
-                1,
-                32,
-                0,
-                Args::new()
-                    .ptr(m.down_s.ptr)
-                    .ptr(m.down_q.ptr)
-                    .ptr(unsafe { (self.moe_ids.ptr as *mut i32).add(e) } as *mut c_void)
-                    .ptr(unsafe { (self.moe_act.ptr as *mut f32).add(e * m.eff) } as *mut c_void)
-                    .ptr(unsafe { (self.moe_dy.ptr as *mut f32).add(e * m.hidden) } as *mut c_void)
-                    .i(m.eff as i32)
-                    .i(m.hidden as i32),
-            );
-        }
+        self.launch2(
+            "q8_moe_gemv_rows",
+            m.hidden as u32,
+            k as u32,
+            32,
+            0,
+            Args::new()
+                .ptr(m.down_s.ptr)
+                .ptr(m.down_q.ptr)
+                .ptr(self.moe_ids.ptr)
+                .ptr(self.moe_act.ptr)
+                .ptr(self.moe_dy.ptr)
+                .i(m.eff as i32)
+                .i(m.hidden as i32),
+        );
         self.launch(
             "moe_wsum",
             m.hidden.div_ceil(256) as u32,

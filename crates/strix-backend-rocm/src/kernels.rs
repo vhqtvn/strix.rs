@@ -625,6 +625,35 @@ extern "C" __global__ void q8_moe_gemv(const float* __restrict__ scales,
     if (l == 0) y[(long long)k * out_dim + row] = acc;
 }
 
+// Down-projection variant: all top-k experts in ONE launch. x = per-k act rows
+// [k][in_dim], y = per-k outputs [k][out_dim]. grid=(out_dim, k), block=32.
+extern "C" __global__ void q8_moe_gemv_rows(const float* __restrict__ scales,
+                                            const signed char* __restrict__ quants,
+                                            const int* __restrict__ ids,
+                                            const float* __restrict__ x,
+                                            float* __restrict__ y, int in_dim, int out_dim) {
+    int l = threadIdx.x & 31;
+    int row = blockIdx.x, k = blockIdx.y;
+    if (row >= out_dim) return;
+    int nb = in_dim / 32;
+    long long eoff = (long long)ids[k] * out_dim * nb;
+    const float* sc = scales + eoff + (long long)row * nb;
+    const signed char* qr = quants + (eoff + (long long)row * nb) * 32;
+    const float* xk = x + (long long)k * in_dim;
+    float acc = 0.f;
+    for (int b4 = 0; b4 < nb; b4 += 4) {
+        int bi = b4 + (l >> 3);
+        if (bi >= nb) continue;
+        float d = sc[bi];
+        int e = (l & 7) * 4;
+        const char4 q = *(const char4*)(qr + (long long)bi * 32 + e);
+        const float* xb = xk + bi * 32 + e;
+        acc += d * (q.x * xb[0] + q.y * xb[1] + q.z * xb[2] + q.w * xb[3]);
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
+    if (l == 0) y[(long long)k * out_dim + row] = acc;
+}
+
 // ===== Native-Q6_K MoE GEMV (NO repack: 210 B/superblock as in the GGUF) =====
 // w = full 3D expert tensor (native bytes), expert stride ebytes. Per superblock:
 // ql[128] qh[64] sc[16xi8] d[f16]. 8 waves/block, 32 lanes on the SAME superblock
