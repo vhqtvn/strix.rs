@@ -34,8 +34,8 @@ __device__ __forceinline__ unsigned short f2h(float f) {
 // const float* (reinterpreted). Lets the SDPA kernels serve either cache format.
 #define KVLD(p, i, kvf16) ((kvf16) ? h2f(((const unsigned short*)(p))[(i)]) : (p)[(i)])
 
-typedef int v4i __attribute__((ext_vector_type(4)));
-typedef int v8i __attribute__((ext_vector_type(8)));
+typedef int w4i_t __attribute__((ext_vector_type(4)));
+typedef int w8i_t __attribute__((ext_vector_type(8)));
 
 // Q4_0 GEMV: f16 scales (1/block) + uint4 quants (16 nibble bytes/block).
 extern "C" __global__ void q4_gemv(const unsigned short* __restrict__ scales,
@@ -426,7 +426,7 @@ extern "C" __global__ __launch_bounds__(256, 3) void q4_gemm_w(const unsigned sh
     for (int b = 0; b < nb; b++) {
         int cur = b & 1;
         if (b + 1 < nb) Q4GEMMW_STAGE(b + 1, (b + 1) & 1);  // prefetch next (loads overlap WMMA below)
-        v4i alo[2], ahi[2]; float xdv[2][8];
+        w4i_t alo[2], ahi[2]; float xdv[2][8];
         #pragma unroll
         for (int mt = 0; mt < 2; mt++) {
             int tg = wt + mt * 4;                 // token subtile 0..7
@@ -438,11 +438,11 @@ extern "C" __global__ __launch_bounds__(256, 3) void q4_gemm_w(const unsigned sh
         #pragma unroll
         for (int rt = 0; rt < 4; rt++) {
             int br = wr * 64 + rt * 16 + (l & 15);
-            v4i blo, bhi; for (int g = 0; g < 4; g++) { blo[g] = sh_blo[cur][br*4+g]; bhi[g] = sh_bhi[cur][br*4+g]; }
+            w4i_t blo, bhi; for (int g = 0; g < 4; g++) { blo[g] = sh_blo[cur][br*4+g]; bhi[g] = sh_bhi[cur][br*4+g]; }
             float wsc = sh_wsc[cur][wr * 64 + rt * 16 + (l & 15)];
             #pragma unroll
             for (int mt = 0; mt < 2; mt++) {
-                v8i c = {0,0,0,0,0,0,0,0};
+                w8i_t c = {0,0,0,0,0,0,0,0};
                 // signed weights (−8 baked in via SUB8) → both operands signed, raw int32 accumulate
                 c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, alo[mt], true, blo, c, false);
                 c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, ahi[mt], true, bhi, c, false);
@@ -491,7 +491,7 @@ extern "C" __global__ __launch_bounds__(256, 3) void q4_gemm_w_sk(const unsigned
     for (int b = b0; b < b1; b++) {
         int cur = b & 1;
         if (b + 1 < b1) Q4GEMMW_STAGE(b + 1, (b + 1) & 1);
-        v4i alo[2], ahi[2]; float xdv[2][8];
+        w4i_t alo[2], ahi[2]; float xdv[2][8];
         #pragma unroll
         for (int mt = 0; mt < 2; mt++) {
             int tg = wt + mt * 4;
@@ -503,11 +503,11 @@ extern "C" __global__ __launch_bounds__(256, 3) void q4_gemm_w_sk(const unsigned
         #pragma unroll
         for (int rt = 0; rt < 4; rt++) {
             int br = wr * 64 + rt * 16 + (l & 15);
-            v4i blo, bhi; for (int g = 0; g < 4; g++) { blo[g] = sh_blo[cur][br*4+g]; bhi[g] = sh_bhi[cur][br*4+g]; }
+            w4i_t blo, bhi; for (int g = 0; g < 4; g++) { blo[g] = sh_blo[cur][br*4+g]; bhi[g] = sh_bhi[cur][br*4+g]; }
             float wsc = sh_wsc[cur][wr * 64 + rt * 16 + (l & 15)];
             #pragma unroll
             for (int mt = 0; mt < 2; mt++) {
-                v8i c = {0,0,0,0,0,0,0,0};
+                w8i_t c = {0,0,0,0,0,0,0,0};
                 c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, alo[mt], true, blo, c, false);
                 c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, ahi[mt], true, bhi, c, false);
                 #pragma unroll
@@ -1229,8 +1229,6 @@ extern "C" __global__ void f32_gemv_rows(const float* __restrict__ w, const floa
 // y[t][row] = W X^T. A = 16 weight rows, B = 16 tokens. Per K-32 block, two WMMA
 // ops accumulate i32; scales applied per block. Lane t<16 holds full 16B K rows
 // (lanes 16-31 replicated). C: lane t, elem l -> row t%16, col 2l + t/16.
-typedef int v4i __attribute__((vector_size(16)));
-typedef int v8i __attribute__((vector_size(32)));
 extern "C" __global__ void q8w_gemm(const float* __restrict__ scales,
                                     const signed char* __restrict__ quants,
                                     const signed char* __restrict__ xq,
@@ -1263,16 +1261,16 @@ extern "C" __global__ void q8w_gemm(const float* __restrict__ scales,
         int bmax = nb - b8 < 8 ? nb - b8 : 8;
         for (int bi = 0; bi < bmax; bi++) {
             int blk = b8 + bi;
-            v4i a0 = {0, 0, 0, 0}, a1 = {0, 0, 0, 0};
+            w4i_t a0 = {0, 0, 0, 0}, a1 = {0, 0, 0, 0};
             if (rok) {
                 const int* wp = (const int*)(quants + ((long long)rrow * nb + blk) * 32);
                 a0[0] = wp[0]; a0[1] = wp[1]; a0[2] = wp[2]; a0[3] = wp[3];
                 a1[0] = wp[4]; a1[1] = wp[5]; a1[2] = wp[6]; a1[3] = wp[7];
             }
-            v4i b0, b1;
+            w4i_t b0, b1;
             #pragma unroll
             for (int q = 0; q < 4; q++) { b0[q] = bt[t][bi * 8 + q]; b1[q] = bt[t][bi * 8 + 4 + q]; }
-            v8i acc = {0, 0, 0, 0, 0, 0, 0, 0};
+            w8i_t acc = {0, 0, 0, 0, 0, 0, 0, 0};
             acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, acc, true);
             acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, acc, true);
             float dw = rok ? scales[(long long)rrow * nb + blk] : 0.f;

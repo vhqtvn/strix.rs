@@ -345,7 +345,13 @@ impl RocmWeightAccel {
     pub fn new() -> Option<Self> {
         let gpu = HipGpu::new().ok()?;
         let name = gpu.adapter_name().to_string();
-        let code = crate::hip::compile(crate::kernels::KERNELS).ok()?;
+        let code = match crate::hip::compile(crate::kernels::KERNELS) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[rocm] kernel compile FAILED: {e}");
+                return None;
+            }
+        };
         let module = gpu.load_module(&code).ok()?;
         let mut funcs = HashMap::new();
         for name in [
