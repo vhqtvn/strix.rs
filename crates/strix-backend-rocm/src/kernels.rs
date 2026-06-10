@@ -1211,6 +1211,19 @@ extern "C" __global__ void sdpa_rows(const float* __restrict__ q, const float* _
     }
 }
 
+
+// router GEMM rows: y[t][row] = w[row] . x[t]; grid=(out, m)
+extern "C" __global__ void f32_gemv_rows(const float* __restrict__ w, const float* __restrict__ x,
+                                         float* __restrict__ y, int in_dim, int out_dim, int m) {
+    int l = threadIdx.x & 31, row = blockIdx.x, t = blockIdx.y;
+    if (row >= out_dim || t >= m) return;
+    const float* xr = x + (long long)t * in_dim;
+    float acc = 0.f;
+    for (int i = l; i < in_dim; i += 32) acc += w[(long long)row * in_dim + i] * xr[i];
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
+    if (l == 0) y[(long long)t * out_dim + row] = acc;
+}
+
 // ===== Native-Q6_K MoE GEMV (NO repack: 210 B/superblock as in the GGUF) =====
 // w = full 3D expert tensor (native bytes), expert stride ebytes. Per superblock:
 // ql[128] qh[64] sc[16xi8] d[f16]. 8 waves/block, 32 lanes on the SAME superblock

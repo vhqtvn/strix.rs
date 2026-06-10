@@ -286,6 +286,8 @@ pub struct RocmWeightAccel {
     pf_act: Dbuf,
     pf_xq: Dbuf,
     pf_cs: Dbuf,
+    pf_h: Dbuf,
+    pf_n: Dbuf,
     pf_sn: Dbuf,
     pf_xd: Dbuf,
     /// f16 KV cache (STRIX_F16_KV=1): halves KV memory + decode KV traffic, at a
@@ -379,6 +381,7 @@ impl RocmWeightAccel {
             "moe_wsum",
             "gather_xq8",
             "rmsnorm_heads",
+            "f32_gemv_rows",
             "rope_rows",
             "kv_append_rows",
             "sdpa_rows",
@@ -454,6 +457,8 @@ impl RocmWeightAccel {
         let pf_act = gpu.alloc(2048 * 1024 * 4).ok()?;
         let pf_xq = gpu.alloc(2048 * 4096).ok()?;
         let pf_cs = gpu.alloc(512 * 64 * 4).ok()?;
+        let pf_h = gpu.alloc(512 * 2304 * 4).ok()?;
+        let pf_n = gpu.alloc(512 * 2304 * 4).ok()?;
         let pf_sn = gpu.alloc(512 * 64 * 4).ok()?;
         let pf_xd = gpu.alloc(2048 * 128 * 4).ok()?;
         let mut batch_x = Vec::new();
@@ -513,6 +518,8 @@ impl RocmWeightAccel {
             pf_act,
             pf_xq,
             pf_cs,
+            pf_h,
+            pf_n,
             pf_sn,
             pf_xd,
             kv_f16: std::env::var("STRIX_F16_KV").is_ok(),
@@ -1171,6 +1178,291 @@ impl RocmWeightAccel {
                 .i(64),
         );
         true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attn_prefill_inner(
+        &mut self,
+        layer: usize,
+        m: usize,
+        base: usize,
+        win: usize,
+        cs: &[f32],
+        sn: &[f32],
+        src: *mut c_void,
+    ) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let wq = self.q8.get(&format!("blk.{layer}.attn_q.weight"))?;
+        let wk = self.q8.get(&format!("blk.{layer}.attn_k.weight"))?;
+        let wv = self.q8.get(&format!("blk.{layer}.attn_v.weight"))?;
+        let wo = self.q8.get(&format!("blk.{layer}.attn_output.weight"))?;
+        let qn = self.f32w.get(&format!("blk.{layer}.attn_q_norm.weight"))?;
+        let kn = self.f32w.get(&format!("blk.{layer}.attn_k_norm.weight"))?;
+        let (hidden, q_dim, kv_dim) = (wq.in_dim, wq.out_dim, wk.out_dim);
+        let hd = 128usize;
+        let (nh, nkv) = (q_dim / hd, kv_dim / hd);
+        if layer >= self.mlm_kc.len() || base + m > self.mlm_seq || m > 512 {
+            return None;
+        }
+        self.gpu.upload_at(&self.pf_cs, 0, cs).ok()?;
+        self.gpu.upload_at(&self.pf_sn, 0, sn).ok()?;
+        let (xq, xd) = self.pf_quant(src, m, hidden);
+        let qb = self.pf_y.ptr;
+        let kb = self.pf_a.ptr;
+        let vb = self.pf_b.ptr;
+        for (w, y, od) in [(&wq, qb, q_dim), (&wk, kb, kv_dim), (&wv, vb, kv_dim)] {
+            self.launch2(
+                "q8i_gemm_lds2",
+                od.div_ceil(16) as u32,
+                m.div_ceil(32) as u32,
+                256,
+                0,
+                Args::new()
+                    .ptr(w.scales.ptr)
+                    .ptr(w.quants.ptr)
+                    .ptr(xq)
+                    .ptr(xd)
+                    .ptr(y)
+                    .i(hidden as i32)
+                    .i(od as i32)
+                    .i(m as i32),
+            );
+        }
+        for (y, n, w) in [(qb, nh, qn.ptr), (kb, nkv, kn.ptr)] {
+            self.launch2(
+                "rmsnorm_heads",
+                n as u32,
+                m as u32,
+                256,
+                0,
+                Args::new().ptr(y).ptr(w).ptr(y).i(hd as i32).i((n * hd) as i32).i(m as i32),
+            );
+        }
+        let half = hd / 2;
+        for (y, n) in [(qb, nh), (kb, nkv)] {
+            self.launch2(
+                "rope_rows",
+                ((n * half).div_ceil(64)) as u32,
+                m as u32,
+                64,
+                0,
+                Args::new()
+                    .ptr(y)
+                    .ptr(self.pf_cs.ptr)
+                    .ptr(self.pf_sn.ptr)
+                    .i(hd as i32)
+                    .i(n as i32)
+                    .i(m as i32),
+            );
+        }
+        for (src, cache) in [(kb, &self.mlm_kc[layer]), (vb, &self.mlm_vc[layer])] {
+            self.launch2(
+                "kv_append_rows",
+                kv_dim.div_ceil(256) as u32,
+                m as u32,
+                256,
+                0,
+                Args::new().ptr(src).ptr(cache.ptr).i(base as i32).i(kv_dim as i32).i(m as i32),
+            );
+        }
+        let attn = self.pf_dy.ptr;
+        let scale = 1.0 / (hd as f32).sqrt();
+        self.launch2(
+            "sdpa_rows",
+            nh as u32,
+            m as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(qb)
+                .ptr(self.mlm_kc[layer].ptr)
+                .ptr(self.mlm_vc[layer].ptr)
+                .ptr(attn)
+                .i(hd as i32)
+                .i(base as i32)
+                .i(win as i32)
+                .i((nh / nkv) as i32)
+                .i(nkv as i32)
+                .f(scale)
+                .i(m as i32)
+                .i(q_dim as i32),
+        );
+        let (aq, ad) = self.pf_quant(attn, m, q_dim);
+        let outp = unsafe { (self.pf_y.ptr as *mut f32).add(m * q_dim) } as *mut c_void;
+        self.launch2(
+            "q8i_gemm_lds2",
+            hidden.div_ceil(16) as u32,
+            m.div_ceil(32) as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(wo.scales.ptr)
+                .ptr(wo.quants.ptr)
+                .ptr(aq)
+                .ptr(ad)
+                .ptr(outp)
+                .i(q_dim as i32)
+                .i(hidden as i32)
+                .i(m as i32),
+        );
+        let resident = src == self.pf_n.ptr;
+        if resident {
+            self.launch(
+                "vec_add",
+                (m * hidden).div_ceil(256) as u32,
+                256,
+                0,
+                Args::new().ptr(self.pf_h.ptr).ptr(outp).i((m * hidden) as i32),
+            );
+        }
+        self.gpu.sync().ok()?;
+        let out = if resident {
+            Vec::new()
+        } else {
+            self.pf_y.download_at::<f32>(m * q_dim * 4, m * hidden).ok()?
+        };
+        let kk = self.pf_a.download::<f32>(m * kv_dim).ok()?;
+        let vv = self.pf_b.download::<f32>(m * kv_dim).ok()?;
+        Some((out, kk, vv))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn moe_layer_dev_inner(
+        &self,
+        layer: usize,
+        m: usize,
+        plan: &[(usize, usize, usize)],
+        slot_tok: &[i32],
+        wslot: &[f32],
+        src: *mut c_void,
+        hout: *mut c_void,
+    ) -> Option<()> {
+        let mo = self.moe.get(&layer)?;
+        let (hidden, eff) = (mo.hidden, mo.eff);
+        let nb = hidden / 32;
+        let slots = slot_tok.len();
+        if slots == 0 || slots > 4096 || m > 512 {
+            return None;
+        }
+        self.gpu.upload_at(&self.pf_tab, 0, slot_tok).ok()?;
+        self.gpu.upload_at(&self.pf_tab, slots * 4, wslot).ok()?;
+        let wptr = unsafe { (self.pf_tab.ptr as *mut u8).add(slots * 4) } as *mut c_void;
+        let (xq, xd) = self.pf_quant(src, m, hidden);
+        // gathered acts region (after token region): tokens use [0, m), slots at [m, m+slots)
+        let gq = unsafe { (self.pf_xq.ptr as *mut u8).add(m * hidden) } as *mut c_void;
+        let gd = unsafe { (self.pf_xd.ptr as *mut f32).add(m * nb) } as *mut c_void;
+        self.launch2(
+            "gather_xq8",
+            nb as u32,
+            slots as u32,
+            32,
+            0,
+            Args::new()
+                .ptr(xq)
+                .ptr(xd)
+                .ptr(self.pf_tab.ptr)
+                .ptr(gq)
+                .ptr(gd)
+                .i(nb as i32)
+                .i(slots as i32),
+        );
+        let enb = eff / 32;
+        for &(e, off, me) in plan {
+            let eoff = e * eff * nb;
+            let sq = unsafe { (gq as *mut u8).add(off * hidden) } as *mut c_void;
+            let sd = unsafe { (gd as *mut f32).add(off * nb) } as *mut c_void;
+            for (sb, qb2, y) in [
+                (&mo.gate_s, &mo.gate_q, self.pf_a.ptr),
+                (&mo.up_s, &mo.up_q, self.pf_b.ptr),
+            ] {
+                let sp = unsafe { (sb.ptr as *mut f32).add(eoff) } as *mut c_void;
+                let qp = unsafe { (qb2.ptr as *mut i8).add(eoff * 32) } as *mut c_void;
+                let yp = unsafe { (y as *mut f32).add(off * eff) } as *mut c_void;
+                self.launch2(
+                    "q8i_gemm_lds2",
+                    eff.div_ceil(16) as u32,
+                    me.div_ceil(32) as u32,
+                    256,
+                    0,
+                    Args::new()
+                        .ptr(sp)
+                        .ptr(qp)
+                        .ptr(sq)
+                        .ptr(sd)
+                        .ptr(yp)
+                        .i(hidden as i32)
+                        .i(eff as i32)
+                        .i(me as i32),
+                );
+            }
+        }
+        // silu+quantize all slot activations, then down per expert
+        let aq = unsafe { (self.pf_xq.ptr as *mut u8).add((m + slots) * hidden) } as *mut c_void;
+        let ad = unsafe { (self.pf_xd.ptr as *mut f32).add((m + slots) * nb) } as *mut c_void;
+        let nblk = slots * enb;
+        self.launch(
+            "silu_quant_rows",
+            nblk as u32,
+            32,
+            0,
+            Args::new()
+                .ptr(self.pf_a.ptr)
+                .ptr(self.pf_b.ptr)
+                .ptr(aq)
+                .ptr(ad)
+                .i(nblk as i32),
+        );
+        for &(e, off, me) in plan {
+            let deoff = e * hidden * enb;
+            let sp = unsafe { (mo.down_s.ptr as *mut f32).add(deoff) } as *mut c_void;
+            let qp = unsafe { (mo.down_q.ptr as *mut i8).add(deoff * 32) } as *mut c_void;
+            let sq = unsafe { (aq as *mut u8).add(off * eff) } as *mut c_void;
+            let sd = unsafe { (ad as *mut f32).add(off * enb) } as *mut c_void;
+            let yp = unsafe { (self.pf_dy.ptr as *mut f32).add(off * hidden) } as *mut c_void;
+            self.launch2(
+                "q8i_gemm_lds2",
+                hidden.div_ceil(16) as u32,
+                me.div_ceil(32) as u32,
+                256,
+                0,
+                Args::new()
+                    .ptr(sp)
+                    .ptr(qp)
+                    .ptr(sq)
+                    .ptr(sd)
+                    .ptr(yp)
+                    .i(eff as i32)
+                    .i(hidden as i32)
+                    .i(me as i32),
+            );
+        }
+        let dst = if hout.is_null() {
+            let n_out = m * hidden;
+            self.launch(
+                "zerof",
+                n_out.div_ceil(256) as u32,
+                256,
+                0,
+                Args::new().ptr(self.pf_y.ptr).i(n_out as i32),
+            );
+            self.pf_y.ptr
+        } else {
+            hout // residual: scatter-add straight into resident h
+        };
+        self.launch2(
+            "scatter_add_w",
+            hidden.div_ceil(256) as u32,
+            slots as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(self.pf_dy.ptr)
+                .ptr(self.pf_tab.ptr)
+                .ptr(wptr)
+                .ptr(dst)
+                .i(hidden as i32)
+                .i(slots as i32),
+        );
+        Some(())
     }
 
     fn launch(&self, name: &str, grid: u32, block: u32, shared: u32, args: Args) {
@@ -2913,125 +3205,65 @@ impl WeightAccel for RocmWeightAccel {
         cs: &[f32],
         sn: &[f32],
     ) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-        let wq = self.q8.get(&format!("blk.{layer}.attn_q.weight"))?;
-        let wk = self.q8.get(&format!("blk.{layer}.attn_k.weight"))?;
-        let wv = self.q8.get(&format!("blk.{layer}.attn_v.weight"))?;
-        let wo = self.q8.get(&format!("blk.{layer}.attn_output.weight"))?;
-        let qn = self.f32w.get(&format!("blk.{layer}.attn_q_norm.weight"))?;
-        let kn = self.f32w.get(&format!("blk.{layer}.attn_k_norm.weight"))?;
-        let (hidden, q_dim, kv_dim) = (wq.in_dim, wq.out_dim, wk.out_dim);
-        let hd = 128usize;
-        let (nh, nkv) = (q_dim / hd, kv_dim / hd);
-        if layer >= self.mlm_kc.len() || base + m > self.mlm_seq || m > 512 || xs.len() != m * hidden {
-            return None;
-        }
         self.gpu.upload_at(&self.pf_x, 0, xs).ok()?;
-        self.gpu.upload_at(&self.pf_cs, 0, cs).ok()?;
-        self.gpu.upload_at(&self.pf_sn, 0, sn).ok()?;
-        let (xq, xd) = self.pf_quant(self.pf_x.ptr, m, hidden);
-        let qb = self.pf_y.ptr;
-        let kb = self.pf_a.ptr;
-        let vb = self.pf_b.ptr;
-        for (w, y, od) in [(&wq, qb, q_dim), (&wk, kb, kv_dim), (&wv, vb, kv_dim)] {
-            self.launch2(
-                "q8i_gemm_lds2",
-                od.div_ceil(16) as u32,
-                m.div_ceil(32) as u32,
-                256,
-                0,
-                Args::new()
-                    .ptr(w.scales.ptr)
-                    .ptr(w.quants.ptr)
-                    .ptr(xq)
-                    .ptr(xd)
-                    .ptr(y)
-                    .i(hidden as i32)
-                    .i(od as i32)
-                    .i(m as i32),
-            );
-        }
-        for (y, n, w) in [(qb, nh, qn.ptr), (kb, nkv, kn.ptr)] {
-            self.launch2(
-                "rmsnorm_heads",
-                n as u32,
-                m as u32,
-                256,
-                0,
-                Args::new().ptr(y).ptr(w).ptr(y).i(hd as i32).i((n * hd) as i32).i(m as i32),
-            );
-        }
-        let half = hd / 2;
-        for (y, n) in [(qb, nh), (kb, nkv)] {
-            self.launch2(
-                "rope_rows",
-                ((n * half).div_ceil(64)) as u32,
-                m as u32,
-                64,
-                0,
-                Args::new()
-                    .ptr(y)
-                    .ptr(self.pf_cs.ptr)
-                    .ptr(self.pf_sn.ptr)
-                    .i(hd as i32)
-                    .i(n as i32)
-                    .i(m as i32),
-            );
-        }
-        for (src, cache) in [(kb, &self.mlm_kc[layer]), (vb, &self.mlm_vc[layer])] {
-            self.launch2(
-                "kv_append_rows",
-                kv_dim.div_ceil(256) as u32,
-                m as u32,
-                256,
-                0,
-                Args::new().ptr(src).ptr(cache.ptr).i(base as i32).i(kv_dim as i32).i(m as i32),
-            );
-        }
-        let attn = self.pf_dy.ptr;
-        let scale = 1.0 / (hd as f32).sqrt();
-        self.launch2(
-            "sdpa_rows",
-            nh as u32,
+        let _ = xs;
+        let (out, kk, vv) = self.attn_prefill_inner(layer, m, base, win, cs, sn, self.pf_x.ptr)?;
+        Some((out, kk, vv))
+    }
+
+
+
+    fn pf_begin(&mut self, h: &[f32], m: usize) -> bool {
+        m <= 512 && self.gpu.upload_at(&self.pf_h, 0, h).is_ok()
+    }
+
+    fn pf_attn(&mut self, l: usize, m: usize, base: usize, win: usize, cs: &[f32], sn: &[f32]) -> Option<(Vec<f32>, Vec<f32>)> {
+        let an = self.f32w.get(&format!("blk.{l}.attn_norm.weight"))?;
+        let hidden = an.bytes / 4;
+        self.launch(
+            "rmsnorm",
             m as u32,
             256,
             0,
-            Args::new()
-                .ptr(qb)
-                .ptr(self.mlm_kc[layer].ptr)
-                .ptr(self.mlm_vc[layer].ptr)
-                .ptr(attn)
-                .i(hd as i32)
-                .i(base as i32)
-                .i(win as i32)
-                .i((nh / nkv) as i32)
-                .i(nkv as i32)
-                .f(scale)
-                .i(m as i32)
-                .i(q_dim as i32),
+            Args::new().ptr(self.pf_h.ptr).ptr(an.ptr).ptr(self.pf_n.ptr).i(hidden as i32).i(1).f(1e-6),
         );
-        let (aq, ad) = self.pf_quant(attn, m, q_dim);
-        let outp = unsafe { (self.pf_y.ptr as *mut f32).add(m * q_dim) } as *mut c_void;
-        self.launch2(
-            "q8i_gemm_lds2",
-            hidden.div_ceil(16) as u32,
-            m.div_ceil(32) as u32,
+        // attention reads normed acts from pf_n via the resident path
+        let (out, kk, vv) = self.attn_prefill_inner(l, m, base, win, cs, sn, self.pf_n.ptr)?;
+        let _ = out;
+        Some((kk, vv))
+    }
+
+    fn pf_router(&mut self, l: usize, m: usize, ne: usize) -> Option<Vec<f32>> {
+        let fnw = self.f32w.get(&format!("blk.{l}.ffn_norm.weight"))?;
+        let wgi = self.f32w.get(&format!("blk.{l}.ffn_gate_inp.weight"))?;
+        let hidden = fnw.bytes / 4;
+        self.launch(
+            "rmsnorm",
+            m as u32,
             256,
             0,
-            Args::new()
-                .ptr(wo.scales.ptr)
-                .ptr(wo.quants.ptr)
-                .ptr(aq)
-                .ptr(ad)
-                .ptr(outp)
-                .i(q_dim as i32)
-                .i(hidden as i32)
-                .i(m as i32),
+            Args::new().ptr(self.pf_h.ptr).ptr(fnw.ptr).ptr(self.pf_n.ptr).i(hidden as i32).i(1).f(1e-6),
+        );
+        self.launch2(
+            "f32_gemv_rows",
+            ne as u32,
+            m as u32,
+            32,
+            0,
+            Args::new().ptr(wgi.ptr).ptr(self.pf_n.ptr).ptr(self.pf_y.ptr).i(hidden as i32).i(ne as i32).i(m as i32),
         );
         self.gpu.sync().ok()?;
-        let out = self.pf_y.download_at::<f32>(m * q_dim * 4, m * hidden).ok()?;
-        let kk = self.pf_a.download::<f32>(m * kv_dim).ok()?;
-        let vv = self.pf_b.download::<f32>(m * kv_dim).ok()?;
-        Some((out, kk, vv))
+        self.pf_y.download::<f32>(m * ne).ok()
+    }
+
+    fn pf_moe(&mut self, l: usize, m: usize, plan: &[(usize, usize, usize)], st: &[i32], w: &[f32]) -> bool {
+        self.moe_layer_dev_inner(l, m, plan, st, w, self.pf_n.ptr, self.pf_h.ptr).is_some()
+    }
+
+    fn pf_end(&mut self, m: usize) -> Option<Vec<f32>> {
+        let hidden = 2304usize;
+        self.gpu.sync().ok()?;
+        self.pf_h.download::<f32>(m * hidden).ok()
     }
 
     fn moe_expert_flush(&self, rows: usize, hidden: usize) -> Option<Vec<f32>> {
@@ -3048,132 +3280,16 @@ impl WeightAccel for RocmWeightAccel {
         slot_tok: &[i32],
         wslot: &[f32],
     ) -> Option<Vec<f32>> {
-        let mo = self.moe.get(&layer)?;
-        let (hidden, eff) = (mo.hidden, mo.eff);
-        let nb = hidden / 32;
-        let slots = slot_tok.len();
-        if xs.len() != m * hidden || slots == 0 || slots > 4096 || m > 512 {
+        if xs.len() != m * self.moe.get(&layer)?.hidden {
             return None;
         }
-        // uploads: acts (f32, quantized on GPU), slot map, weights
         self.gpu.upload_at(&self.pf_x, 0, xs).ok()?;
-        self.gpu.upload_at(&self.pf_tab, 0, slot_tok).ok()?;
-        self.gpu.upload_at(&self.pf_tab, slots * 4, wslot).ok()?;
-        let wptr = unsafe { (self.pf_tab.ptr as *mut u8).add(slots * 4) } as *mut c_void;
-        let (xq, xd) = self.pf_quant(self.pf_x.ptr, m, hidden);
-        // gathered acts region (after token region): tokens use [0, m), slots at [m, m+slots)
-        let gq = unsafe { (self.pf_xq.ptr as *mut u8).add(m * hidden) } as *mut c_void;
-        let gd = unsafe { (self.pf_xd.ptr as *mut f32).add(m * nb) } as *mut c_void;
-        self.launch2(
-            "gather_xq8",
-            nb as u32,
-            slots as u32,
-            32,
-            0,
-            Args::new()
-                .ptr(xq)
-                .ptr(xd)
-                .ptr(self.pf_tab.ptr)
-                .ptr(gq)
-                .ptr(gd)
-                .i(nb as i32)
-                .i(slots as i32),
-        );
-        let enb = eff / 32;
-        for &(e, off, me) in plan {
-            let eoff = e * eff * nb;
-            let sq = unsafe { (gq as *mut u8).add(off * hidden) } as *mut c_void;
-            let sd = unsafe { (gd as *mut f32).add(off * nb) } as *mut c_void;
-            for (sb, qb2, y) in [
-                (&mo.gate_s, &mo.gate_q, self.pf_a.ptr),
-                (&mo.up_s, &mo.up_q, self.pf_b.ptr),
-            ] {
-                let sp = unsafe { (sb.ptr as *mut f32).add(eoff) } as *mut c_void;
-                let qp = unsafe { (qb2.ptr as *mut i8).add(eoff * 32) } as *mut c_void;
-                let yp = unsafe { (y as *mut f32).add(off * eff) } as *mut c_void;
-                self.launch2(
-                    "q8i_gemm_lds2",
-                    eff.div_ceil(16) as u32,
-                    me.div_ceil(32) as u32,
-                    256,
-                    0,
-                    Args::new()
-                        .ptr(sp)
-                        .ptr(qp)
-                        .ptr(sq)
-                        .ptr(sd)
-                        .ptr(yp)
-                        .i(hidden as i32)
-                        .i(eff as i32)
-                        .i(me as i32),
-                );
-            }
-        }
-        // silu+quantize all slot activations, then down per expert
-        let aq = unsafe { (self.pf_xq.ptr as *mut u8).add((m + slots) * hidden) } as *mut c_void;
-        let ad = unsafe { (self.pf_xd.ptr as *mut f32).add((m + slots) * nb) } as *mut c_void;
-        let nblk = slots * enb;
-        self.launch(
-            "silu_quant_rows",
-            nblk as u32,
-            32,
-            0,
-            Args::new()
-                .ptr(self.pf_a.ptr)
-                .ptr(self.pf_b.ptr)
-                .ptr(aq)
-                .ptr(ad)
-                .i(nblk as i32),
-        );
-        for &(e, off, me) in plan {
-            let deoff = e * hidden * enb;
-            let sp = unsafe { (mo.down_s.ptr as *mut f32).add(deoff) } as *mut c_void;
-            let qp = unsafe { (mo.down_q.ptr as *mut i8).add(deoff * 32) } as *mut c_void;
-            let sq = unsafe { (aq as *mut u8).add(off * eff) } as *mut c_void;
-            let sd = unsafe { (ad as *mut f32).add(off * enb) } as *mut c_void;
-            let yp = unsafe { (self.pf_dy.ptr as *mut f32).add(off * hidden) } as *mut c_void;
-            self.launch2(
-                "q8i_gemm_lds2",
-                hidden.div_ceil(16) as u32,
-                me.div_ceil(32) as u32,
-                256,
-                0,
-                Args::new()
-                    .ptr(sp)
-                    .ptr(qp)
-                    .ptr(sq)
-                    .ptr(sd)
-                    .ptr(yp)
-                    .i(eff as i32)
-                    .i(hidden as i32)
-                    .i(me as i32),
-            );
-        }
-        let n_out = m * hidden;
-        self.launch(
-            "zerof",
-            n_out.div_ceil(256) as u32,
-            256,
-            0,
-            Args::new().ptr(self.pf_y.ptr).i(n_out as i32),
-        );
-        self.launch2(
-            "scatter_add_w",
-            hidden.div_ceil(256) as u32,
-            slots as u32,
-            256,
-            0,
-            Args::new()
-                .ptr(self.pf_dy.ptr)
-                .ptr(self.pf_tab.ptr)
-                .ptr(wptr)
-                .ptr(self.pf_y.ptr)
-                .i(hidden as i32)
-                .i(slots as i32),
-        );
+        self.moe_layer_dev_inner(layer, m, plan, slot_tok, wslot, self.pf_x.ptr, std::ptr::null_mut())?;
+        let hidden = self.moe.get(&layer)?.hidden;
         self.gpu.sync().ok()?;
-        self.pf_y.download::<f32>(n_out).ok()
+        self.pf_y.download::<f32>(m * hidden).ok()
     }
+
 
     fn gemv(&self, key: &str, x: &[f32]) -> Option<Vec<f32>> {
         // Per-weight GEMV on a resident Q6_K / Q4_0 weight, reusing the exact kernels

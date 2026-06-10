@@ -182,6 +182,25 @@ pub trait WeightAccel: Send + Sync {
         None
     }
 
+    /// Resident-h prefill: upload h once per chunk, run layers via the fns below,
+    /// download once at the end. Returns false/None on missing support.
+    fn pf_begin(&mut self, _h: &[f32], _m: usize) -> bool {
+        false
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn pf_attn(&mut self, _l: usize, _m: usize, _base: usize, _win: usize, _cs: &[f32], _sn: &[f32]) -> Option<(Vec<f32>, Vec<f32>)> {
+        None
+    }
+    fn pf_router(&mut self, _l: usize, _m: usize, _ne: usize) -> Option<Vec<f32>> {
+        None
+    }
+    fn pf_moe(&mut self, _l: usize, _m: usize, _plan: &[(usize, usize, usize)], _st: &[i32], _w: &[f32]) -> bool {
+        false
+    }
+    fn pf_end(&mut self, _m: usize) -> Option<Vec<f32>> {
+        None
+    }
+
     fn moe_layer_q8_dev(
         &self,
         _layer: usize,

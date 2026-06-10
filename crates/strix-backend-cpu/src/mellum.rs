@@ -910,8 +910,83 @@ impl MellumModel {
         let mut attn_out = vec![0.0f32; m * q_dim];
         let mut o = vec![0.0f32; m * hidden];
 
+        let mut resident = std::env::var("STRIX_NO_INT8").is_err() && self.accel.is_some();
+        if resident {
+            let a = self.accel.as_mut().unwrap();
+            resident = a.mlm_prepare(cfg.n_layer, kv_dim, 2048) && a.pf_begin(&h, m);
+        }
         for il in 0..cfg.n_layer {
             let b = |s: &str| format!("blk.{il}.{s}");
+            if resident {
+                let is_swa0 = cfg.is_swa(il);
+                let win = if is_swa0 { cfg.sliding_window } else { 0 };
+                let (fs, ef, ms) = if is_swa0 {
+                    (1.0, 0.0, 1.0)
+                } else {
+                    (1.0 / cfg.yarn_factor, 1.0, cfg.yarn_attn_factor)
+                };
+                let half = hd / 2;
+                let mut cs = vec![0.0f32; m * half];
+                let mut sn = vec![0.0f32; m * half];
+                let theta_scale = cfg.rope_freq_base.powf(-2.0 / cfg.n_rot as f32);
+                for t in 0..m {
+                    let mut theta = (self.pos + t) as f32;
+                    for kk2 in 0..half {
+                        let (c, s2) = rope_yarn(theta, fs, corr, 2 * kk2, ef, ms);
+                        cs[t * half + kk2] = c;
+                        sn[t * half + kk2] = s2;
+                        theta *= theta_scale;
+                    }
+                }
+                let pos0 = self.pos;
+                let ne = cfg.n_expert;
+                let topk = cfg.n_expert_used;
+                let a = self.accel.as_mut().unwrap();
+                let mut done = false;
+                if let Some((kk, vv)) = a.pf_attn(il, m, pos0, win, &cs, &sn) {
+                    if let Some(rl) = a.pf_router(il, m, ne) {
+                        let mut by_exp: Vec<Vec<(usize, f32)>> = vec![Vec::new(); ne];
+                        for t in 0..m {
+                            let logits = &rl[t * ne..(t + 1) * ne];
+                            let mx = logits.iter().cloned().fold(f32::MIN, f32::max);
+                            let mut probs: Vec<f32> = logits.iter().map(|&l| (l - mx).exp()).collect();
+                            let sum: f32 = probs.iter().sum();
+                            for p in probs.iter_mut() {
+                                *p /= sum;
+                            }
+                            let mut idx: Vec<usize> = (0..ne).collect();
+                            idx.sort_by(|&x, &y| probs[y].partial_cmp(&probs[x]).unwrap());
+                            idx.truncate(topk);
+                            let wsum: f32 = idx.iter().map(|&e| probs[e]).sum();
+                            for &e in &idx {
+                                by_exp[e].push((t, probs[e] / wsum));
+                            }
+                        }
+                        let mut plan: Vec<(usize, usize, usize)> = Vec::new();
+                        let mut slot_tok: Vec<i32> = Vec::new();
+                        let mut wslot: Vec<f32> = Vec::new();
+                        for (e, list) in by_exp.iter().enumerate() {
+                            if list.is_empty() {
+                                continue;
+                            }
+                            plan.push((e, slot_tok.len(), list.len()));
+                            for &(t, wv) in list {
+                                slot_tok.push(t as i32);
+                                wslot.push(wv);
+                            }
+                        }
+                        if a.pf_moe(il, m, &plan, &slot_tok, &wslot) {
+                            self.kc[il].extend_from_slice(&kk);
+                            self.vc[il].extend_from_slice(&vv);
+                            done = true;
+                        }
+                    }
+                }
+                if !done {
+                    return Err(StrixError::backend("resident prefill failed mid-chunk"));
+                }
+                continue;
+            }
             let an = self.vecw(&b("attn_norm.weight"))?;
             for t in 0..m {
                 let (hs, ns) = (
@@ -1298,6 +1373,13 @@ impl MellumModel {
                 for i in 0..hidden {
                     hrow[i] += out[i];
                 }
+            }
+        }
+        if resident {
+            let a = self.accel.as_mut().unwrap();
+            match a.pf_end(m) {
+                Some(hg) => h = hg,
+                None => return Err(StrixError::backend("pf_end failed")),
             }
         }
         self.pos += m;
