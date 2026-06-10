@@ -538,6 +538,10 @@ impl Qwen35Model {
                 for t in ["attn_q", "attn_k", "attn_v", "attn_output"] {
                     names.push(format!("blk.{il}.{t}.weight"));
                 }
+            } else {
+                for t in ["attn_qkv", "attn_gate", "ssm_out"] {
+                    names.push(format!("blk.{il}.{t}.weight"));
+                }
             }
         }
         if self.gguf.tensors().contains_key("output.weight") {
@@ -1275,9 +1279,13 @@ impl Qwen35Model {
         let mut alpha_raw = vec![0.0f32; n_vh];
         {
             let wqkv = self.w(&b("attn_qkv.weight"))?;
-            qmatmul(&mut qkv, x, wqkv.bytes, wqkv.ty, wqkv.in_dim, row);
+            if !self.try_gemv(&b("attn_qkv.weight"), x, &mut qkv) {
+                qmatmul(&mut qkv, x, wqkv.bytes, wqkv.ty, wqkv.in_dim, row);
+            }
             let wgate = self.w(&b("attn_gate.weight"))?;
-            qmatmul(&mut z, x, wgate.bytes, wgate.ty, wgate.in_dim, row);
+            if !self.try_gemv(&b("attn_gate.weight"), x, &mut z) {
+                qmatmul(&mut z, x, wgate.bytes, wgate.ty, wgate.in_dim, row);
+            }
             let wbeta = self.w(&b("ssm_beta.weight"))?;
             qmatmul(&mut beta_raw, x, wbeta.bytes, wbeta.ty, wbeta.in_dim, row);
             let walpha = self.w(&b("ssm_alpha.weight"))?;
@@ -1383,7 +1391,7 @@ impl Qwen35Model {
             }
         }
         let mut o = vec![0.0f32; cfg.hidden];
-        {
+        if !self.try_gemv(&b("ssm_out.weight"), &gated, &mut o) {
             let wout = self.w(&b("ssm_out.weight"))?;
             qmatmul(&mut o, &gated, wout.bytes, wout.ty, wout.in_dim, row);
         }
