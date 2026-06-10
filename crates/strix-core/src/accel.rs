@@ -93,6 +93,30 @@ pub trait WeightAccel: Send + Sync {
         None
     }
 
+    // --- Mellum fused decode: h stays resident on-device across the whole token;
+    // the host round-trips only q/k/v (rope+SDPA on CPU) and the router logits.
+
+    /// Upload the token's hidden state; begins a fused decode token. False = unsupported.
+    fn mlm_begin(&mut self, _h: &[f32]) -> bool {
+        false
+    }
+    /// attn_norm + q/k/v projections for layer `il`; returns (q,k,v).
+    fn mlm_qkv(&mut self, _il: usize) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        None
+    }
+    /// o-proj + residual + ffn_norm + router for layer `il`; returns router logits.
+    fn mlm_post1(&mut self, _il: usize, _attn_out: &[f32]) -> Option<Vec<f32>> {
+        None
+    }
+    /// fused MoE with routed experts + residual for layer `il` (no sync). False = unsupported.
+    fn mlm_post2(&mut self, _il: usize, _ids: &[i32], _wexp: &[f32]) -> bool {
+        false
+    }
+    /// output_norm + lm_head on the resident h; ends the token.
+    fn mlm_logits(&mut self) -> Option<Vec<f32>> {
+        None
+    }
+
     /// Compute `y = W · x` for an adopted weight. Returns `None` if `key` was not
     /// adopted, or `Some(y)` of length `out_dim`.
     fn gemv(&self, key: &str, x: &[f32]) -> Option<Vec<f32>>;

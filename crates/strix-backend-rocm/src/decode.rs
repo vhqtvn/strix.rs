@@ -225,6 +225,14 @@ pub struct RocmWeightAccel {
     moe_act: Dbuf,
     moe_dy: Dbuf,
     moe_out: Dbuf,
+    /// Mellum fused-token scratch: resident hidden state + norm/proj buffers.
+    mlm_h: Dbuf,
+    mlm_n: Dbuf,
+    mlm_q: Dbuf,
+    mlm_k: Dbuf,
+    mlm_v: Dbuf,
+    mlm_attn: Dbuf,
+    mlm_rl: Dbuf,
     /// f16 KV cache (STRIX_F16_KV=1): halves KV memory + decode KV traffic, at a
     /// small prefill cost (the prefill SDPA is occupancy-bound, so the h2f isn't
     /// free there). Default false (f32) — best for prefill-heavy workloads.
@@ -295,6 +303,7 @@ impl RocmWeightAccel {
             "q8_moe_gemv",
             "moe_silu_mul",
             "moe_wsum",
+            "vec_add",
             "argmax_f32",
             "rmsnorm",
             "addnorm",
@@ -333,6 +342,13 @@ impl RocmWeightAccel {
         let moe_act = gpu.alloc(16 * 4096 * 4).ok()?;
         let moe_dy = gpu.alloc(16 * 4096 * 4).ok()?;
         let moe_out = gpu.alloc(4096 * 4).ok()?;
+        let mlm_h = gpu.alloc(4096 * 4).ok()?;
+        let mlm_n = gpu.alloc(4096 * 4).ok()?;
+        let mlm_q = gpu.alloc(8192 * 4).ok()?;
+        let mlm_k = gpu.alloc(1024 * 4).ok()?;
+        let mlm_v = gpu.alloc(1024 * 4).ok()?;
+        let mlm_attn = gpu.alloc(8192 * 4).ok()?;
+        let mlm_rl = gpu.alloc(256 * 4).ok()?;
         Some(Self {
             gpu,
             funcs,
@@ -352,6 +368,13 @@ impl RocmWeightAccel {
             moe_act,
             moe_dy,
             moe_out,
+            mlm_h,
+            mlm_n,
+            mlm_q,
+            mlm_k,
+            mlm_v,
+            mlm_attn,
+            mlm_rl,
             kv_f16: std::env::var("STRIX_F16_KV").is_ok(),
             // pinned split if STRIX_N_SPLIT set, else 0 = context-adaptive (~len/64).
             n_split: std::env::var("STRIX_N_SPLIT").ok().and_then(|s| s.parse::<usize>().ok()).map(|v| v.clamp(1, N_SPLIT_MAX)).unwrap_or(0),
@@ -387,6 +410,99 @@ impl RocmWeightAccel {
 
     fn launch(&self, name: &str, grid: u32, block: u32, shared: u32, args: Args) {
         self.launch2(name, grid, 1, block, shared, args);
+    }
+
+    /// No-sync Q8_0 dense GEMV on a resident weight (stream-ordered).
+    fn q8_launch(&self, e: &ResQ8, x: *mut c_void, y: *mut c_void) {
+        self.launch(
+            "q8_0_gemv",
+            e.out_dim.div_ceil(8) as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(e.scales.ptr)
+                .ptr(e.quants.ptr)
+                .ptr(x)
+                .ptr(y)
+                .i(e.in_dim as i32)
+                .i(e.out_dim as i32),
+        );
+    }
+
+    /// No-sync RMSNorm on resident buffers (single row).
+    fn norm_launch(&self, x: *mut c_void, w: *mut c_void, y: *mut c_void, dim: usize) {
+        self.launch(
+            "rmsnorm",
+            1,
+            256,
+            0,
+            Args::new().ptr(x).ptr(w).ptr(y).i(dim as i32).i(1).f(1e-6),
+        );
+    }
+
+    /// No-sync fused-MoE launches for layer `layer` over k routed experts
+    /// (ids/wexp already uploaded): x → moe_out. Caller syncs.
+    fn moe_launches(&self, m: &ResMoe, k: usize, x: *mut c_void) {
+        let geb = m.gate_eb as usize as *mut c_void;
+        let deb = m.down_eb as usize as *mut c_void;
+        for (w, y) in [(&m.gate, self.moe_g.ptr), (&m.up, self.moe_u.ptr)] {
+            self.launch2(
+                "q8_moe_gemv",
+                m.eff.div_ceil(8) as u32,
+                k as u32,
+                256,
+                0,
+                Args::new()
+                    .ptr(w.ptr)
+                    .ptr(geb)
+                    .ptr(self.moe_ids.ptr)
+                    .ptr(x)
+                    .ptr(y)
+                    .i(m.hidden as i32)
+                    .i(m.eff as i32),
+            );
+        }
+        let n_act = k * m.eff;
+        self.launch(
+            "moe_silu_mul",
+            n_act.div_ceil(256) as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(self.moe_g.ptr)
+                .ptr(self.moe_u.ptr)
+                .ptr(self.moe_act.ptr)
+                .i(n_act as i32),
+        );
+        for e in 0..k {
+            self.launch2(
+                "q8_moe_gemv",
+                m.hidden.div_ceil(8) as u32,
+                1,
+                256,
+                0,
+                Args::new()
+                    .ptr(m.down.ptr)
+                    .ptr(deb)
+                    .ptr(unsafe { (self.moe_ids.ptr as *mut i32).add(e) } as *mut c_void)
+                    .ptr(unsafe { (self.moe_act.ptr as *mut f32).add(e * m.eff) } as *mut c_void)
+                    .ptr(unsafe { (self.moe_dy.ptr as *mut f32).add(e * m.hidden) } as *mut c_void)
+                    .i(m.eff as i32)
+                    .i(m.hidden as i32),
+            );
+        }
+        self.launch(
+            "moe_wsum",
+            m.hidden.div_ceil(256) as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(self.moe_dy.ptr)
+                .ptr(self.moe_w.ptr)
+                .ptr(self.moe_out.ptr)
+                .i(m.hidden as i32)
+                .i(k as i32),
+        );
     }
 
     /// lm_head GEMV (tied token_embd): Q6_K (gemma-4 target) or Q4_0 (a pure-Q4_0
@@ -981,66 +1097,82 @@ impl WeightAccel for RocmWeightAccel {
         self.gemv_x.upload(x).ok()?;
         self.moe_ids.upload(ids).ok()?;
         self.moe_w.upload(wexp).ok()?;
-        // ebytes passed as a pointer-sized arg (Args packs 8 bytes either way)
-        let geb = m.gate_eb as usize as *mut c_void;
-        let deb = m.down_eb as usize as *mut c_void;
-        let gemv = |w: &Dbuf, eb: *mut c_void, x: *mut c_void, y: *mut c_void, in_d: usize, out_d: usize| {
-            self.launch2(
-                "q8_moe_gemv",
-                out_d.div_ceil(8) as u32,
-                k as u32,
-                256,
-                0,
-                Args::new()
-                    .ptr(w.ptr)
-                    .ptr(eb)
-                    .ptr(self.moe_ids.ptr)
-                    .ptr(x)
-                    .ptr(y)
-                    .i(in_d as i32)
-                    .i(out_d as i32),
-            );
-        };
-        gemv(&m.gate, geb, self.gemv_x.ptr, self.moe_g.ptr, m.hidden, m.eff);
-        gemv(&m.up, geb, self.gemv_x.ptr, self.moe_u.ptr, m.hidden, m.eff);
-        let n_act = k * m.eff;
+        self.moe_launches(m, k, self.gemv_x.ptr);
+        self.gpu.sync().ok()?;
+        self.moe_out.download::<f32>(m.hidden).ok()
+    }
+
+    fn mlm_begin(&mut self, h: &[f32]) -> bool {
+        if self.moe.is_empty() || h.len() > 4096 {
+            return false;
+        }
+        self.mlm_h.upload(h).is_ok()
+    }
+
+    fn mlm_qkv(&mut self, il: usize) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let nw = self.f32w.get(&format!("blk.{il}.attn_norm.weight"))?;
+        let wq = self.q8.get(&format!("blk.{il}.attn_q.weight"))?;
+        let wk = self.q8.get(&format!("blk.{il}.attn_k.weight"))?;
+        let wv = self.q8.get(&format!("blk.{il}.attn_v.weight"))?;
+        self.norm_launch(self.mlm_h.ptr, nw.ptr, self.mlm_n.ptr, wq.in_dim);
+        self.q8_launch(wq, self.mlm_n.ptr, self.mlm_q.ptr);
+        self.q8_launch(wk, self.mlm_n.ptr, self.mlm_k.ptr);
+        self.q8_launch(wv, self.mlm_n.ptr, self.mlm_v.ptr);
+        self.gpu.sync().ok()?;
+        Some((
+            self.mlm_q.download::<f32>(wq.out_dim).ok()?,
+            self.mlm_k.download::<f32>(wk.out_dim).ok()?,
+            self.mlm_v.download::<f32>(wv.out_dim).ok()?,
+        ))
+    }
+
+    fn mlm_post1(&mut self, il: usize, attn_out: &[f32]) -> Option<Vec<f32>> {
+        let wo = self.q8.get(&format!("blk.{il}.attn_output.weight"))?;
+        let fnw = self.f32w.get(&format!("blk.{il}.ffn_norm.weight"))?;
+        let wgi = self.q8.get(&format!("blk.{il}.ffn_gate_inp.weight"))?;
+        if attn_out.len() != wo.in_dim {
+            return None;
+        }
+        self.mlm_attn.upload(attn_out).ok()?;
+        self.q8_launch(wo, self.mlm_attn.ptr, self.moe_out.ptr);
+        let hidden = wo.out_dim;
         self.launch(
-            "moe_silu_mul",
-            n_act.div_ceil(256) as u32,
+            "vec_add",
+            hidden.div_ceil(256) as u32,
             256,
             0,
-            Args::new().ptr(self.moe_g.ptr).ptr(self.moe_u.ptr).ptr(self.moe_act.ptr).i(n_act as i32),
+            Args::new().ptr(self.mlm_h.ptr).ptr(self.moe_out.ptr).i(hidden as i32),
         );
-        // down: per-expert act rows (x stride eff): reuse q8_moe_gemv with x per-k
-        // → q8_moe_gemv expects ONE x for all k; act differs per k. Pass via a per-k
-        // x base: handled in kernel by k row offset — q8_moe_gemv reads x[bi*32+l] only,
-        // so call the down GEMV once per expert (still launches not syncs — cheap).
-        for e in 0..k {
-            self.launch2(
-                "q8_moe_gemv",
-                m.hidden.div_ceil(8) as u32,
-                1,
-                256,
-                0,
-                Args::new()
-                    .ptr(m.down.ptr)
-                    .ptr(deb)
-                    .ptr(unsafe { (self.moe_ids.ptr as *mut i32).add(e) } as *mut c_void)
-                    .ptr(unsafe { (self.moe_act.ptr as *mut f32).add(e * m.eff) } as *mut c_void)
-                    .ptr(unsafe { (self.moe_dy.ptr as *mut f32).add(e * m.hidden) } as *mut c_void)
-                    .i(m.eff as i32)
-                    .i(m.hidden as i32),
-            );
+        self.norm_launch(self.mlm_h.ptr, fnw.ptr, self.mlm_n.ptr, hidden);
+        self.q8_launch(wgi, self.mlm_n.ptr, self.mlm_rl.ptr);
+        self.gpu.sync().ok()?;
+        self.mlm_rl.download::<f32>(wgi.out_dim).ok()
+    }
+
+    fn mlm_post2(&mut self, il: usize, ids: &[i32], wexp: &[f32]) -> bool {
+        let Some(m) = self.moe.get(&il) else { return false };
+        let k = ids.len();
+        if self.moe_ids.upload(ids).is_err() || self.moe_w.upload(wexp).is_err() {
+            return false;
         }
+        self.moe_launches(m, k, self.mlm_n.ptr);
         self.launch(
-            "moe_wsum",
+            "vec_add",
             m.hidden.div_ceil(256) as u32,
             256,
             0,
-            Args::new().ptr(self.moe_dy.ptr).ptr(self.moe_w.ptr).ptr(self.moe_out.ptr).i(m.hidden as i32).i(k as i32),
+            Args::new().ptr(self.mlm_h.ptr).ptr(self.moe_out.ptr).i(m.hidden as i32),
         );
+        true // no sync — next layer's qkv sync covers it
+    }
+
+    fn mlm_logits(&mut self) -> Option<Vec<f32>> {
+        let on = self.f32w.get("output_norm.weight")?;
+        let head = self.q8.get("output.weight")?;
+        self.norm_launch(self.mlm_h.ptr, on.ptr, self.mlm_n.ptr, head.in_dim);
+        self.q8_launch(head, self.mlm_n.ptr, self.gemv_y.ptr);
         self.gpu.sync().ok()?;
-        self.moe_out.download::<f32>(m.hidden).ok()
+        self.gemv_y.download::<f32>(head.out_dim).ok()
     }
 
     fn gemv(&self, key: &str, x: &[f32]) -> Option<Vec<f32>> {

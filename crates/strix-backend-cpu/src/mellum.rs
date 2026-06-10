@@ -315,6 +315,9 @@ pub struct MellumModel {
     // (default / CPU build) → byte-identical CPU forward. Mellum is all-Q8_0, so this
     // needs a Q8_0-capable accel (RocmWeightAccel). See docs/ideas/moe-accel-plan.md.
     accel: Option<Box<dyn strix_core::WeightAccel>>,
+    /// All layers fully resident (dense + MoE + norms + router + lm_head) → the
+    /// fused on-GPU decode path is safe (won't bail mid-token corrupting KV).
+    fused_ok: bool,
     // Optional NPU prefill offload (feature `npu`): fixed-shape int8 GEMMs for the
     // dense q/o projections + MoE experts, batched over the prompt. CPU-driven, no
     // iGPU involvement; numerics ≈ CPU (per-channel int8 weights), not bit-identical.
@@ -333,6 +336,7 @@ impl MellumModel {
             gguf,
             pos: 0,
             accel: None,
+            fused_ok: false,
             #[cfg(feature = "npu")]
             npu: None,
         })
@@ -522,8 +526,129 @@ impl MellumModel {
         for name in &advise {
             self.gguf.advise_dontneed(name);
         }
+        // Norm weights + router (for the fused on-GPU decode path).
+        for il in 0..self.cfg.n_layer {
+            for t in ["attn_norm", "ffn_norm"] {
+                let name = format!("blk.{il}.{t}.weight");
+                if let Ok(w) = self.vecw(&name) {
+                    accel.upload_f32(&name, &w);
+                }
+            }
+            let name = format!("blk.{il}.ffn_gate_inp.weight");
+            if let (Some(ti), Ok(bytes)) = (self.gguf.tensors().get(&name), self.gguf.tensor_bytes(&name)) {
+                if ti.ggml_type == GgmlType::Q8_0 {
+                    accel.upload_q8_0(&name, bytes, ti.dims[0] as usize, ti.dims[1] as usize);
+                }
+            }
+        }
+        if let Ok(w) = self.vecw("output_norm.weight") {
+            accel.upload_f32("output_norm.weight", &w);
+        }
+        // fused decode is safe only with every MoE layer resident
+        self.fused_ok = advise.len() == self.cfg.n_layer * 3;
         self.accel = Some(accel);
         n
+    }
+
+    /// Fused on-GPU decode for one token: h resident on-device; host round-trips only
+    /// q/k/v (CPU rope+SDPA, exact) and router logits. Falls back to the CPU forward
+    /// (None) if any layer/weight isn't resident.
+    fn forward_fused(&mut self, token: u32) -> Result<Option<Vec<f32>>> {
+        let cfg = self.cfg.clone();
+        let hidden = cfg.hidden;
+        let pos = self.pos;
+        let (hd, nh, nkv) = (cfg.head_dim, cfg.n_head, cfg.n_head_kv);
+        let groups = nh / nkv;
+        let kv_dim = nkv * hd;
+        let q_dim = nh * hd;
+        let scale = 1.0 / (hd as f32).sqrt();
+
+        // embedding (CPU)
+        let emb = self.w("token_embd.weight")?;
+        let mut h = vec![0.0f32; hidden];
+        let bpr = (hidden / emb.ty.block_elems()) * emb.ty.block_bytes();
+        dequantize_into(emb.ty, &emb.bytes[token as usize * bpr..(token as usize + 1) * bpr], &mut h)?;
+
+        let Some(a) = self.accel.as_mut() else { return Ok(None) };
+        if !a.mlm_begin(&h) {
+            return Ok(None);
+        }
+        let topk = cfg.n_expert_used;
+        for il in 0..cfg.n_layer {
+            let a = self.accel.as_mut().unwrap();
+            let Some((mut q, mut k, v)) = a.mlm_qkv(il) else { return Ok(None) };
+            // per-head QK-norm + rope + cache + sdpa (CPU, exact)
+            let qn = self.vecw(&format!("blk.{il}.attn_q_norm.weight"))?;
+            let kn = self.vecw(&format!("blk.{il}.attn_k_norm.weight"))?;
+            let is_swa = cfg.is_swa(il);
+            let (freq_scale, ext_factor, mscale) = if is_swa {
+                (1.0, 0.0, 1.0)
+            } else {
+                (1.0 / cfg.yarn_factor, 1.0, cfg.yarn_attn_factor)
+            };
+            let corr = yarn_corr_dims(cfg.n_rot, cfg.yarn_orig_ctx, cfg.rope_freq_base, cfg.yarn_beta_fast, cfg.yarn_beta_slow);
+            for hh in 0..nh {
+                let qh = &mut q[hh * hd..hh * hd + hd];
+                let mut tmp = vec![0.0f32; hd];
+                rmsnorm(&mut tmp, qh, &qn, cfg.rms_eps);
+                qh.copy_from_slice(&tmp);
+                rope_neox(qh, pos, cfg.n_rot, cfg.rope_freq_base, freq_scale, ext_factor, mscale, corr);
+            }
+            for kh in 0..nkv {
+                let khv = &mut k[kh * hd..kh * hd + hd];
+                let mut tmp = vec![0.0f32; hd];
+                rmsnorm(&mut tmp, khv, &kn, cfg.rms_eps);
+                khv.copy_from_slice(&tmp);
+                rope_neox(khv, pos, cfg.n_rot, cfg.rope_freq_base, freq_scale, ext_factor, mscale, corr);
+            }
+            self.kc[il].extend_from_slice(&k);
+            self.vc[il].extend_from_slice(&v);
+            let len = pos + 1;
+            let win_start = if is_swa && cfg.sliding_window > 0 && len > cfg.sliding_window {
+                len - cfg.sliding_window
+            } else {
+                0
+            };
+            let wlen = len - win_start;
+            let mut attn_out = vec![0.0f32; q_dim];
+            let mut keys = vec![0.0f32; wlen * hd];
+            let mut vals = vec![0.0f32; wlen * hd];
+            let mut scratch = vec![0.0f32; wlen];
+            for hh in 0..nh {
+                let kvh = hh / groups;
+                for (ti, t) in (win_start..len).enumerate() {
+                    keys[ti * hd..ti * hd + hd]
+                        .copy_from_slice(&self.kc[il][t * kv_dim + kvh * hd..t * kv_dim + kvh * hd + hd]);
+                    vals[ti * hd..ti * hd + hd]
+                        .copy_from_slice(&self.vc[il][t * kv_dim + kvh * hd..t * kv_dim + kvh * hd + hd]);
+                }
+                let mut oh = vec![0.0f32; hd];
+                crate::attention::sdpa_single(&mut oh, &q[hh * hd..hh * hd + hd], &keys, &vals, hd, wlen, scale, &mut scratch);
+                attn_out[hh * hd..hh * hd + hd].copy_from_slice(&oh);
+            }
+            let a = self.accel.as_mut().unwrap();
+            let Some(rl) = a.mlm_post1(il, &attn_out) else { return Ok(None) };
+            // router top-k (CPU, same math as moe())
+            let ne = cfg.n_expert;
+            let mx = rl.iter().cloned().fold(f32::MIN, f32::max);
+            let mut probs: Vec<f32> = rl.iter().map(|&l| (l - mx).exp()).collect();
+            let sum: f32 = probs.iter().sum();
+            for p in probs.iter_mut() {
+                *p /= sum;
+            }
+            let mut idx: Vec<usize> = (0..ne).collect();
+            idx.sort_by(|&x, &y| probs[y].partial_cmp(&probs[x]).unwrap());
+            idx.truncate(topk);
+            let wsum: f32 = idx.iter().map(|&e| probs[e]).sum();
+            let ids: Vec<i32> = idx.iter().map(|&e| e as i32).collect();
+            let wexp: Vec<f32> = idx.iter().map(|&e| probs[e] / wsum).collect();
+            if !a.mlm_post2(il, &ids, &wexp) {
+                return Ok(None);
+            }
+        }
+        self.pos += 1;
+        let a = self.accel.as_mut().unwrap();
+        Ok(a.mlm_logits())
     }
 
     /// True if an NPU expert call would be used for `me` rows (drives the NPU/CPU split).
@@ -1317,6 +1442,12 @@ impl Decoder for MellumModel {
     }
 
     fn decode_one(&mut self, token: u32) -> Result<Logits> {
+        if self.fused_ok {
+            if let Some(l) = self.forward_fused(token)? {
+                return Ok(Logits::new(l));
+            }
+            self.fused_ok = false; // fell through before any state change → safe
+        }
         Ok(Logits::new(self.forward(token, true)?.unwrap()))
     }
 

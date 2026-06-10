@@ -576,14 +576,20 @@ extern "C" __global__ void q8_0_gemv(const float* __restrict__ scales,
                                      const float* __restrict__ x,
                                      float* __restrict__ y, int in_dim, int out_dim) {
     int wave = threadIdx.x >> 5;  // 0..7
-    int l = threadIdx.x & 31;     // lane = value index within the 32-block
+    int l = threadIdx.x & 31;
     int row = blockIdx.x * 8 + wave;
     if (row >= out_dim) return;
     int nb = in_dim / 32, rb = row * nb;
+    // 4 blocks per pass, char4 per lane (coalesced 128B/wave). nb % 4 == 0 holds for
+    // all our shapes (in_dim multiple of 128).
     float acc = 0.f;
-    for (int bi = 0; bi < nb; bi++) {
+    for (int b4 = 0; b4 < nb; b4 += 4) {
+        int bi = b4 + (l >> 3);
         float d = scales[rb + bi];
-        acc += d * (float)quants[(rb + bi) * 32 + l] * x[bi * 32 + l];
+        int e = (l & 7) * 4;
+        const char4 q = *(const char4*)(quants + ((long long)(rb + bi) * 32 + e));
+        const float* xb = x + bi * 32 + e;
+        acc += d * (q.x * xb[0] + q.y * xb[1] + q.z * xb[2] + q.w * xb[3]);
     }
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
     if (l == 0) y[row] = acc;
@@ -605,11 +611,16 @@ extern "C" __global__ void q8_moe_gemv(const unsigned char* __restrict__ w, long
     const unsigned char* we = w + (long long)ids[k] * ebytes;
     int nb = in_dim / 32;
     const unsigned char* rowp = we + (long long)row * nb * 34;
+    // 4 blocks per wave-pass: lane covers 4 int8 (char4 load → coalesced 128B/wave).
     float acc = 0.f;
-    for (int bi = 0; bi < nb; bi++) {
+    for (int b4 = 0; b4 < nb; b4 += 4) {
+        int bi = b4 + (l >> 3);
         const unsigned char* blk = rowp + bi * 34;
         float d = h2f(*(const unsigned short*)blk);
-        acc += d * (float)((const signed char*)blk)[2 + l] * x[bi * 32 + l];
+        int e = (l & 7) * 4;
+        const signed char* q = (const signed char*)(blk + 2) + e;
+        const float* xb = x + bi * 32 + e;
+        acc += d * (q[0] * xb[0] + q[1] * xb[1] + q[2] * xb[2] + q[3] * xb[3]);
     }
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
     if (l == 0) y[(long long)k * out_dim + row] = acc;
@@ -622,6 +633,12 @@ extern "C" __global__ void moe_silu_mul(const float* __restrict__ g, const float
     if (i >= n) return;
     float gv = g[i];
     act[i] = (gv / (1.f + __expf(-gv))) * u[i];
+}
+
+// h[i] += x[i] (plain residual). grid=ceil(n/256), block=256.
+extern "C" __global__ void vec_add(float* __restrict__ h, const float* __restrict__ x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) h[i] += x[i];
 }
 
 // out[o] = sum_k wexp[k]*dy[k][o] — deterministic accumulation in routed order.
