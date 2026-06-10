@@ -625,6 +625,44 @@ extern "C" __global__ void q8_moe_gemv(const float* __restrict__ scales,
     if (l == 0) y[(long long)k * out_dim + row] = acc;
 }
 
+// ===== Native-Q6_K MoE GEMV (NO repack: 210 B/superblock as in the GGUF) =====
+// w = full 3D expert tensor (native bytes), expert stride ebytes. Per superblock:
+// ql[128] qh[64] sc[16xi8] d[f16]. 8 waves/block, 32 lanes on the SAME superblock
+// (l = the l-index of dequant), looping superblocks serially. grid=(ceil(out/8), k).
+extern "C" __global__ void q6_moe_gemv(const unsigned char* __restrict__ w, long long ebytes,
+                                       const int* __restrict__ ids,
+                                       const float* __restrict__ x,
+                                       float* __restrict__ y, int in_dim, int out_dim) {
+    int wave = threadIdx.x >> 5, l = threadIdx.x & 31;
+    int row = blockIdx.x * 8 + wave, k = blockIdx.y;
+    if (row >= out_dim) return;
+    int nb = in_dim / 256;
+    const unsigned char* rowp = w + (long long)ids[k] * ebytes + (long long)row * nb * 210;
+    int is = l / 16;
+    float acc = 0.f;
+    for (int bi = 0; bi < nb; bi++) {
+        const unsigned char* blk = rowp + bi * 210;
+        const unsigned char* ql = blk;
+        const unsigned char* qh = blk + 128;
+        const signed char* sc = (const signed char*)(blk + 192);
+        float d = h2f(*(const unsigned short*)(blk + 208));
+        int xb = bi * 256;
+        for (int half = 0; half < 2; half++) {
+            int q0 = ql[half * 64 + l], q1 = ql[half * 64 + l + 32];
+            int hh = qh[half * 32 + l];
+            int v1 = ((q0 & 0xF) | ((hh & 3) << 4)) - 32;
+            int v2 = ((q1 & 0xF) | (((hh >> 2) & 3) << 4)) - 32;
+            int v3 = ((q0 >> 4) | (((hh >> 4) & 3) << 4)) - 32;
+            int v4 = ((q1 >> 4) | (((hh >> 6) & 3) << 4)) - 32;
+            int pos = half * 128 + l, si = half * 8 + is;
+            acc += d * (sc[si] * v1 * x[xb + pos] + sc[si + 2] * v2 * x[xb + pos + 32]
+                      + sc[si + 4] * v3 * x[xb + pos + 64] + sc[si + 6] * v4 * x[xb + pos + 96]);
+    }
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
+    if (l == 0) y[(long long)k * out_dim + row] = acc;
+}
+
 // act[k][i] = silu(g[k][i]) * u[k][i]; n = k*eff.
 extern "C" __global__ void moe_silu_mul(const float* __restrict__ g, const float* __restrict__ u,
                                         float* __restrict__ act, int n) {

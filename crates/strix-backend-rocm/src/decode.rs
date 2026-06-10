@@ -128,6 +128,17 @@ fn planar_q8(bytes: &[u8]) -> (Vec<f32>, Vec<i8>) {
     (scales, quants)
 }
 
+/// A whole MoE layer in NATIVE Q6_K bytes (210 B/superblock, no inflation).
+struct ResMoe6 {
+    gate: Dbuf,
+    up: Dbuf,
+    down: Dbuf,
+    hidden: usize,
+    eff: usize,
+    gate_eb: i64,
+    down_eb: i64,
+}
+
 /// Per-launch kernel argument buffer (stable storage the launch points into).
 struct Args {
     vals: Vec<[u8; 8]>,
@@ -234,6 +245,7 @@ pub struct RocmWeightAccel {
     gemv_y: Dbuf,
     /// Fused-MoE residency (by layer) + per-token scratch (ids/wexp/g/u/act/dy/out).
     moe: HashMap<usize, ResMoe>,
+    moe6: HashMap<usize, ResMoe6>,
     moe_ids: Dbuf,
     moe_w: Dbuf,
     moe_g: Dbuf,
@@ -317,6 +329,7 @@ impl RocmWeightAccel {
             "q6_gemv",
             "q8_0_gemv",
             "q8_moe_gemv",
+            "q6_moe_gemv",
             "moe_silu_mul",
             "moe_wsum",
             "vec_add",
@@ -377,6 +390,7 @@ impl RocmWeightAccel {
             gemv_x,
             gemv_y,
             moe: HashMap::new(),
+            moe6: HashMap::new(),
             moe_ids,
             moe_w,
             moe_g,
@@ -457,6 +471,70 @@ impl RocmWeightAccel {
             256,
             0,
             Args::new().ptr(x).ptr(w).ptr(y).i(dim as i32).i(1).f(1e-6),
+        );
+    }
+
+    /// No-sync fused Q6_K MoE launches (native bytes) — same scratch as Q8.
+    fn moe6_launches(&self, m: &ResMoe6, k: usize, x: *mut c_void) {
+        let geb = m.gate_eb as usize as *mut c_void;
+        let deb = m.down_eb as usize as *mut c_void;
+        for (w, y) in [(&m.gate, self.moe_g.ptr), (&m.up, self.moe_u.ptr)] {
+            self.launch2(
+                "q6_moe_gemv",
+                m.eff.div_ceil(8) as u32,
+                k as u32,
+                256,
+                0,
+                Args::new()
+                    .ptr(w.ptr)
+                    .ptr(geb)
+                    .ptr(self.moe_ids.ptr)
+                    .ptr(x)
+                    .ptr(y)
+                    .i(m.hidden as i32)
+                    .i(m.eff as i32),
+            );
+        }
+        let n_act = k * m.eff;
+        self.launch(
+            "moe_silu_mul",
+            n_act.div_ceil(256) as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(self.moe_g.ptr)
+                .ptr(self.moe_u.ptr)
+                .ptr(self.moe_act.ptr)
+                .i(n_act as i32),
+        );
+        for e in 0..k {
+            self.launch2(
+                "q6_moe_gemv",
+                m.hidden.div_ceil(8) as u32,
+                1,
+                256,
+                0,
+                Args::new()
+                    .ptr(m.down.ptr)
+                    .ptr(deb)
+                    .ptr(unsafe { (self.moe_ids.ptr as *mut i32).add(e) } as *mut c_void)
+                    .ptr(unsafe { (self.moe_act.ptr as *mut f32).add(e * m.eff) } as *mut c_void)
+                    .ptr(unsafe { (self.moe_dy.ptr as *mut f32).add(e * m.hidden) } as *mut c_void)
+                    .i(m.eff as i32)
+                    .i(m.hidden as i32),
+            );
+        }
+        self.launch(
+            "moe_wsum",
+            m.hidden.div_ceil(256) as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(self.moe_dy.ptr)
+                .ptr(self.moe_w.ptr)
+                .ptr(self.moe_out.ptr)
+                .i(m.hidden as i32)
+                .i(k as i32),
         );
     }
 
@@ -1119,7 +1197,59 @@ impl WeightAccel for RocmWeightAccel {
         true
     }
 
+    fn upload_moe_q6(
+        &mut self,
+        layer: usize,
+        gate: &[u8],
+        up: &[u8],
+        down: &[u8],
+        hidden: usize,
+        eff: usize,
+        ne: usize,
+    ) -> bool {
+        if hidden % QK_K != 0 || eff % QK_K != 0 || eff > 4096 || hidden > 4096 {
+            return false;
+        }
+        let gate_eb = (hidden / QK_K) * Q6_K_BYTES * eff;
+        let down_eb = (eff / QK_K) * Q6_K_BYTES * hidden;
+        if gate.len() != gate_eb * ne || up.len() != gate_eb * ne || down.len() != down_eb * ne {
+            return false;
+        }
+        let (Ok(gb), Ok(ub), Ok(db)) = (
+            self.gpu.upload_new(gate),
+            self.gpu.upload_new(up),
+            self.gpu.upload_new(down),
+        ) else {
+            return false;
+        };
+        self.moe6.insert(
+            layer,
+            ResMoe6 {
+                gate: gb,
+                up: ub,
+                down: db,
+                hidden,
+                eff,
+                gate_eb: gate_eb as i64,
+                down_eb: down_eb as i64,
+            },
+        );
+        true
+    }
+
     fn moe_ffn(&self, layer: usize, ids: &[i32], wexp: &[f32], x: &[f32]) -> Option<Vec<f32>> {
+        if let Some(m) = self.moe6.get(&layer) {
+            let k = ids.len();
+            if x.len() != m.hidden || wexp.len() != k || k > 16 {
+                return None;
+            }
+            self.gemv_x.upload(x).ok()?;
+            self.moe_ids.upload(ids).ok()?;
+            self.moe_w.upload(wexp).ok()?;
+            self.moe6_launches(m, k, self.gemv_x.ptr);
+            self.gpu.sync().ok()?;
+            return self.moe_out.download::<f32>(m.hidden).ok();
+        }
         let m = self.moe.get(&layer)?;
         let k = ids.len();
         if x.len() != m.hidden || wexp.len() != k || k > 16 {

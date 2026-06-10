@@ -578,55 +578,34 @@ impl Qwen35Model {
         let hidden = self.cfg.hidden;
         let eff = self.cfg.expert_ff;
         let ne = self.cfg.n_expert;
-        // Partial offload: cap how many layers' experts go to the GPU (rest stay CPU).
-        // The full 35B experts (~29GB repacked) don't fit on a 58GB box alongside the
-        // mmap; STRIX_GPU_EXPERT_LAYERS=N offloads only the first N layers that fit.
-        // Default = all layers (fits for smaller models / when mmap pages are dropped).
         let layer_cap = std::env::var("STRIX_GPU_EXPERT_LAYERS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(self.cfg.n_layer);
         let mut advise: Vec<String> = Vec::new();
+        // Whole-layer NATIVE upload (Q6_K/Q8_0, no repack inflation -> the 35B fits)
+        // for the fused moe_ffn decode path.
         for il in 0..self.cfg.n_layer.min(layer_cap) {
-            for (tname, in_dim, out_dim) in [
-                ("ffn_gate_exps", hidden, eff),
-                ("ffn_up_exps", hidden, eff),
-                ("ffn_down_exps", eff, hidden),
-            ] {
-                let full = format!("blk.{il}.{tname}.weight");
-                let Some(ti) = self.gguf.tensors().get(&full) else {
-                    continue;
-                };
-                let ty = ti.ggml_type;
-                if !matches!(ty, GgmlType::Q6K | GgmlType::Q4_0 | GgmlType::Q8_0) {
-                    continue;
-                }
-                let bpr = (in_dim / ty.block_elems()) * ty.block_bytes() * out_dim;
-                let Ok(bytes) = self.gguf.tensor_bytes(&full) else {
-                    continue;
-                };
-                let mut got = 0usize;
-                for e in 0..ne {
-                    let slice = &bytes[e * bpr..(e + 1) * bpr];
-                    if up(
-                        &mut accel,
-                        &format!("blk.{il}.{tname}.e{e}"),
-                        slice,
-                        ty,
-                        in_dim,
-                        out_dim,
-                    ) {
-                        got += 1;
-                    }
-                }
-                n += got;
-                // If every expert of this tensor was uploaded to the GPU, drop its
-                // CPU mmap pages (MADV_DONTNEED) — the GPU now holds the working copy.
-                // Avoids double-counting ~24GB of experts (mmap + UMA) which would
-                // otherwise swap-thrash a 58GB box on the 35B model.
-                if got == ne {
-                    advise.push(full.clone());
-                }
+            let gname = format!("blk.{il}.ffn_gate_exps.weight");
+            let uname = format!("blk.{il}.ffn_up_exps.weight");
+            let dname = format!("blk.{il}.ffn_down_exps.weight");
+            let (Some(gt), Some(dt)) = (self.gguf.tensors().get(&gname), self.gguf.tensors().get(&dname)) else { continue };
+            let (gty, dty) = (gt.ggml_type, dt.ggml_type);
+            let (Ok(gb), Ok(ub), Ok(db)) = (
+                self.gguf.tensor_bytes(&gname),
+                self.gguf.tensor_bytes(&uname),
+                self.gguf.tensor_bytes(&dname),
+            ) else { continue };
+            let ok = match (gty, dty) {
+                (GgmlType::Q6K, GgmlType::Q6K) => accel.upload_moe_q6(il, gb, ub, db, hidden, eff, ne),
+                (GgmlType::Q8_0, GgmlType::Q8_0) => accel.upload_moe_q8(il, gb, ub, db, hidden, eff, ne),
+                _ => false,
+            };
+            if ok {
+                n += 1;
+                advise.push(gname);
+                advise.push(uname);
+                advise.push(dname);
             }
         }
         for name in &advise {
@@ -1435,6 +1414,14 @@ impl Qwen35Model {
         idx.truncate(topk);
         let wsum: f32 = idx.iter().map(|&e| probs[e]).sum();
 
+        // Fused GPU MoE for the routed experts (shared expert stays on CPU below).
+        let mut gpu_out: Option<Vec<f32>> = None;
+        if let Some(a) = &self.accel {
+            let ids: Vec<i32> = idx.iter().map(|&e| e as i32).collect();
+            let wexp: Vec<f32> = idx.iter().map(|&e| probs[e] / wsum).collect();
+            gpu_out = a.moe_ffn(il, &ids, &wexp, x).filter(|y| y.len() == hidden);
+        }
+
         let wge = self.w(&b("ffn_gate_exps.weight"))?; // [hidden, eff, ne]
         let wue = self.w(&b("ffn_up_exps.weight"))?;
         let wde = self.w(&b("ffn_down_exps.weight"))?; // [eff, hidden, ne]
@@ -1442,12 +1429,13 @@ impl Qwen35Model {
         let up_bpr = (hidden / wue.ty.block_elems()) * wue.ty.block_bytes() * eff;
         let down_bpr = (eff / wde.ty.block_elems()) * wde.ty.block_bytes() * hidden;
 
-        let mut out = vec![0.0f32; hidden];
+        let routed_on_gpu = gpu_out.is_some();
+        let mut out = gpu_out.unwrap_or_else(|| vec![0.0f32; hidden]);
         let mut g = vec![0.0f32; eff];
         let mut u = vec![0.0f32; eff];
         let mut act = vec![0.0f32; eff];
         let mut dy = vec![0.0f32; hidden];
-        for &e in &idx {
+        for &e in if routed_on_gpu { &idx[..0] } else { &idx[..] } {
             let wexp = probs[e] / wsum;
             // GPU gemv per expert slice (key `blk.{il}.ffn_*_exps.e{e}`) if resident,
             // else CPU on the byte slice. Experts are the bulk of decode compute.
