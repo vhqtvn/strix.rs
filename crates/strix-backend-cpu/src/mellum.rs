@@ -386,7 +386,11 @@ impl MellumModel {
                     ) else {
                         continue;
                     };
-                    if npu.kv.stage_q8((il * 2 + j) as u64, bytes, ti.ggml_type).is_err() {
+                    if npu
+                        .kv
+                        .stage_q8((il * 2 + j) as u64, bytes, ti.ggml_type)
+                        .is_err()
+                    {
                         break 'stage;
                     }
                     n += 1;
@@ -535,7 +539,10 @@ impl MellumModel {
                 }
             }
             let name = format!("blk.{il}.ffn_gate_inp.weight");
-            if let (Some(ti), Ok(bytes)) = (self.gguf.tensors().get(&name), self.gguf.tensor_bytes(&name)) {
+            if let (Some(ti), Ok(bytes)) = (
+                self.gguf.tensors().get(&name),
+                self.gguf.tensor_bytes(&name),
+            ) {
                 if ti.ggml_type == GgmlType::Q8_0 {
                     accel.upload_q8_0(&name, bytes, ti.dims[0] as usize, ti.dims[1] as usize);
                 }
@@ -567,16 +574,24 @@ impl MellumModel {
         let emb = self.w("token_embd.weight")?;
         let mut h = vec![0.0f32; hidden];
         let bpr = (hidden / emb.ty.block_elems()) * emb.ty.block_bytes();
-        dequantize_into(emb.ty, &emb.bytes[token as usize * bpr..(token as usize + 1) * bpr], &mut h)?;
+        dequantize_into(
+            emb.ty,
+            &emb.bytes[token as usize * bpr..(token as usize + 1) * bpr],
+            &mut h,
+        )?;
 
-        let Some(a) = self.accel.as_mut() else { return Ok(None) };
+        let Some(a) = self.accel.as_mut() else {
+            return Ok(None);
+        };
         if !a.mlm_begin(&h) {
             return Ok(None);
         }
         let topk = cfg.n_expert_used;
         for il in 0..cfg.n_layer {
             let a = self.accel.as_mut().unwrap();
-            let Some((mut q, mut k, v)) = a.mlm_qkv(il) else { return Ok(None) };
+            let Some((mut q, mut k, v)) = a.mlm_qkv(il) else {
+                return Ok(None);
+            };
             // per-head QK-norm + rope + cache + sdpa (CPU, exact)
             let qn = self.vecw(&format!("blk.{il}.attn_q_norm.weight"))?;
             let kn = self.vecw(&format!("blk.{il}.attn_k_norm.weight"))?;
@@ -586,20 +601,44 @@ impl MellumModel {
             } else {
                 (1.0 / cfg.yarn_factor, 1.0, cfg.yarn_attn_factor)
             };
-            let corr = yarn_corr_dims(cfg.n_rot, cfg.yarn_orig_ctx, cfg.rope_freq_base, cfg.yarn_beta_fast, cfg.yarn_beta_slow);
+            let corr = yarn_corr_dims(
+                cfg.n_rot,
+                cfg.yarn_orig_ctx,
+                cfg.rope_freq_base,
+                cfg.yarn_beta_fast,
+                cfg.yarn_beta_slow,
+            );
             for hh in 0..nh {
                 let qh = &mut q[hh * hd..hh * hd + hd];
                 let mut tmp = vec![0.0f32; hd];
                 rmsnorm(&mut tmp, qh, &qn, cfg.rms_eps);
                 qh.copy_from_slice(&tmp);
-                rope_neox(qh, pos, cfg.n_rot, cfg.rope_freq_base, freq_scale, ext_factor, mscale, corr);
+                rope_neox(
+                    qh,
+                    pos,
+                    cfg.n_rot,
+                    cfg.rope_freq_base,
+                    freq_scale,
+                    ext_factor,
+                    mscale,
+                    corr,
+                );
             }
             for kh in 0..nkv {
                 let khv = &mut k[kh * hd..kh * hd + hd];
                 let mut tmp = vec![0.0f32; hd];
                 rmsnorm(&mut tmp, khv, &kn, cfg.rms_eps);
                 khv.copy_from_slice(&tmp);
-                rope_neox(khv, pos, cfg.n_rot, cfg.rope_freq_base, freq_scale, ext_factor, mscale, corr);
+                rope_neox(
+                    khv,
+                    pos,
+                    cfg.n_rot,
+                    cfg.rope_freq_base,
+                    freq_scale,
+                    ext_factor,
+                    mscale,
+                    corr,
+                );
             }
             self.kc[il].extend_from_slice(&k);
             self.vc[il].extend_from_slice(&v);
@@ -617,17 +656,30 @@ impl MellumModel {
             for hh in 0..nh {
                 let kvh = hh / groups;
                 for (ti, t) in (win_start..len).enumerate() {
-                    keys[ti * hd..ti * hd + hd]
-                        .copy_from_slice(&self.kc[il][t * kv_dim + kvh * hd..t * kv_dim + kvh * hd + hd]);
-                    vals[ti * hd..ti * hd + hd]
-                        .copy_from_slice(&self.vc[il][t * kv_dim + kvh * hd..t * kv_dim + kvh * hd + hd]);
+                    keys[ti * hd..ti * hd + hd].copy_from_slice(
+                        &self.kc[il][t * kv_dim + kvh * hd..t * kv_dim + kvh * hd + hd],
+                    );
+                    vals[ti * hd..ti * hd + hd].copy_from_slice(
+                        &self.vc[il][t * kv_dim + kvh * hd..t * kv_dim + kvh * hd + hd],
+                    );
                 }
                 let mut oh = vec![0.0f32; hd];
-                crate::attention::sdpa_single(&mut oh, &q[hh * hd..hh * hd + hd], &keys, &vals, hd, wlen, scale, &mut scratch);
+                crate::attention::sdpa_single(
+                    &mut oh,
+                    &q[hh * hd..hh * hd + hd],
+                    &keys,
+                    &vals,
+                    hd,
+                    wlen,
+                    scale,
+                    &mut scratch,
+                );
                 attn_out[hh * hd..hh * hd + hd].copy_from_slice(&oh);
             }
             let a = self.accel.as_mut().unwrap();
-            let Some(rl) = a.mlm_post1(il, &attn_out) else { return Ok(None) };
+            let Some(rl) = a.mlm_post1(il, &attn_out) else {
+                return Ok(None);
+            };
             // router top-k (CPU, same math as moe())
             let ne = cfg.n_expert;
             let mx = rl.iter().cloned().fold(f32::MIN, f32::max);

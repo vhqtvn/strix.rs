@@ -575,9 +575,9 @@ extern "C" __global__ void q8_0_gemv(const float* __restrict__ scales,
                                      const signed char* __restrict__ quants,
                                      const float* __restrict__ x,
                                      float* __restrict__ y, int in_dim, int out_dim) {
-    int wave = threadIdx.x >> 5;  // 0..7
+    // 1 wave per row, wg=32 (q4_gemv recipe: more blocks -> better latency hiding)
     int l = threadIdx.x & 31;
-    int row = blockIdx.x * 8 + wave;
+    int row = blockIdx.x;
     if (row >= out_dim) return;
     int nb = in_dim / 32, rb = row * nb;
     // 4 blocks per pass, char4 per lane (coalesced 128B/wave). nb % 4 == 0 holds for

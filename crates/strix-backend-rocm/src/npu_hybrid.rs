@@ -173,13 +173,17 @@ impl NpuFfn {
         let t = t0.elapsed().as_secs_f64() / reps as f64;
         let (m, k, n) = (MPAD as f64, self.k as f64, self.n_npu as f64);
         let ops = 2.0 * m * k * n; // MAC = 2 flops
-        // int8 A (m·k) + int8 B (k·n) + int32 C (m·n·4)
+                                   // int8 A (m·k) + int8 B (k·n) + int32 C (m·n·4)
         let bytes = m * k + k * n + m * n * 4.0;
         let tops = ops / t / 1e12;
         let bw = bytes / t / 1e9;
         let ai = ops / bytes;
         // ~50 TOPS int8 peak, ~60 GB/s NPU bandwidth (measured, see memory).
-        let bound = if tops / 50.0 > bw / 60.0 { "COMPUTE" } else { "MEMORY" };
+        let bound = if tops / 50.0 > bw / 60.0 {
+            "COMPUTE"
+        } else {
+            "MEMORY"
+        };
         eprintln!(
             "[npu-roofline {label}] M=256 K={} N={} | {:.3} ms/run | {:.1} TOPS ({:.0}%) | {:.1} GB/s ({:.0}%) | AI={:.1} | {}-bound{}",
             self.k, self.n_npu, t * 1e3, tops, tops / 50.0 * 100.0, bw, bw / 60.0 * 100.0, ai, bound,

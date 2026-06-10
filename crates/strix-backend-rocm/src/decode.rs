@@ -393,7 +393,11 @@ impl RocmWeightAccel {
             mlm_rl,
             kv_f16: std::env::var("STRIX_F16_KV").is_ok(),
             // pinned split if STRIX_N_SPLIT set, else 0 = context-adaptive (~len/64).
-            n_split: std::env::var("STRIX_N_SPLIT").ok().and_then(|s| s.parse::<usize>().ok()).map(|v| v.clamp(1, N_SPLIT_MAX)).unwrap_or(0),
+            n_split: std::env::var("STRIX_N_SPLIT")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .map(|v| v.clamp(1, N_SPLIT_MAX))
+                .unwrap_or(0),
             name,
             verify_all: false,
             want_argmax: false,
@@ -432,8 +436,8 @@ impl RocmWeightAccel {
     fn q8_launch(&self, e: &ResQ8, x: *mut c_void, y: *mut c_void) {
         self.launch(
             "q8_0_gemv",
-            e.out_dim.div_ceil(8) as u32,
-            256,
+            e.out_dim as u32,
+            32,
             0,
             Args::new()
                 .ptr(e.scales.ptr)
@@ -747,8 +751,8 @@ impl RocmWeightAccel {
         // so it moves FLOPs off the iGPU for free (power) at no wall-time cost.
         if !self.npu_q_pending.is_empty() {
             let qd = 4096usize; // local q_dim
-            // Default 4096 → attn_q(local) FULLY on NPU (full-N 256x3840x4096_8c xclbin
-            // exists); max-NPU posture, transparent partition. STRIX_NPU_NNPU_Q overrides.
+                                // Default 4096 → attn_q(local) FULLY on NPU (full-N 256x3840x4096_8c xclbin
+                                // exists); max-NPU posture, transparent partition. STRIX_NPU_NNPU_Q overrides.
             let n_npu_q = std::env::var("STRIX_NPU_NNPU_Q")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -925,7 +929,9 @@ impl WeightAccel for RocmWeightAccel {
             // only ffn_up (the gate∥up free-parallelism pair), which is marginally
             // faster at high iGPU clock but works the iGPU harder. STRIX_NPU_SKIP
             // (comma list of up,down,o,q) is a fine override.
-            let power = std::env::var("STRIX_NPU_MODE").map(|m| m != "speed").unwrap_or(true);
+            let power = std::env::var("STRIX_NPU_MODE")
+                .map(|m| m != "speed")
+                .unwrap_or(true);
             let skipv = std::env::var("STRIX_NPU_SKIP").unwrap_or_default();
             let skip = |n: &str| {
                 skipv.split(',').any(|s| s.trim() == n)
@@ -1165,7 +1171,10 @@ impl WeightAccel for RocmWeightAccel {
             hidden.div_ceil(256) as u32,
             256,
             0,
-            Args::new().ptr(self.mlm_h.ptr).ptr(self.moe_out.ptr).i(hidden as i32),
+            Args::new()
+                .ptr(self.mlm_h.ptr)
+                .ptr(self.moe_out.ptr)
+                .i(hidden as i32),
         );
         self.norm_launch(self.mlm_h.ptr, fnw.ptr, self.mlm_n.ptr, hidden);
         self.q8_launch(wgi, self.mlm_n.ptr, self.mlm_rl.ptr);
@@ -1174,7 +1183,9 @@ impl WeightAccel for RocmWeightAccel {
     }
 
     fn mlm_post2(&mut self, il: usize, ids: &[i32], wexp: &[f32]) -> bool {
-        let Some(m) = self.moe.get(&il) else { return false };
+        let Some(m) = self.moe.get(&il) else {
+            return false;
+        };
         let k = ids.len();
         if self.moe_ids.upload(ids).is_err() || self.moe_w.upload(wexp).is_err() {
             return false;
@@ -1185,7 +1196,10 @@ impl WeightAccel for RocmWeightAccel {
             m.hidden.div_ceil(256) as u32,
             256,
             0,
-            Args::new().ptr(self.mlm_h.ptr).ptr(self.moe_out.ptr).i(m.hidden as i32),
+            Args::new()
+                .ptr(self.mlm_h.ptr)
+                .ptr(self.moe_out.ptr)
+                .i(m.hidden as i32),
         );
         true // no sync — next layer's qkv sync covers it
     }
@@ -1255,8 +1269,8 @@ impl WeightAccel for RocmWeightAccel {
             self.gemv_x.upload(x).ok()?;
             self.launch(
                 "q8_0_gemv",
-                e.out_dim.div_ceil(8) as u32,
-                256,
+                e.out_dim as u32,
+                32,
                 0,
                 Args::new()
                     .ptr(e.scales.ptr)
@@ -1359,7 +1373,9 @@ impl WeightAccel for RocmWeightAccel {
             // (n_heads*M_CHUNK*max_seq f32 can be 10s-100s of MB).
             p_scores: if std::env::var("STRIX_GEMM_SDPA").is_ok() {
                 // f16 scores (2 bytes/elem): n_heads * M_CHUNK * max_seq.
-                self.gpu.alloc(n_heads * M_CHUNK * cfg.max_seq * 2).expect("p_scores")
+                self.gpu
+                    .alloc(n_heads * M_CHUNK * cfg.max_seq * 2)
+                    .expect("p_scores")
             } else {
                 self.gpu.alloc(2).expect("p_scores")
             },
@@ -2218,7 +2234,11 @@ impl WeightAccel for RocmWeightAccel {
                     let len = start_pos + m;
                     let n_swa = if lc.is_local { cfg.n_swa as i32 } else { 0 };
                     // waves/block (each wave = one independent output tile). 8 default.
-                    let gnw = std::env::var("STRIX_GEMM_NW").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(8).clamp(1, 16);
+                    let gnw = std::env::var("STRIX_GEMM_NW")
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(8)
+                        .clamp(1, 16);
                     self.launch3(
                         "sdpa_qk_wmma",
                         n_heads as u32,
@@ -2301,7 +2321,11 @@ impl WeightAccel for RocmWeightAccel {
                     // Gated to hd<=256: dchunks=hd/16<=MAXDC(16) and shared stays <64KB.
                     // Gemma global layers (hd=512) fall through to the scalar path below.
                     let n_swa = if lc.is_local { cfg.n_swa as i32 } else { 0 };
-                    let nw = std::env::var("STRIX_WMMA_NW").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(4).clamp(1, 4);
+                    let nw = std::env::var("STRIX_WMMA_NW")
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(4)
+                        .clamp(1, 4);
                     let shbytes = (64 * hd + 32 * nw * hd + 1664 * nw) as u32;
                     self.launch2(
                         "sdpa_prefill_wmma",
