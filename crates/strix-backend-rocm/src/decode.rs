@@ -1462,7 +1462,7 @@ impl WeightAccel for RocmWeightAccel {
         self.launch2(
             "q8_gemm_rows",
             e.out_dim as u32,
-            m as u32,
+            m.div_ceil(8) as u32,
             32,
             0,
             Args::new()
@@ -1471,7 +1471,8 @@ impl WeightAccel for RocmWeightAccel {
                 .ptr(self.pf_x.ptr)
                 .ptr(self.pf_y.ptr)
                 .i(e.in_dim as i32)
-                .i(e.out_dim as i32),
+                .i(e.out_dim as i32)
+                .i(m as i32),
         );
         self.gpu.sync().ok()?;
         self.pf_y.download::<f32>(m * e.out_dim).ok()

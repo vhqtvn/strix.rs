@@ -672,26 +672,34 @@ extern "C" __global__ void q6_moe_gemv(const unsigned char* __restrict__ w, long
 }
 
 // Q8 GEMM rows variant: y[t][row] = W row . xs[t]; grid=(out_dim, m), block=32 (wave/row).
+// 8 tokens/block: weight row read once per 8 tokens. grid=(out_dim, ceil(m/8)).
 extern "C" __global__ void q8_gemm_rows(const float* __restrict__ scales,
                                         const signed char* __restrict__ quants,
                                         const float* __restrict__ xs,
-                                        float* __restrict__ y, int in_dim, int out_dim) {
+                                        float* __restrict__ y, int in_dim, int out_dim, int m) {
     int l = threadIdx.x & 31;
-    int row = blockIdx.x, t = blockIdx.y;
+    int row = blockIdx.x, t0 = blockIdx.y * 8;
     if (row >= out_dim) return;
+    int tm = m - t0;
+    if (tm > 8) tm = 8;
     int nb = in_dim / 32, rb = row * nb;
-    const float* x = xs + (long long)t * in_dim;
-    float acc = 0.f;
     int e = (l & 7) * 4;
+    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     for (int b4 = 0; b4 < nb; b4 += 4) {
         int bi = b4 + (l >> 3);
         float d = scales[rb + bi];
         const char4 q = *(const char4*)(quants + ((long long)(rb + bi) * 32 + e));
-        const float* xb = x + bi * 32 + e;
-        acc += d * (q.x * xb[0] + q.y * xb[1] + q.z * xb[2] + q.w * xb[3]);
+        int xo = bi * 32 + e;
+        for (int j = 0; j < tm; j++) {
+            const float* xb = xs + (long long)(t0 + j) * in_dim + xo;
+            acc[j] += d * (q.x * xb[0] + q.y * xb[1] + q.z * xb[2] + q.w * xb[3]);
+        }
     }
-    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
-    if (l == 0) y[(long long)t * out_dim + row] = acc;
+    for (int j = 0; j < tm; j++) {
+        float a = acc[j];
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_down(a, o);
+        if (l == 0) y[(long long)(t0 + j) * out_dim + row] = a;
+    }
 }
 
 // Native-Q6 GEMM rows for ONE expert: y[t][row] = expert eid row . xs[t].
