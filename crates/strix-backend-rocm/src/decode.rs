@@ -100,16 +100,32 @@ struct ResQ8 {
     out_dim: usize,
 }
 
-/// A whole MoE layer resident in NATIVE Q8_0 bytes (no repack): the full 3D
-/// gate/up/down expert tensors + per-token scratch for the fused decode path.
+/// A whole MoE layer resident in PLANAR Q8_0 (f32 scales + int8 quants per tensor):
+/// aligned char4/coalesced reads for the fused decode path.
 struct ResMoe {
-    gate: Dbuf,
-    up: Dbuf,
-    down: Dbuf,
+    gate_s: Dbuf,
+    gate_q: Dbuf,
+    up_s: Dbuf,
+    up_q: Dbuf,
+    down_s: Dbuf,
+    down_q: Dbuf,
     hidden: usize,
     eff: usize,
-    gate_eb: i64, // bytes per expert
-    down_eb: i64,
+}
+
+/// Repack a whole 3D Q8_0 expert tensor into planar scales f32 + quants i8.
+fn planar_q8(bytes: &[u8]) -> (Vec<f32>, Vec<i8>) {
+    let nb_total = bytes.len() / 34;
+    let mut scales = vec![0.0f32; nb_total];
+    let mut quants = vec![0i8; nb_total * 32];
+    for b in 0..nb_total {
+        let blk = &bytes[b * 34..(b + 1) * 34];
+        scales[b] = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        for i in 0..32 {
+            quants[b * 32 + i] = blk[2 + i] as i8;
+        }
+    }
+    (scales, quants)
 }
 
 /// Per-launch kernel argument buffer (stable storage the launch points into).
@@ -443,9 +459,10 @@ impl RocmWeightAccel {
     /// No-sync fused-MoE launches for layer `layer` over k routed experts
     /// (ids/wexp already uploaded): x → moe_out. Caller syncs.
     fn moe_launches(&self, m: &ResMoe, k: usize, x: *mut c_void) {
-        let geb = m.gate_eb as usize as *mut c_void;
-        let deb = m.down_eb as usize as *mut c_void;
-        for (w, y) in [(&m.gate, self.moe_g.ptr), (&m.up, self.moe_u.ptr)] {
+        for (ws, wq, y) in [
+            (&m.gate_s, &m.gate_q, self.moe_g.ptr),
+            (&m.up_s, &m.up_q, self.moe_u.ptr),
+        ] {
             self.launch2(
                 "q8_moe_gemv",
                 m.eff.div_ceil(8) as u32,
@@ -453,8 +470,8 @@ impl RocmWeightAccel {
                 256,
                 0,
                 Args::new()
-                    .ptr(w.ptr)
-                    .ptr(geb)
+                    .ptr(ws.ptr)
+                    .ptr(wq.ptr)
                     .ptr(self.moe_ids.ptr)
                     .ptr(x)
                     .ptr(y)
@@ -482,8 +499,8 @@ impl RocmWeightAccel {
                 256,
                 0,
                 Args::new()
-                    .ptr(m.down.ptr)
-                    .ptr(deb)
+                    .ptr(m.down_s.ptr)
+                    .ptr(m.down_q.ptr)
                     .ptr(unsafe { (self.moe_ids.ptr as *mut i32).add(e) } as *mut c_void)
                     .ptr(unsafe { (self.moe_act.ptr as *mut f32).add(e * m.eff) } as *mut c_void)
                     .ptr(unsafe { (self.moe_dy.ptr as *mut f32).add(e * m.hidden) } as *mut c_void)
@@ -1066,23 +1083,30 @@ impl WeightAccel for RocmWeightAccel {
         if gate.len() != gate_eb * ne || up.len() != gate_eb * ne || down.len() != down_eb * ne {
             return false;
         }
-        let (Ok(gb), Ok(ub), Ok(db)) = (
-            self.gpu.upload_new(gate),
-            self.gpu.upload_new(up),
-            self.gpu.upload_new(down),
+        let (gs, gq) = planar_q8(gate);
+        let (us, uq) = planar_q8(up);
+        let (ds, dq) = planar_q8(down);
+        let (Ok(gsb), Ok(gqb), Ok(usb), Ok(uqb), Ok(dsb), Ok(dqb)) = (
+            self.gpu.upload_new(&gs),
+            self.gpu.upload_new(&gq),
+            self.gpu.upload_new(&us),
+            self.gpu.upload_new(&uq),
+            self.gpu.upload_new(&ds),
+            self.gpu.upload_new(&dq),
         ) else {
             return false;
         };
         self.moe.insert(
             layer,
             ResMoe {
-                gate: gb,
-                up: ub,
-                down: db,
+                gate_s: gsb,
+                gate_q: gqb,
+                up_s: usb,
+                up_q: uqb,
+                down_s: dsb,
+                down_q: dqb,
                 hidden,
                 eff,
-                gate_eb: gate_eb as i64,
-                down_eb: down_eb as i64,
             },
         );
         true
