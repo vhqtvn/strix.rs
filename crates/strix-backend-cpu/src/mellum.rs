@@ -541,6 +541,9 @@ impl MellumModel {
                 }
             }
             let name = format!("blk.{il}.ffn_gate_inp.weight");
+            if let Ok(w) = self.vecw(&name) {
+                accel.upload_f32(&name, &w);
+            }
             if let (Some(ti), Ok(bytes)) = (
                 self.gguf.tensors().get(&name),
                 self.gguf.tensor_bytes(&name),
@@ -583,12 +586,12 @@ impl MellumModel {
         let topk = cfg.n_expert_used;
         let max_seq = 2048usize;
         if pos + 1 > max_seq {
-            return Ok(None);
+            { eprintln!("[fused bail 1]"); return Ok(None); }
         }
         {
             let a = self.accel.as_mut().unwrap();
             if !a.mlm_prepare(cfg.n_layer, kv_dim, max_seq) || !a.mlm_begin(&h) {
-                return Ok(None);
+                { eprintln!("[fused bail 2]"); return Ok(None); }
             }
         }
         if !self.kv_seeded {
@@ -596,7 +599,7 @@ impl MellumModel {
                 let (kc, vc) = (self.kc[il].clone(), self.vc[il].clone());
                 let a = self.accel.as_mut().unwrap();
                 if !a.mlm_seed_kv(il, &kc, &vc) {
-                    return Ok(None);
+                    { eprintln!("[fused bail 3]"); return Ok(None); }
                 }
             }
             self.kv_seeded = true;
@@ -635,13 +638,13 @@ impl MellumModel {
                     (&cs_f, &sn_f)
                 };
                 if !a.mlm_rope_tables(cs, sn) {
-                    return Ok(None);
+                    { eprintln!("[fused bail 4]"); return Ok(None); }
                 }
                 last_swa = cur;
             }
             let win = if is_swa { cfg.sliding_window } else { 0 };
             if !a.mlm_layer_nosync(il, pos, win, topk) {
-                return Ok(None);
+                { eprintln!("[fused bail 5]"); return Ok(None); }
             }
         }
         self.pos += 1;

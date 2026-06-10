@@ -840,6 +840,17 @@ extern "C" __global__ void vec_add(float* __restrict__ h, const float* __restric
     if (i < n) h[i] += x[i];
 }
 
+// Tiny F32 GEMV (router): y[row] = W[row,:].x. grid=out, block=32.
+extern "C" __global__ void f32_gemv(const float* __restrict__ w, const float* __restrict__ x,
+                                    float* __restrict__ y, int in_dim, int out_dim) {
+    int l = threadIdx.x & 31, row = blockIdx.x;
+    if (row >= out_dim) return;
+    float acc = 0.f;
+    for (int i = l; i < in_dim; i += 32) acc += w[(long long)row * in_dim + i] * x[i];
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
+    if (l == 0) y[row] = acc;
+}
+
 // GPU router top-k: logits[ne] -> ids[k] + renormalized softmax weights[k].
 // Single wave; iterative argmax (ne<=256, k<=16). Matches CPU softmax-all+topk+renorm.
 extern "C" __global__ void topk_router(const float* __restrict__ logits, int ne, int k,

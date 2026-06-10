@@ -352,6 +352,7 @@ impl RocmWeightAccel {
             "vec_add",
             "rope_tab",
             "topk_router",
+            "f32_gemv",
             "shexp_add",
             "argmax_f32",
             "rmsnorm",
@@ -551,12 +552,12 @@ impl RocmWeightAccel {
             self.q8.get(&format!("blk.{il}.attn_v.weight")),
             self.q8.get(&format!("blk.{il}.attn_output.weight")),
             self.f32w.get(&format!("blk.{il}.ffn_norm.weight")),
-            self.q8.get(&format!("blk.{il}.ffn_gate_inp.weight")),
+            self.f32w.get(&format!("blk.{il}.ffn_gate_inp.weight")),
             self.f32w.get(&format!("blk.{il}.attn_q_norm.weight")),
             self.f32w.get(&format!("blk.{il}.attn_k_norm.weight")),
         )
         else {
-            return false;
+            { eprintln!("[mlm_attn_part bail 1]"); return false; }
         };
         let hidden = wq.in_dim;
         let q_dim = wq.out_dim;
@@ -565,7 +566,7 @@ impl RocmWeightAccel {
         let nh = q_dim / hd;
         let nkv = kv_dim / hd;
         if il >= self.mlm_kc.len() || (pos + 1) > self.mlm_seq {
-            return false;
+            { eprintln!("[mlm_attn_part bail 2]"); return false; }
         }
         self.norm_launch(self.mlm_h.ptr, nw.ptr, self.mlm_n.ptr, hidden);
         self.q8_launch(wq, self.mlm_n.ptr, self.mlm_q.ptr);
@@ -645,7 +646,7 @@ impl RocmWeightAccel {
         let win_start = if win > 0 && len > win { len - win } else { 0 };
         let wlen = len - win_start;
         if wlen > 2048 {
-            return false;
+            { eprintln!("[mlm_attn_part bail 3]"); return false; }
         }
         let kbase =
             unsafe { (self.mlm_kc[il].ptr as *mut f32).add(win_start * kv_dim) } as *mut c_void;
@@ -681,7 +682,14 @@ impl RocmWeightAccel {
                 .i(hidden as i32),
         );
         self.norm_launch(self.mlm_h.ptr, fnw.ptr, self.mlm_n.ptr, hidden);
-        self.q8_launch(wgi, self.mlm_n.ptr, self.mlm_rl.ptr);
+        // router is F32 in the GGUF — tiny f32 GEMV (out = n_expert)
+        self.launch(
+            "f32_gemv",
+            64,
+            32,
+            0,
+            Args::new().ptr(wgi.ptr).ptr(self.mlm_n.ptr).ptr(self.mlm_rl.ptr).i(hidden as i32).i(64),
+        );
         true
     }
 
@@ -1572,10 +1580,8 @@ impl WeightAccel for RocmWeightAccel {
         if !self.mlm_attn_part(il, pos, win) {
             return None;
         }
-        let wgi = self.q8.get(&format!("blk.{il}.ffn_gate_inp.weight"))?;
-        let out_dim = wgi.out_dim;
         self.gpu.sync().ok()?;
-        self.mlm_rl.download::<f32>(out_dim).ok()
+        self.mlm_rl.download::<f32>(64).ok()
     }
 
     /// Full layer with on-GPU router top-k + queued MoE — NO sync. Caller syncs once
@@ -1590,11 +1596,11 @@ impl WeightAccel for RocmWeightAccel {
             .get(&format!("blk.{il}.ffn_gate_inp.weight"))
             .map(|w| w.out_dim)
         else {
-            return false;
+            { eprintln!("[mlm_layer_nosync bail 1]"); return false; }
         };
         // attn part: reuse the mlm_layer body up to the router (without sync/download)
         if !self.mlm_attn_part(il, pos, win) {
-            return false;
+            { eprintln!("[mlm_layer_nosync bail 2]"); return false; }
         }
         self.launch(
             "topk_router",
@@ -1609,7 +1615,7 @@ impl WeightAccel for RocmWeightAccel {
                 .ptr(self.moe_w.ptr),
         );
         let Some(m) = self.moe.get(&il) else {
-            return false;
+            { eprintln!("[mlm_layer_nosync bail 3]"); return false; }
         };
         self.moe_launches(m, topk, self.mlm_n.ptr);
         self.launch(
