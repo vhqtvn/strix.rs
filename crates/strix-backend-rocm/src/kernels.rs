@@ -1304,13 +1304,13 @@ extern "C" __global__ void q8w_gemm32(const float* __restrict__ scales,
                                       const float* __restrict__ xd,
                                       float* __restrict__ y, int in_dim, int out_dim, int m) {
     int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, t = lane & 15, hs = lane >> 4;
-    int row0 = blockIdx.x * 128 + w * 16, tok0 = blockIdx.y * 32;
+    int row0 = blockIdx.x * 256 + w * 32, tok0 = blockIdx.y * 32;
     int nb = in_dim / 32;
-    int rrow = row0 + t;
-    bool rok = rrow < out_dim;
+    int rrowA = row0 + t, rrowB = row0 + 16 + t;
+    bool rokA = rrowA < out_dim, rokB = rrowB < out_dim;
     __shared__ int bt[32][32];
     __shared__ float bd[32][4];
-    float f0[8] = {0.f}, f1[8] = {0.f};
+    float f0[8] = {0.f}, f1[8] = {0.f}, g0[8] = {0.f}, g1[8] = {0.f};
     for (int b4 = 0; b4 < nb; b4 += 4) {
         __syncthreads();
         {
@@ -1330,11 +1330,16 @@ extern "C" __global__ void q8w_gemm32(const float* __restrict__ scales,
         int bmax = nb - b4 < 4 ? nb - b4 : 4;
         for (int bi = 0; bi < bmax; bi++) {
             int blk = b4 + bi;
-            w4i_t a0 = {0, 0, 0, 0}, a1 = {0, 0, 0, 0};
-            if (rok) {
-                const int* wp = (const int*)(quants + ((long long)rrow * nb + blk) * 32);
-                a0[0] = wp[0]; a0[1] = wp[1]; a0[2] = wp[2]; a0[3] = wp[3];
-                a1[0] = wp[4]; a1[1] = wp[5]; a1[2] = wp[6]; a1[3] = wp[7];
+            w4i_t a0 = {0,0,0,0}, a1 = {0,0,0,0}, a2 = {0,0,0,0}, a3 = {0,0,0,0};
+            if (rokA) {
+                const int* wp = (const int*)(quants + ((long long)rrowA * nb + blk) * 32);
+                a0[0]=wp[0];a0[1]=wp[1];a0[2]=wp[2];a0[3]=wp[3];
+                a1[0]=wp[4];a1[1]=wp[5];a1[2]=wp[6];a1[3]=wp[7];
+            }
+            if (rokB) {
+                const int* wp = (const int*)(quants + ((long long)rrowB * nb + blk) * 32);
+                a2[0]=wp[0];a2[1]=wp[1];a2[2]=wp[2];a2[3]=wp[3];
+                a3[0]=wp[4];a3[1]=wp[5];a3[2]=wp[6];a3[3]=wp[7];
             }
             w4i_t b0, b1, c0, c1;
             #pragma unroll
@@ -1343,17 +1348,25 @@ extern "C" __global__ void q8w_gemm32(const float* __restrict__ scales,
                 c0[q] = bt[t + 16][bi * 8 + q]; c1[q] = bt[t + 16][bi * 8 + 4 + q];
             }
             w8i_t acc0 = {0,0,0,0,0,0,0,0}, acc1 = {0,0,0,0,0,0,0,0};
+            w8i_t acc2 = {0,0,0,0,0,0,0,0}, acc3 = {0,0,0,0,0,0,0,0};
             acc0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, acc0, true);
             acc0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, acc0, true);
             acc1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, c0, acc1, true);
             acc1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, c1, acc1, true);
+            acc2 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a2, true, b0, acc2, true);
+            acc2 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a3, true, b1, acc2, true);
+            acc3 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a2, true, c0, acc3, true);
+            acc3 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a3, true, c1, acc3, true);
             float dx0 = bd[t][bi], dx1 = bd[t + 16][bi];
             #pragma unroll
             for (int l = 0; l < 8; l++) {
-                int r = row0 + 2 * l + hs;
-                float dw = r < out_dim ? scales[(long long)r * nb + blk] : 0.f;
-                f0[l] += dw * dx0 * (float)acc0[l];
-                f1[l] += dw * dx1 * (float)acc1[l];
+                int rA = row0 + 2 * l + hs, rB = rA + 16;
+                float dwA = rA < out_dim ? scales[(long long)rA * nb + blk] : 0.f;
+                float dwB = rB < out_dim ? scales[(long long)rB * nb + blk] : 0.f;
+                f0[l] += dwA * dx0 * (float)acc0[l];
+                f1[l] += dwA * dx1 * (float)acc1[l];
+                g0[l] += dwB * dx0 * (float)acc2[l];
+                g1[l] += dwB * dx1 * (float)acc3[l];
             }
         }
     }
@@ -1362,10 +1375,12 @@ extern "C" __global__ void q8w_gemm32(const float* __restrict__ scales,
         int tok = tok0 + t + 16 * half;
         if (tok >= m) continue;
         float* f = half ? f1 : f0;
+        float* g = half ? g1 : g0;
         #pragma unroll
         for (int l = 0; l < 8; l++) {
-            int r = row0 + 2 * l + hs;
-            if (r < out_dim) y[(long long)tok * out_dim + r] = f[l];
+            int rA = row0 + 2 * l + hs, rB = rA + 16;
+            if (rA < out_dim) y[(long long)tok * out_dim + rA] = f[l];
+            if (rB < out_dim) y[(long long)tok * out_dim + rB] = g[l];
         }
     }
 }
