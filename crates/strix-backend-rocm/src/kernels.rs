@@ -753,6 +753,37 @@ extern "C" __global__ void q8_qkv_gemv(const float* __restrict__ qs, const signe
     if (l == 0) y[row] = acc;
 }
 
+
+// 32-token tile: weights read once per 32 tokens (2 reg chains for ILP).
+extern "C" __global__ void q8_gemm_rows32(const float* __restrict__ scales,
+                                          const signed char* __restrict__ quants,
+                                          const float* __restrict__ xs,
+                                          float* __restrict__ y, int in_dim, int out_dim, int m) {
+    int l = threadIdx.x & 31;
+    int row = blockIdx.x, t0 = blockIdx.y * 32;
+    if (row >= out_dim) return;
+    int tm = m - t0;
+    if (tm > 32) tm = 32;
+    int nb = in_dim / 32, rb = row * nb;
+    int e = (l & 7) * 4;
+    float acc[32] = {0.f};
+    for (int b4 = 0; b4 < nb; b4 += 4) {
+        int bi = b4 + (l >> 3);
+        float d = scales[rb + bi];
+        const char4 q = *(const char4*)(quants + ((long long)(rb + bi) * 32 + e));
+        int xo = bi * 32 + e;
+        for (int j = 0; j < tm; j++) {
+            const float* xb = xs + (long long)(t0 + j) * in_dim + xo;
+            acc[j] += d * (q.x * xb[0] + q.y * xb[1] + q.z * xb[2] + q.w * xb[3]);
+        }
+    }
+    for (int j = 0; j < tm; j++) {
+        float a = acc[j];
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_down(a, o);
+        if (l == 0) y[(long long)(t0 + j) * out_dim + row] = a;
+    }
+}
+
 // ===== Native-Q6_K MoE GEMV (NO repack: 210 B/superblock as in the GGUF) =====
 // w = full 3D expert tensor (native bytes), expert stride ebytes. Per superblock:
 // ql[128] qh[64] sc[16xi8] d[f16]. 8 waves/block, 32 lanes on the SAME superblock

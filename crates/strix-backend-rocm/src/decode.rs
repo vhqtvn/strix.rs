@@ -353,6 +353,7 @@ impl RocmWeightAccel {
             "q8_qkv_gemv",
             "q6_moe_gemv",
             "q8_gemm_rows",
+            "q8_gemm_rows32",
             "q6_gemm_rows",
             "q6_gemm_moe",
             "moe_silu_mul",
@@ -2138,9 +2139,9 @@ impl WeightAccel for RocmWeightAccel {
         }
         self.pf_x.upload(xs).ok()?;
         self.launch2(
-            "q8_gemm_rows",
+            "q8_gemm_rows32",
             e.out_dim as u32,
-            m.div_ceil(16) as u32,
+            m.div_ceil(32) as u32,
             32,
             0,
             Args::new()
@@ -2319,9 +2320,9 @@ impl WeightAccel for RocmWeightAccel {
             let sp = unsafe { (sb.ptr as *mut f32).add(eoff) } as *mut c_void;
             let qp = unsafe { (qb2.ptr as *mut i8).add(eoff * 32) } as *mut c_void;
             self.launch2(
-                "q8_gemm_rows",
+                "q8_gemm_rows32",
                 mo.eff as u32,
-                m.div_ceil(16) as u32,
+                m.div_ceil(32) as u32,
                 32,
                 0,
                 Args::new()
@@ -2352,9 +2353,9 @@ impl WeightAccel for RocmWeightAccel {
             unsafe { (mo.down_q.ptr as *mut i8).add(eid * mo.hidden * nbd * 32) } as *mut c_void;
         let dyp = unsafe { (self.pf_dy.ptr as *mut f32).add(dy_off * mo.hidden) } as *mut c_void;
         self.launch2(
-            "q8_gemm_rows",
+            "q8_gemm_rows32",
             mo.hidden as u32,
-            m.div_ceil(16) as u32,
+            m.div_ceil(32) as u32,
             32,
             0,
             Args::new()
@@ -2465,9 +2466,9 @@ impl WeightAccel for RocmWeightAccel {
             let sp = unsafe { (e.scales.ptr as *mut f32).add(base * nb) } as *mut c_void;
             let qp = unsafe { (e.quants.ptr as *mut i8).add(base * nb * 32) } as *mut c_void;
             self.launch2(
-                "q8_gemm_rows",
+                "q8_gemm_rows32",
                 oc as u32,
-                m.div_ceil(16) as u32,
+                m.div_ceil(32) as u32,
                 32,
                 0,
                 Args::new()
