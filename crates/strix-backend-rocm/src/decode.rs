@@ -268,6 +268,10 @@ pub struct RocmWeightAccel {
     mlm_cs2: Dbuf,
     mlm_sn2: Dbuf,
     mlm_pos: Dbuf,
+    /// int8-activation scratch (STRIX_INT8): quantized acts + per-32-block scales.
+    mlm_xq: Dbuf,
+    mlm_xd: Dbuf,
+    mlm_int8: bool,
     mlm_graph: Option<*mut std::os::raw::c_void>,
     mlm_seq: usize,
     batch_x: Vec<Dbuf>,
@@ -351,6 +355,12 @@ impl RocmWeightAccel {
             "q8_moe_gemv_gu",
             "q8_moe_down",
             "q8_qkv_gemv",
+            "xquant8",
+            "silu_quant",
+            "q8i_gemv",
+            "q8i_qkv_gemv",
+            "q8i_moe_gu",
+            "q8i_moe_down",
             "q6_moe_gemv",
             "q8_gemm_rows",
             "q8_gemm_rows32",
@@ -415,6 +425,8 @@ impl RocmWeightAccel {
         let mlm_cs2 = gpu.alloc(128 * 4).ok()?;
         let mlm_sn2 = gpu.alloc(128 * 4).ok()?;
         let mlm_pos = gpu.alloc(4).ok()?;
+        let mlm_xq = gpu.alloc(16 * 4096).ok()?;
+        let mlm_xd = gpu.alloc(2048 * 4).ok()?;
         let pf_x = gpu.alloc(2048 * 4096 * 4).ok()?;
         let pf_a = gpu.alloc(2048 * 1024 * 4).ok()?;
         let pf_b = gpu.alloc(2048 * 1024 * 4).ok()?;
@@ -462,6 +474,9 @@ impl RocmWeightAccel {
             mlm_cs2,
             mlm_sn2,
             mlm_pos,
+            mlm_xq,
+            mlm_xd,
+            mlm_int8: std::env::var("STRIX_INT8").is_ok(),
             mlm_graph: None,
             mlm_seq: 0,
             batch_x,
@@ -619,26 +634,61 @@ impl RocmWeightAccel {
             (self.mlm_cs.ptr, self.mlm_sn.ptr)
         };
         self.norm_launch(self.mlm_h.ptr, nw.ptr, self.mlm_n.ptr, hidden);
-        self.launch(
-            "q8_qkv_gemv",
-            (q_dim + 2 * kv_dim) as u32,
-            32,
-            0,
-            Args::new()
-                .ptr(wq.scales.ptr)
-                .ptr(wq.quants.ptr)
-                .ptr(wk.scales.ptr)
-                .ptr(wk.quants.ptr)
-                .ptr(wv.scales.ptr)
-                .ptr(wv.quants.ptr)
-                .ptr(self.mlm_n.ptr)
-                .ptr(self.mlm_q.ptr)
-                .ptr(self.mlm_k.ptr)
-                .ptr(self.mlm_v.ptr)
-                .i(hidden as i32)
-                .i(q_dim as i32)
-                .i(kv_dim as i32),
-        );
+        if self.mlm_int8 {
+            self.launch(
+                "xquant8",
+                (hidden / 32) as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(self.mlm_n.ptr)
+                    .ptr(self.mlm_xq.ptr)
+                    .ptr(self.mlm_xd.ptr)
+                    .i((hidden / 32) as i32),
+            );
+            self.launch(
+                "q8i_qkv_gemv",
+                (q_dim + 2 * kv_dim) as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(wq.scales.ptr)
+                    .ptr(wq.quants.ptr)
+                    .ptr(wk.scales.ptr)
+                    .ptr(wk.quants.ptr)
+                    .ptr(wv.scales.ptr)
+                    .ptr(wv.quants.ptr)
+                    .ptr(self.mlm_xd.ptr)
+                    .ptr(self.mlm_xq.ptr)
+                    .ptr(self.mlm_q.ptr)
+                    .ptr(self.mlm_k.ptr)
+                    .ptr(self.mlm_v.ptr)
+                    .i(hidden as i32)
+                    .i(q_dim as i32)
+                    .i(kv_dim as i32),
+            );
+        } else {
+            self.launch(
+                "q8_qkv_gemv",
+                (q_dim + 2 * kv_dim) as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(wq.scales.ptr)
+                    .ptr(wq.quants.ptr)
+                    .ptr(wk.scales.ptr)
+                    .ptr(wk.quants.ptr)
+                    .ptr(wv.scales.ptr)
+                    .ptr(wv.quants.ptr)
+                    .ptr(self.mlm_n.ptr)
+                    .ptr(self.mlm_q.ptr)
+                    .ptr(self.mlm_k.ptr)
+                    .ptr(self.mlm_v.ptr)
+                    .i(hidden as i32)
+                    .i(q_dim as i32)
+                    .i(kv_dim as i32),
+            );
+        }
         self.launch(
             "rmsnorm",
             nh as u32,
@@ -724,7 +774,34 @@ impl RocmWeightAccel {
                 .i(nkv as i32)
                 .f(scale),
         );
-        self.q8_launch(wo, self.mlm_attn.ptr, self.moe_out.ptr);
+        if self.mlm_int8 {
+            let onb = wo.in_dim / 32;
+            let xqo = unsafe { (self.mlm_xq.ptr as *mut u8).add(8192) as *mut c_void };
+            let xdo = unsafe { (self.mlm_xd.ptr as *mut f32).add(512) as *mut c_void };
+            self.launch(
+                "xquant8",
+                onb as u32,
+                32,
+                0,
+                Args::new().ptr(self.mlm_attn.ptr).ptr(xqo).ptr(xdo).i(onb as i32),
+            );
+            self.launch(
+                "q8i_gemv",
+                wo.out_dim as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(wo.scales.ptr)
+                    .ptr(wo.quants.ptr)
+                    .ptr(xdo)
+                    .ptr(xqo)
+                    .ptr(self.moe_out.ptr)
+                    .i(wo.in_dim as i32)
+                    .i(wo.out_dim as i32),
+            );
+        } else {
+            self.q8_launch(wo, self.mlm_attn.ptr, self.moe_out.ptr);
+        }
         self.launch(
             "vec_add",
             hidden.div_ceil(256) as u32,
@@ -736,6 +813,19 @@ impl RocmWeightAccel {
                 .i(hidden as i32),
         );
         self.norm_launch(self.mlm_h.ptr, fnw.ptr, self.mlm_n.ptr, hidden);
+        if self.mlm_int8 {
+            self.launch(
+                "xquant8",
+                (hidden / 32) as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(self.mlm_n.ptr)
+                    .ptr(self.mlm_xq.ptr)
+                    .ptr(self.mlm_xd.ptr)
+                    .i((hidden / 32) as i32),
+            );
+        }
         self.launch(
             "f32_gemv",
             64,
@@ -825,26 +915,61 @@ impl RocmWeightAccel {
             }
         }
         self.norm_launch(self.mlm_h.ptr, nw.ptr, self.mlm_n.ptr, hidden);
-        self.launch(
-            "q8_qkv_gemv",
-            (q_dim + 2 * kv_dim) as u32,
-            32,
-            0,
-            Args::new()
-                .ptr(wq.scales.ptr)
-                .ptr(wq.quants.ptr)
-                .ptr(wk.scales.ptr)
-                .ptr(wk.quants.ptr)
-                .ptr(wv.scales.ptr)
-                .ptr(wv.quants.ptr)
-                .ptr(self.mlm_n.ptr)
-                .ptr(self.mlm_q.ptr)
-                .ptr(self.mlm_k.ptr)
-                .ptr(self.mlm_v.ptr)
-                .i(hidden as i32)
-                .i(q_dim as i32)
-                .i(kv_dim as i32),
-        );
+        if self.mlm_int8 {
+            self.launch(
+                "xquant8",
+                (hidden / 32) as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(self.mlm_n.ptr)
+                    .ptr(self.mlm_xq.ptr)
+                    .ptr(self.mlm_xd.ptr)
+                    .i((hidden / 32) as i32),
+            );
+            self.launch(
+                "q8i_qkv_gemv",
+                (q_dim + 2 * kv_dim) as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(wq.scales.ptr)
+                    .ptr(wq.quants.ptr)
+                    .ptr(wk.scales.ptr)
+                    .ptr(wk.quants.ptr)
+                    .ptr(wv.scales.ptr)
+                    .ptr(wv.quants.ptr)
+                    .ptr(self.mlm_xd.ptr)
+                    .ptr(self.mlm_xq.ptr)
+                    .ptr(self.mlm_q.ptr)
+                    .ptr(self.mlm_k.ptr)
+                    .ptr(self.mlm_v.ptr)
+                    .i(hidden as i32)
+                    .i(q_dim as i32)
+                    .i(kv_dim as i32),
+            );
+        } else {
+            self.launch(
+                "q8_qkv_gemv",
+                (q_dim + 2 * kv_dim) as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(wq.scales.ptr)
+                    .ptr(wq.quants.ptr)
+                    .ptr(wk.scales.ptr)
+                    .ptr(wk.quants.ptr)
+                    .ptr(wv.scales.ptr)
+                    .ptr(wv.quants.ptr)
+                    .ptr(self.mlm_n.ptr)
+                    .ptr(self.mlm_q.ptr)
+                    .ptr(self.mlm_k.ptr)
+                    .ptr(self.mlm_v.ptr)
+                    .i(hidden as i32)
+                    .i(q_dim as i32)
+                    .i(kv_dim as i32),
+            );
+        }
         self.launch(
             "rmsnorm",
             nh as u32,
@@ -945,7 +1070,34 @@ impl RocmWeightAccel {
                 .f(scale)
                 .i(0),
         );
-        self.q8_launch(wo, self.mlm_attn.ptr, self.moe_out.ptr);
+        if self.mlm_int8 {
+            let onb = wo.in_dim / 32;
+            let xqo = unsafe { (self.mlm_xq.ptr as *mut u8).add(8192) as *mut c_void };
+            let xdo = unsafe { (self.mlm_xd.ptr as *mut f32).add(512) as *mut c_void };
+            self.launch(
+                "xquant8",
+                onb as u32,
+                32,
+                0,
+                Args::new().ptr(self.mlm_attn.ptr).ptr(xqo).ptr(xdo).i(onb as i32),
+            );
+            self.launch(
+                "q8i_gemv",
+                wo.out_dim as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(wo.scales.ptr)
+                    .ptr(wo.quants.ptr)
+                    .ptr(xdo)
+                    .ptr(xqo)
+                    .ptr(self.moe_out.ptr)
+                    .i(wo.in_dim as i32)
+                    .i(wo.out_dim as i32),
+            );
+        } else {
+            self.q8_launch(wo, self.mlm_attn.ptr, self.moe_out.ptr);
+        }
         self.launch(
             "vec_add",
             hidden.div_ceil(256) as u32,
@@ -957,6 +1109,19 @@ impl RocmWeightAccel {
                 .i(hidden as i32),
         );
         self.norm_launch(self.mlm_h.ptr, fnw.ptr, self.mlm_n.ptr, hidden);
+        if self.mlm_int8 {
+            self.launch(
+                "xquant8",
+                (hidden / 32) as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(self.mlm_n.ptr)
+                    .ptr(self.mlm_xq.ptr)
+                    .ptr(self.mlm_xd.ptr)
+                    .i((hidden / 32) as i32),
+            );
+        }
         // router is F32 in the GGUF — tiny f32 GEMV (out = n_expert)
         self.launch(
             "f32_gemv",
@@ -1110,43 +1275,100 @@ impl RocmWeightAccel {
     /// No-sync fused-MoE launches for layer `layer` over k routed experts
     /// (ids/wexp already uploaded): x → moe_out. Caller syncs.
     fn moe_launches(&self, m: &ResMoe, k: usize, x: *mut c_void) {
-        self.launch3(
-            "q8_moe_gemv_gu",
-            m.eff as u32,
-            k as u32,
-            2,
-            32,
-            0,
-            Args::new()
-                .ptr(m.gate_s.ptr)
-                .ptr(m.gate_q.ptr)
-                .ptr(m.up_s.ptr)
-                .ptr(m.up_q.ptr)
-                .ptr(self.moe_ids.ptr)
-                .ptr(x)
-                .ptr(self.moe_g.ptr)
-                .ptr(self.moe_u.ptr)
-                .i(m.hidden as i32)
-                .i(m.eff as i32),
-        );
-        self.launch2(
-            "q8_moe_down",
-            m.hidden as u32,
-            k as u32,
-            32,
-            0,
-            Args::new()
-                .ptr(m.down_s.ptr)
-                .ptr(m.down_q.ptr)
-                .ptr(self.moe_ids.ptr)
-                .ptr(self.moe_w.ptr)
-                .ptr(self.moe_g.ptr)
-                .ptr(self.moe_u.ptr)
-                .ptr(self.moe_dy.ptr)
-                .i(m.eff as i32)
-                .i(m.hidden as i32)
-                .i(k as i32),
-        );
+        if self.mlm_int8 {
+            self.launch3(
+                "q8i_moe_gu",
+                m.eff as u32,
+                k as u32,
+                2,
+                32,
+                0,
+                Args::new()
+                    .ptr(m.gate_s.ptr)
+                    .ptr(m.gate_q.ptr)
+                    .ptr(m.up_s.ptr)
+                    .ptr(m.up_q.ptr)
+                    .ptr(self.moe_ids.ptr)
+                    .ptr(self.mlm_xd.ptr)
+                    .ptr(self.mlm_xq.ptr)
+                    .ptr(self.moe_g.ptr)
+                    .ptr(self.moe_u.ptr)
+                    .i(m.hidden as i32)
+                    .i(m.eff as i32),
+            );
+        } else {
+            self.launch3(
+                "q8_moe_gemv_gu",
+                m.eff as u32,
+                k as u32,
+                2,
+                32,
+                0,
+                Args::new()
+                    .ptr(m.gate_s.ptr)
+                    .ptr(m.gate_q.ptr)
+                    .ptr(m.up_s.ptr)
+                    .ptr(m.up_q.ptr)
+                    .ptr(self.moe_ids.ptr)
+                    .ptr(x)
+                    .ptr(self.moe_g.ptr)
+                    .ptr(self.moe_u.ptr)
+                    .i(m.hidden as i32)
+                    .i(m.eff as i32),
+            );
+        }
+        if self.mlm_int8 {
+            let nb_act = k * m.eff / 32;
+            let xqm = unsafe { (self.mlm_xq.ptr as *mut u8).add(12288) as *mut c_void };
+            let xdm = unsafe { (self.mlm_xd.ptr as *mut f32).add(768) as *mut c_void };
+            self.launch(
+                "silu_quant",
+                nb_act as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(self.moe_g.ptr)
+                    .ptr(self.moe_u.ptr)
+                    .ptr(xqm)
+                    .ptr(xdm)
+                    .i(nb_act as i32),
+            );
+            self.launch2(
+                "q8i_moe_down",
+                m.hidden as u32,
+                k as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(m.down_s.ptr)
+                    .ptr(m.down_q.ptr)
+                    .ptr(self.moe_ids.ptr)
+                    .ptr(xdm)
+                    .ptr(xqm)
+                    .ptr(self.moe_dy.ptr)
+                    .i(m.eff as i32)
+                    .i(m.hidden as i32),
+            );
+        } else {
+            self.launch2(
+                "q8_moe_down",
+                m.hidden as u32,
+                k as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(m.down_s.ptr)
+                    .ptr(m.down_q.ptr)
+                    .ptr(self.moe_ids.ptr)
+                    .ptr(self.moe_w.ptr)
+                    .ptr(self.moe_g.ptr)
+                    .ptr(self.moe_u.ptr)
+                    .ptr(self.moe_dy.ptr)
+                    .i(m.eff as i32)
+                    .i(m.hidden as i32)
+                    .i(k as i32),
+            );
+        }
         self.launch(
             "moe_wsum",
             m.hidden.div_ceil(256) as u32,
@@ -2035,19 +2257,47 @@ impl WeightAccel for RocmWeightAccel {
             if ok {
                 // final norm + lm_head into gemv_y
                 self.norm_launch(self.mlm_h.ptr, on_ptr, self.mlm_n.ptr, head_in);
-                self.launch(
-                    "q8_0_gemv",
-                    head_out as u32,
-                    32,
-                    0,
-                    Args::new()
-                        .ptr(head_s)
-                        .ptr(head_q)
-                        .ptr(self.mlm_n.ptr)
-                        .ptr(self.gemv_y.ptr)
-                        .i(head_in as i32)
-                        .i(head_out as i32),
-                );
+                if self.mlm_int8 {
+                    self.launch(
+                        "xquant8",
+                        (head_in / 32) as u32,
+                        32,
+                        0,
+                        Args::new()
+                            .ptr(self.mlm_n.ptr)
+                            .ptr(self.mlm_xq.ptr)
+                            .ptr(self.mlm_xd.ptr)
+                            .i((head_in / 32) as i32),
+                    );
+                    self.launch(
+                        "q8i_gemv",
+                        head_out as u32,
+                        32,
+                        0,
+                        Args::new()
+                            .ptr(head_s)
+                            .ptr(head_q)
+                            .ptr(self.mlm_xd.ptr)
+                            .ptr(self.mlm_xq.ptr)
+                            .ptr(self.gemv_y.ptr)
+                            .i(head_in as i32)
+                            .i(head_out as i32),
+                    );
+                } else {
+                    self.launch(
+                        "q8_0_gemv",
+                        head_out as u32,
+                        32,
+                        0,
+                        Args::new()
+                            .ptr(head_s)
+                            .ptr(head_q)
+                            .ptr(self.mlm_n.ptr)
+                            .ptr(self.gemv_y.ptr)
+                            .i(head_in as i32)
+                            .i(head_out as i32),
+                    );
+                }
             }
             let mut graph: *mut c_void = std::ptr::null_mut();
             unsafe {
