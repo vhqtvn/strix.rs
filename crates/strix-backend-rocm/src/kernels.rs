@@ -1085,6 +1085,52 @@ extern "C" __global__ void q8i_gemm_lds2(const float* __restrict__ scales,
     }
 }
 
+
+// gather quantized token rows into expert-grouped slots: grid=(nb, slots), block=32
+extern "C" __global__ void gather_xq8(const signed char* __restrict__ xq, const float* __restrict__ xd,
+                                      const int* __restrict__ slot_tok,
+                                      signed char* __restrict__ gq, float* __restrict__ gd,
+                                      int nb, int slots) {
+    int blk = blockIdx.x, r = blockIdx.y, t = threadIdx.x;
+    if (blk >= nb || r >= slots) return;
+    int tok = slot_tok[r];
+    gq[((long long)r * nb + blk) * 32 + t] = xq[((long long)tok * nb + blk) * 32 + t];
+    if (t == 0) gd[(long long)r * nb + blk] = xd[(long long)tok * nb + blk];
+}
+
+// silu(g)*u + quantize for slot rows: grid = total 32-blocks (slots*eff/32), block 32
+extern "C" __global__ void silu_quant_rows(const float* __restrict__ g, const float* __restrict__ u,
+                                           signed char* __restrict__ xq, float* __restrict__ xd, int nb) {
+    int blk = blockIdx.x, t = threadIdx.x;
+    if (blk >= nb) return;
+    float gv = g[blk * 32 + t];
+    float xv = (gv / (1.f + __expf(-gv))) * u[blk * 32 + t];
+    float a = fabsf(xv);
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor(a, o));
+    float d = a / 127.f;
+    float inv = d > 0.f ? 1.f / d : 0.f;
+    int qi = (int)rintf(xv * inv);
+    xq[blk * 32 + t] = (signed char)max(-127, min(127, qi));
+    if (t == 0) xd[blk] = d;
+}
+
+// scatter-add weighted slot outputs back to tokens: y[t] += w[slot]*dy[slot]
+// grid=(hidden/256, slots), block=256. Slot lists are token-major-unique per expert,
+// but multiple slots add to the same token -> atomicAdd.
+extern "C" __global__ void scatter_add_w(const float* __restrict__ dy, const int* __restrict__ slot_tok,
+                                         const float* __restrict__ wslot, float* __restrict__ y,
+                                         int hidden, int slots) {
+    int i = blockIdx.x * 256 + threadIdx.x, r = blockIdx.y;
+    if (i >= hidden || r >= slots) return;
+    atomicAdd(&y[(long long)slot_tok[r] * hidden + i], wslot[r] * dy[(long long)r * hidden + i]);
+}
+
+// zero f32 buffer
+extern "C" __global__ void zerof(float* __restrict__ y, int n) {
+    int i = blockIdx.x * 256 + threadIdx.x;
+    if (i < n) y[i] = 0.f;
+}
+
 // ===== Native-Q6_K MoE GEMV (NO repack: 210 B/superblock as in the GGUF) =====
 // w = full 3D expert tensor (native bytes), expert stride ebytes. Per superblock:
 // ql[128] qh[64] sc[16xi8] d[f16]. 8 waves/block, 32 lanes on the SAME superblock

@@ -1094,6 +1094,30 @@ impl MellumModel {
             // iGPU path: queue ALL experts (planar Q8 GEMM), one sync + download/layer.
             let mut gpu_done = false;
             if let Some(a) = &self.accel {
+                if std::env::var("STRIX_INT8").is_ok() {
+                    let mut plan: Vec<(usize, usize, usize)> = Vec::new();
+                    let mut slot_tok: Vec<i32> = Vec::with_capacity(m * topk);
+                    let mut wslot: Vec<f32> = Vec::with_capacity(m * topk);
+                    for (e, list) in by_exp.iter().enumerate() {
+                        if list.is_empty() {
+                            continue;
+                        }
+                        plan.push((e, slot_tok.len(), list.len()));
+                        for &(t, s) in list {
+                            slot_tok.push(t as i32);
+                            wslot.push(routes[t][s].1);
+                        }
+                    }
+                    if let Some(out) = a.moe_layer_q8_dev(il, &n, m, &plan, &slot_tok, &wslot) {
+                        for t in 0..m {
+                            for hph in 0..hidden {
+                                h[t * hidden + hph] += out[t * hidden + hph];
+                            }
+                        }
+                        self.pos += 0; // no-op; keeps structure clear
+                        continue;
+                    }
+                }
                 let mut off = 0usize;
                 let mut plan: Vec<(usize, usize)> = Vec::new();
                 let mut all = true;

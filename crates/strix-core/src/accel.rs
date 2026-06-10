@@ -164,6 +164,20 @@ pub trait WeightAccel: Send + Sync {
         false
     }
     /// Sync + download `rows` of hidden from the dy pool.
+    /// Whole-layer MoE on device (int8 prefill): one upload (normed acts) + one
+    /// download (m*hidden out). plan = (expert, slot_off, count); slot_tok/wslot per slot.
+    fn moe_layer_q8_dev(
+        &self,
+        _layer: usize,
+        _xs: &[f32],
+        _m: usize,
+        _plan: &[(usize, usize, usize)],
+        _slot_tok: &[i32],
+        _wslot: &[f32],
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
     fn moe_expert_flush(&self, _rows: usize, _hidden: usize) -> Option<Vec<f32>> {
         None
     }

@@ -375,6 +375,10 @@ impl RocmWeightAccel {
             "q6_gemm_moe",
             "moe_silu_mul",
             "moe_wsum",
+            "gather_xq8",
+            "silu_quant_rows",
+            "scatter_add_w",
+            "zerof",
             "vec_add",
             "rope_tab",
             "kv_append_pos",
@@ -440,7 +444,7 @@ impl RocmWeightAccel {
         let pf_b = gpu.alloc(2048 * 1024 * 4).ok()?;
         let pf_y = gpu.alloc(256 * 8192 * 4).ok()?;
         let pf_dy = gpu.alloc(2048 * 4096 * 4).ok()?;
-        let pf_tab = gpu.alloc(512 * 16).ok()?;
+        let pf_tab = gpu.alloc(64 * 1024).ok()?;
         let pf_act = gpu.alloc(2048 * 1024 * 4).ok()?;
         let pf_xq = gpu.alloc(2048 * 4096).ok()?;
         let pf_xd = gpu.alloc(2048 * 128 * 4).ok()?;
@@ -2891,6 +2895,142 @@ impl WeightAccel for RocmWeightAccel {
     fn moe_expert_flush(&self, rows: usize, hidden: usize) -> Option<Vec<f32>> {
         self.gpu.sync().ok()?;
         self.pf_dy.download::<f32>(rows * hidden).ok()
+    }
+
+    fn moe_layer_q8_dev(
+        &self,
+        layer: usize,
+        xs: &[f32],
+        m: usize,
+        plan: &[(usize, usize, usize)],
+        slot_tok: &[i32],
+        wslot: &[f32],
+    ) -> Option<Vec<f32>> {
+        let mo = self.moe.get(&layer)?;
+        let (hidden, eff) = (mo.hidden, mo.eff);
+        let nb = hidden / 32;
+        let slots = slot_tok.len();
+        if xs.len() != m * hidden || slots == 0 || slots > 4096 || m > 512 {
+            return None;
+        }
+        // uploads: acts (f32, quantized on GPU), slot map, weights
+        self.gpu.upload_at(&self.pf_x, 0, xs).ok()?;
+        self.gpu.upload_at(&self.pf_tab, 0, slot_tok).ok()?;
+        self.gpu.upload_at(&self.pf_tab, slots * 4, wslot).ok()?;
+        let wptr = unsafe { (self.pf_tab.ptr as *mut u8).add(slots * 4) } as *mut c_void;
+        let (xq, xd) = self.pf_quant(self.pf_x.ptr, m, hidden);
+        // gathered acts region (after token region): tokens use [0, m), slots at [m, m+slots)
+        let gq = unsafe { (self.pf_xq.ptr as *mut u8).add(m * hidden) } as *mut c_void;
+        let gd = unsafe { (self.pf_xd.ptr as *mut f32).add(m * nb) } as *mut c_void;
+        self.launch2(
+            "gather_xq8",
+            nb as u32,
+            slots as u32,
+            32,
+            0,
+            Args::new()
+                .ptr(xq)
+                .ptr(xd)
+                .ptr(self.pf_tab.ptr)
+                .ptr(gq)
+                .ptr(gd)
+                .i(nb as i32)
+                .i(slots as i32),
+        );
+        let enb = eff / 32;
+        for &(e, off, me) in plan {
+            let eoff = e * eff * nb;
+            let sq = unsafe { (gq as *mut u8).add(off * hidden) } as *mut c_void;
+            let sd = unsafe { (gd as *mut f32).add(off * nb) } as *mut c_void;
+            for (sb, qb2, y) in [
+                (&mo.gate_s, &mo.gate_q, self.pf_a.ptr),
+                (&mo.up_s, &mo.up_q, self.pf_b.ptr),
+            ] {
+                let sp = unsafe { (sb.ptr as *mut f32).add(eoff) } as *mut c_void;
+                let qp = unsafe { (qb2.ptr as *mut i8).add(eoff * 32) } as *mut c_void;
+                let yp = unsafe { (y as *mut f32).add(off * eff) } as *mut c_void;
+                self.launch2(
+                    "q8i_gemm_lds2",
+                    eff.div_ceil(16) as u32,
+                    me.div_ceil(32) as u32,
+                    256,
+                    0,
+                    Args::new()
+                        .ptr(sp)
+                        .ptr(qp)
+                        .ptr(sq)
+                        .ptr(sd)
+                        .ptr(yp)
+                        .i(hidden as i32)
+                        .i(eff as i32)
+                        .i(me as i32),
+                );
+            }
+        }
+        // silu+quantize all slot activations, then down per expert
+        let aq = unsafe { (self.pf_xq.ptr as *mut u8).add((m + slots) * hidden) } as *mut c_void;
+        let ad = unsafe { (self.pf_xd.ptr as *mut f32).add((m + slots) * nb) } as *mut c_void;
+        let nblk = slots * enb;
+        self.launch(
+            "silu_quant_rows",
+            nblk as u32,
+            32,
+            0,
+            Args::new()
+                .ptr(self.pf_a.ptr)
+                .ptr(self.pf_b.ptr)
+                .ptr(aq)
+                .ptr(ad)
+                .i(nblk as i32),
+        );
+        for &(e, off, me) in plan {
+            let deoff = e * hidden * enb;
+            let sp = unsafe { (mo.down_s.ptr as *mut f32).add(deoff) } as *mut c_void;
+            let qp = unsafe { (mo.down_q.ptr as *mut i8).add(deoff * 32) } as *mut c_void;
+            let sq = unsafe { (aq as *mut u8).add(off * eff) } as *mut c_void;
+            let sd = unsafe { (ad as *mut f32).add(off * enb) } as *mut c_void;
+            let yp = unsafe { (self.pf_dy.ptr as *mut f32).add(off * hidden) } as *mut c_void;
+            self.launch2(
+                "q8i_gemm_lds2",
+                hidden.div_ceil(16) as u32,
+                me.div_ceil(32) as u32,
+                256,
+                0,
+                Args::new()
+                    .ptr(sp)
+                    .ptr(qp)
+                    .ptr(sq)
+                    .ptr(sd)
+                    .ptr(yp)
+                    .i(eff as i32)
+                    .i(hidden as i32)
+                    .i(me as i32),
+            );
+        }
+        let n_out = m * hidden;
+        self.launch(
+            "zerof",
+            n_out.div_ceil(256) as u32,
+            256,
+            0,
+            Args::new().ptr(self.pf_y.ptr).i(n_out as i32),
+        );
+        self.launch2(
+            "scatter_add_w",
+            hidden.div_ceil(256) as u32,
+            slots as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(self.pf_dy.ptr)
+                .ptr(self.pf_tab.ptr)
+                .ptr(wptr)
+                .ptr(self.pf_y.ptr)
+                .i(hidden as i32)
+                .i(slots as i32),
+        );
+        self.gpu.sync().ok()?;
+        self.pf_y.download::<f32>(n_out).ok()
     }
 
     fn gemv(&self, key: &str, x: &[f32]) -> Option<Vec<f32>> {
