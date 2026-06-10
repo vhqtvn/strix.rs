@@ -351,6 +351,7 @@ impl RocmWeightAccel {
             "moe_wsum",
             "vec_add",
             "rope_tab",
+            "topk_router",
             "shexp_add",
             "argmax_f32",
             "rmsnorm",
@@ -488,6 +489,159 @@ impl RocmWeightAccel {
             #[cfg(feature = "npu")]
             npu_o_g: None,
         })
+    }
+
+    /// Attn + ffn-norm + router-launch portion of a fused Mellum layer (no sync).
+    fn mlm_attn_part(&mut self, il: usize, pos: usize, win: usize) -> bool {
+        let (
+            Some(nw),
+            Some(wq),
+            Some(wk),
+            Some(wv),
+            Some(wo),
+            Some(fnw),
+            Some(wgi),
+            Some(qn),
+            Some(kn),
+        ) = (
+            self.f32w.get(&format!("blk.{il}.attn_norm.weight")),
+            self.q8.get(&format!("blk.{il}.attn_q.weight")),
+            self.q8.get(&format!("blk.{il}.attn_k.weight")),
+            self.q8.get(&format!("blk.{il}.attn_v.weight")),
+            self.q8.get(&format!("blk.{il}.attn_output.weight")),
+            self.f32w.get(&format!("blk.{il}.ffn_norm.weight")),
+            self.q8.get(&format!("blk.{il}.ffn_gate_inp.weight")),
+            self.f32w.get(&format!("blk.{il}.attn_q_norm.weight")),
+            self.f32w.get(&format!("blk.{il}.attn_k_norm.weight")),
+        )
+        else {
+            return false;
+        };
+        let hidden = wq.in_dim;
+        let q_dim = wq.out_dim;
+        let kv_dim = wk.out_dim;
+        let hd = 128usize;
+        let nh = q_dim / hd;
+        let nkv = kv_dim / hd;
+        if il >= self.mlm_kc.len() || (pos + 1) > self.mlm_seq {
+            return false;
+        }
+        self.norm_launch(self.mlm_h.ptr, nw.ptr, self.mlm_n.ptr, hidden);
+        self.q8_launch(wq, self.mlm_n.ptr, self.mlm_q.ptr);
+        self.q8_launch(wk, self.mlm_n.ptr, self.mlm_k.ptr);
+        self.q8_launch(wv, self.mlm_n.ptr, self.mlm_v.ptr);
+        self.launch(
+            "rmsnorm",
+            nh as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(self.mlm_q.ptr)
+                .ptr(qn.ptr)
+                .ptr(self.mlm_q.ptr)
+                .i(hd as i32)
+                .i(1)
+                .f(1e-6),
+        );
+        self.launch(
+            "rmsnorm",
+            nkv as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(self.mlm_k.ptr)
+                .ptr(kn.ptr)
+                .ptr(self.mlm_k.ptr)
+                .i(hd as i32)
+                .i(1)
+                .f(1e-6),
+        );
+        let half = hd / 2;
+        self.launch(
+            "rope_tab",
+            ((nh * half).div_ceil(64)) as u32,
+            64,
+            0,
+            Args::new()
+                .ptr(self.mlm_q.ptr)
+                .ptr(self.mlm_cs.ptr)
+                .ptr(self.mlm_sn.ptr)
+                .i(hd as i32)
+                .i(nh as i32),
+        );
+        self.launch(
+            "rope_tab",
+            ((nkv * half).div_ceil(64)) as u32,
+            64,
+            0,
+            Args::new()
+                .ptr(self.mlm_k.ptr)
+                .ptr(self.mlm_cs.ptr)
+                .ptr(self.mlm_sn.ptr)
+                .i(hd as i32)
+                .i(nkv as i32),
+        );
+        let koff = pos * kv_dim;
+        for (src, cache) in [
+            (self.mlm_q.ptr, None),
+            (self.mlm_k.ptr, Some(&self.mlm_kc[il])),
+            (self.mlm_v.ptr, Some(&self.mlm_vc[il])),
+        ] {
+            if let Some(cache) = cache {
+                self.launch(
+                    "copyf",
+                    (kv_dim).div_ceil(256) as u32,
+                    256,
+                    0,
+                    Args::new()
+                        .ptr(src)
+                        .ptr(unsafe { (cache.ptr as *mut f32).add(koff) } as *mut c_void)
+                        .i(kv_dim as i32),
+                );
+            }
+        }
+        let len = pos + 1;
+        let win_start = if win > 0 && len > win { len - win } else { 0 };
+        let wlen = len - win_start;
+        if wlen > 2048 {
+            return false;
+        }
+        let kbase =
+            unsafe { (self.mlm_kc[il].ptr as *mut f32).add(win_start * kv_dim) } as *mut c_void;
+        let vbase =
+            unsafe { (self.mlm_vc[il].ptr as *mut f32).add(win_start * kv_dim) } as *mut c_void;
+        let scale = 1.0 / (hd as f32).sqrt();
+        self.launch(
+            "sdpa",
+            nh as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(self.mlm_q.ptr)
+                .ptr(kbase)
+                .ptr(vbase)
+                .ptr(self.mlm_attn.ptr)
+                .i(hd as i32)
+                .i(wlen as i32)
+                .i((nh / nkv) as i32)
+                .i(nkv as i32)
+                .f(scale)
+                .i(0),
+        );
+        self.q8_launch(wo, self.mlm_attn.ptr, self.moe_out.ptr);
+        self.launch(
+            "vec_add",
+            hidden.div_ceil(256) as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(self.mlm_h.ptr)
+                .ptr(self.moe_out.ptr)
+                .i(hidden as i32),
+        );
+        self.norm_launch(self.mlm_h.ptr, fnw.ptr, self.mlm_n.ptr, hidden);
+        self.q8_launch(wgi, self.mlm_n.ptr, self.mlm_rl.ptr);
+        true
     }
 
     fn launch(&self, name: &str, grid: u32, block: u32, shared: u32, args: Args) {
@@ -1374,141 +1528,56 @@ impl WeightAccel for RocmWeightAccel {
     /// type. ONE sync; returns router logits.
     #[allow(clippy::too_many_arguments)]
     fn mlm_layer(&mut self, il: usize, pos: usize, win: usize) -> Option<Vec<f32>> {
-        let nw = self.f32w.get(&format!("blk.{il}.attn_norm.weight"))?;
-        let wq = self.q8.get(&format!("blk.{il}.attn_q.weight"))?;
-        let wk = self.q8.get(&format!("blk.{il}.attn_k.weight"))?;
-        let wv = self.q8.get(&format!("blk.{il}.attn_v.weight"))?;
-        let wo = self.q8.get(&format!("blk.{il}.attn_output.weight"))?;
-        let fnw = self.f32w.get(&format!("blk.{il}.ffn_norm.weight"))?;
+        if !self.mlm_attn_part(il, pos, win) {
+            return None;
+        }
         let wgi = self.q8.get(&format!("blk.{il}.ffn_gate_inp.weight"))?;
-        let qn = self.f32w.get(&format!("blk.{il}.attn_q_norm.weight"))?;
-        let kn = self.f32w.get(&format!("blk.{il}.attn_k_norm.weight"))?;
-        let hidden = wq.in_dim;
-        let q_dim = wq.out_dim;
-        let kv_dim = wk.out_dim;
-        let hd = 128usize;
-        let nh = q_dim / hd;
-        let nkv = kv_dim / hd;
-        if il >= self.mlm_kc.len() || (pos + 1) > self.mlm_seq {
-            return None;
+        let out_dim = wgi.out_dim;
+        self.gpu.sync().ok()?;
+        self.mlm_rl.download::<f32>(out_dim).ok()
+    }
+
+    /// Full layer with on-GPU router top-k + queued MoE — NO sync. Caller syncs once
+    /// per token at lm_head. Requires the same residency as mlm_layer.
+    fn mlm_layer_nosync(&mut self, il: usize, pos: usize, win: usize, topk: usize) -> bool {
+        let Some(rl_dim) = self
+            .q8
+            .get(&format!("blk.{il}.ffn_gate_inp.weight"))
+            .map(|w| w.out_dim)
+        else {
+            return false;
+        };
+        // attn part: reuse the mlm_layer body up to the router (without sync/download)
+        if !self.mlm_attn_part(il, pos, win) {
+            return false;
         }
-        self.norm_launch(self.mlm_h.ptr, nw.ptr, self.mlm_n.ptr, hidden);
-        self.q8_launch(wq, self.mlm_n.ptr, self.mlm_q.ptr);
-        self.q8_launch(wk, self.mlm_n.ptr, self.mlm_k.ptr);
-        self.q8_launch(wv, self.mlm_n.ptr, self.mlm_v.ptr);
-        // per-head RMSNorm on q (nh rows) and k (nkv rows)
         self.launch(
-            "rmsnorm",
-            nh as u32,
-            256,
+            "topk_router",
+            1,
+            32,
             0,
             Args::new()
-                .ptr(self.mlm_q.ptr)
-                .ptr(qn.ptr)
-                .ptr(self.mlm_q.ptr)
-                .i(hd as i32)
-                .i(1)
-                .f(1e-6),
+                .ptr(self.mlm_rl.ptr)
+                .i(rl_dim as i32)
+                .i(topk as i32)
+                .ptr(self.moe_ids.ptr)
+                .ptr(self.moe_w.ptr),
         );
-        self.launch(
-            "rmsnorm",
-            nkv as u32,
-            256,
-            0,
-            Args::new()
-                .ptr(self.mlm_k.ptr)
-                .ptr(kn.ptr)
-                .ptr(self.mlm_k.ptr)
-                .i(hd as i32)
-                .i(1)
-                .f(1e-6),
-        );
-        // rope (tables already uploaded for this layer's type)
-        let half = hd / 2;
-        self.launch(
-            "rope_tab",
-            ((nh * half).div_ceil(64)) as u32,
-            64,
-            0,
-            Args::new()
-                .ptr(self.mlm_q.ptr)
-                .ptr(self.mlm_cs.ptr)
-                .ptr(self.mlm_sn.ptr)
-                .i(hd as i32)
-                .i(nh as i32),
-        );
-        self.launch(
-            "rope_tab",
-            ((nkv * half).div_ceil(64)) as u32,
-            64,
-            0,
-            Args::new()
-                .ptr(self.mlm_k.ptr)
-                .ptr(self.mlm_cs.ptr)
-                .ptr(self.mlm_sn.ptr)
-                .i(hd as i32)
-                .i(nkv as i32),
-        );
-        // KV append at pos
-        let koff = pos * kv_dim;
-        for (src, cache) in [
-            (self.mlm_k.ptr, &self.mlm_kc[il]),
-            (self.mlm_v.ptr, &self.mlm_vc[il]),
-        ] {
-            self.launch(
-                "copyf",
-                (kv_dim).div_ceil(256) as u32,
-                256,
-                0,
-                Args::new()
-                    .ptr(src)
-                    .ptr(unsafe { (cache.ptr as *mut f32).add(koff) } as *mut c_void)
-                    .i(kv_dim as i32),
-            );
-        }
-        let len = pos + 1;
-        let win_start = if win > 0 && len > win { len - win } else { 0 };
-        let wlen = len - win_start;
-        if wlen > 2048 {
-            return None;
-        }
-        let kbase =
-            unsafe { (self.mlm_kc[il].ptr as *mut f32).add(win_start * kv_dim) } as *mut c_void;
-        let vbase =
-            unsafe { (self.mlm_vc[il].ptr as *mut f32).add(win_start * kv_dim) } as *mut c_void;
-        let scale = 1.0 / (hd as f32).sqrt();
-        self.launch(
-            "sdpa",
-            nh as u32,
-            256,
-            0,
-            Args::new()
-                .ptr(self.mlm_q.ptr)
-                .ptr(kbase)
-                .ptr(vbase)
-                .ptr(self.mlm_attn.ptr)
-                .i(hd as i32)
-                .i(wlen as i32)
-                .i((nh / nkv) as i32)
-                .i(nkv as i32)
-                .f(scale)
-                .i(0),
-        );
-        self.q8_launch(wo, self.mlm_attn.ptr, self.moe_out.ptr);
+        let Some(m) = self.moe.get(&il) else {
+            return false;
+        };
+        self.moe_launches(m, topk, self.mlm_n.ptr);
         self.launch(
             "vec_add",
-            hidden.div_ceil(256) as u32,
+            m.hidden.div_ceil(256) as u32,
             256,
             0,
             Args::new()
                 .ptr(self.mlm_h.ptr)
                 .ptr(self.moe_out.ptr)
-                .i(hidden as i32),
+                .i(m.hidden as i32),
         );
-        self.norm_launch(self.mlm_h.ptr, fnw.ptr, self.mlm_n.ptr, hidden);
-        self.q8_launch(wgi, self.mlm_n.ptr, self.mlm_rl.ptr);
-        self.gpu.sync().ok()?;
-        self.mlm_rl.download::<f32>(wgi.out_dim).ok()
+        true
     }
 
     /// Upload rope cos/sin tables (per layer type, current pos) + allocate KV caches.

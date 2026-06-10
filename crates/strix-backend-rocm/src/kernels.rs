@@ -840,6 +840,33 @@ extern "C" __global__ void vec_add(float* __restrict__ h, const float* __restric
     if (i < n) h[i] += x[i];
 }
 
+// GPU router top-k: logits[ne] -> ids[k] + renormalized softmax weights[k].
+// Single wave; iterative argmax (ne<=256, k<=16). Matches CPU softmax-all+topk+renorm.
+extern "C" __global__ void topk_router(const float* __restrict__ logits, int ne, int k,
+                                       int* __restrict__ ids, float* __restrict__ w) {
+    if (threadIdx.x != 0) return;
+    float mx = -3e38f;
+    for (int e = 0; e < ne; e++) mx = fmaxf(mx, logits[e]);
+    float sum = 0.f;
+    for (int e = 0; e < ne; e++) sum += __expf(logits[e] - mx);
+    float taken[16];
+    int tid[16];
+    for (int i = 0; i < k; i++) {
+        float best = -3e38f;
+        int bj = 0;
+        for (int e = 0; e < ne; e++) {
+            bool used = false;
+            for (int j = 0; j < i; j++) used |= (tid[j] == e);
+            if (!used && logits[e] > best) { best = logits[e]; bj = e; }
+        }
+        tid[i] = bj;
+        taken[i] = __expf(best - mx) / sum;
+    }
+    float ws = 0.f;
+    for (int i = 0; i < k; i++) ws += taken[i];
+    for (int i = 0; i < k; i++) { ids[i] = tid[i]; w[i] = taken[i] / ws; }
+}
+
 // out[o] = sum_k wexp[k]*dy[k][o] — deterministic accumulation in routed order.
 extern "C" __global__ void moe_wsum(const float* __restrict__ dy, const float* __restrict__ wexp,
                                     float* __restrict__ out, int n, int k) {

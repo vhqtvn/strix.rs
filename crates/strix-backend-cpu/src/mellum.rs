@@ -640,23 +640,7 @@ impl MellumModel {
                 last_swa = cur;
             }
             let win = if is_swa { cfg.sliding_window } else { 0 };
-            let Some(rl) = a.mlm_layer(il, pos, win) else {
-                return Ok(None);
-            };
-            let ne = cfg.n_expert;
-            let mx = rl.iter().cloned().fold(f32::MIN, f32::max);
-            let mut probs: Vec<f32> = rl.iter().map(|&l| (l - mx).exp()).collect();
-            let sum: f32 = probs.iter().sum();
-            for p in probs.iter_mut() {
-                *p /= sum;
-            }
-            let mut idx: Vec<usize> = (0..ne).collect();
-            idx.sort_by(|&x, &y| probs[y].partial_cmp(&probs[x]).unwrap());
-            idx.truncate(topk);
-            let wsum: f32 = idx.iter().map(|&e| probs[e]).sum();
-            let ids: Vec<i32> = idx.iter().map(|&e| e as i32).collect();
-            let wexp: Vec<f32> = idx.iter().map(|&e| probs[e] / wsum).collect();
-            if !a.mlm_post2(il, &ids, &wexp) {
+            if !a.mlm_layer_nosync(il, pos, win, topk) {
                 return Ok(None);
             }
         }

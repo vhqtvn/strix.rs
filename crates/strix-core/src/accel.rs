@@ -175,6 +175,10 @@ pub trait WeightAccel: Send + Sync {
     fn mlm_layer(&mut self, _il: usize, _pos: usize, _win: usize) -> Option<Vec<f32>> {
         None
     }
+    /// Full layer with on-GPU router + queued MoE — no sync. False = unsupported.
+    fn mlm_layer_nosync(&mut self, _il: usize, _pos: usize, _win: usize, _topk: usize) -> bool {
+        false
+    }
     /// Allocate device KV caches for the fused token path.
     fn mlm_prepare(&mut self, _n_layers: usize, _kv_dim: usize, _max_seq: usize) -> bool {
         false
