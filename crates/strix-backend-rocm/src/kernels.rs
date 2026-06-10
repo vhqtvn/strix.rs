@@ -821,6 +821,51 @@ extern "C" __global__ void shexp_add(float* __restrict__ out, const float* __res
     if (i < n) out[i] += sd[i] * sgate;
 }
 
+// KV append at device-resident pos: cache[pos*kv_dim + i] = src[i]. grid covers kv_dim.
+extern "C" __global__ void kv_append_pos(const float* __restrict__ src, float* __restrict__ cache,
+                                         const int* __restrict__ pos, int kv_dim) {
+    int i = blockIdx.x * 256 + threadIdx.x;
+    if (i < kv_dim) cache[(long long)pos[0] * kv_dim + i] = src[i];
+}
+
+// SDPA with len from device pos (len=pos+1, sliding-window win, 0=full). One block/head.
+extern "C" __global__ void sdpa_pos(const float* __restrict__ q, const float* __restrict__ kc,
+                                    const float* __restrict__ vc, float* __restrict__ out,
+                                    int hd, const int* __restrict__ posb, int win,
+                                    int groups, int n_kv, float scale) {
+    int h = blockIdx.x, t = threadIdx.x, kvh = h / groups, qbase = h * hd;
+    int len = posb[0] + 1;
+    int ws = (win > 0 && len > win) ? len - win : 0;
+    int wlen = len - ws;
+    if (wlen > 2048) wlen = 2048;
+    const float* k = kc + (long long)ws * n_kv * hd;
+    const float* v = vc + (long long)ws * n_kv * hd;
+    __shared__ float scores[2048];
+    __shared__ float red[256];
+    for (int i = t; i < wlen; i += 256) {
+        float s = 0.f;
+        int kb = (i * n_kv + kvh) * hd;
+        for (int d = 0; d < hd; d++) s += q[qbase + d] * k[kb + d];
+        scores[i] = s * scale;
+    }
+    __syncthreads();
+    float m = -3.0e38f;
+    for (int i = t; i < wlen; i += 256) m = fmaxf(m, scores[i]);
+    red[t] = m; __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) { if (t < s) red[t] = fmaxf(red[t], red[t + s]); __syncthreads(); }
+    float mx = red[0]; __syncthreads();
+    float ls = 0.f;
+    for (int i = t; i < wlen; i += 256) { float e = __expf(scores[i] - mx); scores[i] = e; ls += e; }
+    red[t] = ls; __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) { if (t < s) red[t] += red[t + s]; __syncthreads(); }
+    float inv = 1.f / red[0]; __syncthreads();
+    for (int d = t; d < hd; d += 256) {
+        float acc = 0.f;
+        for (int i = 0; i < wlen; i++) acc += scores[i] * vc[((long long)(ws + i) * n_kv + kvh) * hd + d];
+        out[qbase + d] = acc * inv;
+    }
+}
+
 // Table RoPE: pairwise rotate with precomputed cos/sin per dim (yarn/mscale baked).
 extern "C" __global__ void rope_tab(float* __restrict__ v, const float* __restrict__ cs,
                                     const float* __restrict__ sn, int head_dim, int n_heads) {

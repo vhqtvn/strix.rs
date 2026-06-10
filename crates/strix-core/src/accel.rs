@@ -207,6 +207,24 @@ pub trait WeightAccel: Send + Sync {
     fn mlm_post2(&mut self, _il: usize, _ids: &[i32], _wexp: &[f32]) -> bool {
         false
     }
+    /// Graph token: capture once, replay per token; returns logits.
+    fn mlm_token_graph(&mut self, _layers: &[(usize, bool)], _topk: usize) -> Option<Vec<f32>> {
+        None
+    }
+    /// Upload device pos for the graph token.
+    fn mlm_set_pos(&mut self, _pos: i32) -> bool {
+        false
+    }
+    /// Upload both rope table sets (sliding, full).
+    fn mlm_rope_tables2(
+        &mut self,
+        _cs_s: &[f32],
+        _sn_s: &[f32],
+        _cs_f: &[f32],
+        _sn_f: &[f32],
+    ) -> bool {
+        false
+    }
     /// output_norm + lm_head on the resident h; ends the token.
     fn mlm_logits(&mut self) -> Option<Vec<f32>> {
         None

@@ -345,7 +345,8 @@ fn run_mellum(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Res
     let decode_start = Instant::now();
     // Lookup speculation is LOSSLESS; wins on long generations (+19% @512, more @1k+),
     // ~breakeven short. Default ON; STRIX_NO_LOOKUP=1 disables.
-    let lookup = std::env::var("STRIX_NO_LOOKUP").is_err();
+    // Graph decode (24 t/s) beats lookup-verify; lookup now opt-in STRIX_LOOKUP.
+    let lookup = std::env::var("STRIX_LOOKUP").is_ok();
     if lookup {
         // Lossless n-gram lookup speculation: propose continuation from history,
         // verify all candidates in ONE batched forward, accept matching prefix.

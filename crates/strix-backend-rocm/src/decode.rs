@@ -265,6 +265,10 @@ pub struct RocmWeightAccel {
     mlm_vc: Vec<Dbuf>,
     mlm_cs: Dbuf,
     mlm_sn: Dbuf,
+    mlm_cs2: Dbuf,
+    mlm_sn2: Dbuf,
+    mlm_pos: Dbuf,
+    mlm_graph: Option<*mut std::os::raw::c_void>,
     mlm_seq: usize,
     batch_x: Vec<Dbuf>,
     batch_y: Vec<Dbuf>,
@@ -351,6 +355,8 @@ impl RocmWeightAccel {
             "moe_wsum",
             "vec_add",
             "rope_tab",
+            "kv_append_pos",
+            "sdpa_pos",
             "topk_router",
             "f32_gemv",
             "shexp_add",
@@ -401,6 +407,9 @@ impl RocmWeightAccel {
         let mlm_rl = gpu.alloc(256 * 4).ok()?;
         let mlm_cs = gpu.alloc(128 * 4).ok()?;
         let mlm_sn = gpu.alloc(128 * 4).ok()?;
+        let mlm_cs2 = gpu.alloc(128 * 4).ok()?;
+        let mlm_sn2 = gpu.alloc(128 * 4).ok()?;
+        let mlm_pos = gpu.alloc(4).ok()?;
         let pf_x = gpu.alloc(2048 * 4096 * 4).ok()?;
         let pf_a = gpu.alloc(2048 * 1024 * 4).ok()?;
         let pf_b = gpu.alloc(2048 * 1024 * 4).ok()?;
@@ -445,6 +454,10 @@ impl RocmWeightAccel {
             mlm_vc: Vec::new(),
             mlm_cs,
             mlm_sn,
+            mlm_cs2,
+            mlm_sn2,
+            mlm_pos,
+            mlm_graph: None,
             mlm_seq: 0,
             batch_x,
             batch_y,
@@ -503,7 +516,7 @@ impl RocmWeightAccel {
         }
         let _ = self.gpu.sync();
         T_ATTN.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
-        let rl_dim = self.q8[&format!("blk.{il}.ffn_gate_inp.weight")].out_dim;
+        let rl_dim = 64usize;
         let t1 = std::time::Instant::now();
         self.launch(
             "topk_router",
@@ -517,6 +530,23 @@ impl RocmWeightAccel {
                 .ptr(self.moe_ids.ptr)
                 .ptr(self.moe_w.ptr),
         );
+        if std::env::var("STRIX_RT_DEBUG").is_ok() && il < 3 {
+            let _ = self.gpu.sync();
+            let rl = self.mlm_rl.download::<f32>(rl_dim).unwrap_or_default();
+            let ids = self.moe_ids.download::<i32>(topk).unwrap_or_default();
+            let w = self.moe_w.download::<f32>(topk).unwrap_or_default();
+            let mut idx: Vec<usize> = (0..rl_dim).collect();
+            let mx = rl.iter().cloned().fold(f32::MIN, f32::max);
+            let probs: Vec<f32> = rl.iter().map(|&l| (l - mx).exp()).collect();
+            let sum: f32 = probs.iter().sum();
+            idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+            eprintln!(
+                "[rt l{il}] gpu_ids={ids:?} w0={:.3} cpu_top={:?} p0={:.3}",
+                w.first().copied().unwrap_or(0.0),
+                &idx[..topk.min(8)],
+                probs[idx[0]] / sum
+            );
+        }
         let Some(m) = self.moe.get(&il) else {
             return false;
         };
@@ -540,6 +570,196 @@ impl RocmWeightAccel {
                 T_MOE.load(Ordering::Relaxed) as f64 / 1e3
             );
         }
+        true
+    }
+
+    /// Pos-indirect attn part (graph-capturable: pos read from device buffer).
+    fn mlm_attn_part_pos(&self, il: usize, win: usize, full_tab: bool) -> bool {
+        let (
+            Some(nw),
+            Some(wq),
+            Some(wk),
+            Some(wv),
+            Some(wo),
+            Some(fnw),
+            Some(wgi),
+            Some(qn),
+            Some(kn),
+        ) = (
+            self.f32w.get(&format!("blk.{il}.attn_norm.weight")),
+            self.q8.get(&format!("blk.{il}.attn_q.weight")),
+            self.q8.get(&format!("blk.{il}.attn_k.weight")),
+            self.q8.get(&format!("blk.{il}.attn_v.weight")),
+            self.q8.get(&format!("blk.{il}.attn_output.weight")),
+            self.f32w.get(&format!("blk.{il}.ffn_norm.weight")),
+            self.f32w.get(&format!("blk.{il}.ffn_gate_inp.weight")),
+            self.f32w.get(&format!("blk.{il}.attn_q_norm.weight")),
+            self.f32w.get(&format!("blk.{il}.attn_k_norm.weight")),
+        )
+        else {
+            return false;
+        };
+        let hidden = wq.in_dim;
+        let q_dim = wq.out_dim;
+        let kv_dim = wk.out_dim;
+        let hd = 128usize;
+        let nh = q_dim / hd;
+        let nkv = kv_dim / hd;
+        if il >= self.mlm_kc.len() {
+            return false;
+        }
+        let (cs, sn) = if full_tab {
+            (self.mlm_cs2.ptr, self.mlm_sn2.ptr)
+        } else {
+            (self.mlm_cs.ptr, self.mlm_sn.ptr)
+        };
+        self.norm_launch(self.mlm_h.ptr, nw.ptr, self.mlm_n.ptr, hidden);
+        self.q8_launch(wq, self.mlm_n.ptr, self.mlm_q.ptr);
+        self.q8_launch(wk, self.mlm_n.ptr, self.mlm_k.ptr);
+        self.q8_launch(wv, self.mlm_n.ptr, self.mlm_v.ptr);
+        self.launch(
+            "rmsnorm",
+            nh as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(self.mlm_q.ptr)
+                .ptr(qn.ptr)
+                .ptr(self.mlm_q.ptr)
+                .i(hd as i32)
+                .i(1)
+                .f(1e-6),
+        );
+        self.launch(
+            "rmsnorm",
+            nkv as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(self.mlm_k.ptr)
+                .ptr(kn.ptr)
+                .ptr(self.mlm_k.ptr)
+                .i(hd as i32)
+                .i(1)
+                .f(1e-6),
+        );
+        let half = hd / 2;
+        self.launch(
+            "rope_tab",
+            ((nh * half).div_ceil(64)) as u32,
+            64,
+            0,
+            Args::new()
+                .ptr(self.mlm_q.ptr)
+                .ptr(cs)
+                .ptr(sn)
+                .i(hd as i32)
+                .i(nh as i32),
+        );
+        self.launch(
+            "rope_tab",
+            ((nkv * half).div_ceil(64)) as u32,
+            64,
+            0,
+            Args::new()
+                .ptr(self.mlm_k.ptr)
+                .ptr(cs)
+                .ptr(sn)
+                .i(hd as i32)
+                .i(nkv as i32),
+        );
+        for (src, cache) in [
+            (self.mlm_k.ptr, &self.mlm_kc[il]),
+            (self.mlm_v.ptr, &self.mlm_vc[il]),
+        ] {
+            self.launch(
+                "kv_append_pos",
+                kv_dim.div_ceil(256) as u32,
+                256,
+                0,
+                Args::new()
+                    .ptr(src)
+                    .ptr(cache.ptr)
+                    .ptr(self.mlm_pos.ptr)
+                    .i(kv_dim as i32),
+            );
+        }
+        let scale = 1.0 / (hd as f32).sqrt();
+        self.launch(
+            "sdpa_pos",
+            nh as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(self.mlm_q.ptr)
+                .ptr(self.mlm_kc[il].ptr)
+                .ptr(self.mlm_vc[il].ptr)
+                .ptr(self.mlm_attn.ptr)
+                .i(hd as i32)
+                .ptr(self.mlm_pos.ptr)
+                .i(win as i32)
+                .i((nh / nkv) as i32)
+                .i(nkv as i32)
+                .f(scale),
+        );
+        self.q8_launch(wo, self.mlm_attn.ptr, self.moe_out.ptr);
+        self.launch(
+            "vec_add",
+            hidden.div_ceil(256) as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(self.mlm_h.ptr)
+                .ptr(self.moe_out.ptr)
+                .i(hidden as i32),
+        );
+        self.norm_launch(self.mlm_h.ptr, fnw.ptr, self.mlm_n.ptr, hidden);
+        self.launch(
+            "f32_gemv",
+            64,
+            32,
+            0,
+            Args::new()
+                .ptr(wgi.ptr)
+                .ptr(self.mlm_n.ptr)
+                .ptr(self.mlm_rl.ptr)
+                .i(hidden as i32)
+                .i(64),
+        );
+        true
+    }
+
+    /// Queue one full pos-indirect layer (attn + GPU router + MoE), no sync.
+    fn mlm_layer_pos(&self, il: usize, win: usize, full_tab: bool, topk: usize) -> bool {
+        if !self.mlm_attn_part_pos(il, win, full_tab) {
+            return false;
+        }
+        self.launch(
+            "topk_router",
+            1,
+            32,
+            0,
+            Args::new()
+                .ptr(self.mlm_rl.ptr)
+                .i(64)
+                .i(topk as i32)
+                .ptr(self.moe_ids.ptr)
+                .ptr(self.moe_w.ptr),
+        );
+        let Some(m) = self.moe.get(&il) else {
+            return false;
+        };
+        self.moe_launches(m, topk, self.mlm_n.ptr);
+        self.launch(
+            "vec_add",
+            m.hidden.div_ceil(256) as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(self.mlm_h.ptr)
+                .ptr(self.moe_out.ptr)
+                .i(m.hidden as i32),
+        );
         true
     }
 
@@ -568,7 +788,6 @@ impl RocmWeightAccel {
         )
         else {
             {
-                eprintln!("[mlm_attn_part bail 1]");
                 return false;
             }
         };
@@ -580,7 +799,6 @@ impl RocmWeightAccel {
         let nkv = kv_dim / hd;
         if il >= self.mlm_kc.len() || (pos + 1) > self.mlm_seq {
             {
-                eprintln!("[mlm_attn_part bail 2]");
                 return false;
             }
         }
@@ -663,7 +881,6 @@ impl RocmWeightAccel {
         let wlen = len - win_start;
         if wlen > 2048 {
             {
-                eprintln!("[mlm_attn_part bail 3]");
                 return false;
             }
         }
@@ -1615,20 +1832,10 @@ impl WeightAccel for RocmWeightAccel {
             return self.mlm_layer_prof(il, pos, win, topk);
         }
 
-        let Some(rl_dim) = self
-            .q8
-            .get(&format!("blk.{il}.ffn_gate_inp.weight"))
-            .map(|w| w.out_dim)
-        else {
-            {
-                eprintln!("[mlm_layer_nosync bail 1]");
-                return false;
-            }
-        };
-        // attn part: reuse the mlm_layer body up to the router (without sync/download)
+        let rl_dim = 64usize; // F32 router (n_expert)
+                              // attn part: reuse the mlm_layer body up to the router (without sync/download)
         if !self.mlm_attn_part(il, pos, win) {
             {
-                eprintln!("[mlm_layer_nosync bail 2]");
                 return false;
             }
         }
@@ -1644,9 +1851,25 @@ impl WeightAccel for RocmWeightAccel {
                 .ptr(self.moe_ids.ptr)
                 .ptr(self.moe_w.ptr),
         );
+        if std::env::var("STRIX_RT_DEBUG").is_ok() && il < 3 {
+            let _ = self.gpu.sync();
+            let rl = self.mlm_rl.download::<f32>(rl_dim).unwrap_or_default();
+            let ids = self.moe_ids.download::<i32>(topk).unwrap_or_default();
+            let w = self.moe_w.download::<f32>(topk).unwrap_or_default();
+            let mut idx: Vec<usize> = (0..rl_dim).collect();
+            let mx = rl.iter().cloned().fold(f32::MIN, f32::max);
+            let probs: Vec<f32> = rl.iter().map(|&l| (l - mx).exp()).collect();
+            let sum: f32 = probs.iter().sum();
+            idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+            eprintln!(
+                "[rt l{il}] gpu_ids={ids:?} w0={:.3} cpu_top={:?} p0={:.3}",
+                w.first().copied().unwrap_or(0.0),
+                &idx[..topk.min(8)],
+                probs[idx[0]] / sum
+            );
+        }
         let Some(m) = self.moe.get(&il) else {
             {
-                eprintln!("[mlm_layer_nosync bail 3]");
                 return false;
             }
         };
@@ -1760,6 +1983,87 @@ impl WeightAccel for RocmWeightAccel {
                 .i(m.hidden as i32),
         );
         true // no sync — next layer's qkv sync covers it
+    }
+
+    /// Graph token: capture all layers + lm_head once, then replay per token.
+    /// Host per token: upload h/pos/rope tables, replay, sync, download logits.
+    fn mlm_token_graph(&mut self, layers: &[(usize, bool)], topk: usize) -> Option<Vec<f32>> {
+        let head = self.q8.get("output.weight")?;
+        let on = self.f32w.get("output_norm.weight")?;
+        let (head_in, head_out) = (head.in_dim, head.out_dim);
+        let (head_s, head_q, on_ptr) = (head.scales.ptr, head.quants.ptr, on.ptr);
+        if self.mlm_graph.is_none() {
+            unsafe {
+                if crate::ffi::hipStreamBeginCapture(self.gpu.stream, 0) != 0 {
+                    return None;
+                }
+            }
+            let mut ok = true;
+            for (il, &(win, full)) in layers.iter().enumerate() {
+                if !self.mlm_layer_pos(il, win, full, topk) {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                // final norm + lm_head into gemv_y
+                self.norm_launch(self.mlm_h.ptr, on_ptr, self.mlm_n.ptr, head_in);
+                self.launch(
+                    "q8_0_gemv",
+                    head_out as u32,
+                    32,
+                    0,
+                    Args::new()
+                        .ptr(head_s)
+                        .ptr(head_q)
+                        .ptr(self.mlm_n.ptr)
+                        .ptr(self.gemv_y.ptr)
+                        .i(head_in as i32)
+                        .i(head_out as i32),
+                );
+            }
+            let mut graph: *mut c_void = std::ptr::null_mut();
+            unsafe {
+                if crate::ffi::hipStreamEndCapture(self.gpu.stream, &mut graph) != 0 || !ok {
+                    return None;
+                }
+                let mut exec: *mut c_void = std::ptr::null_mut();
+                if crate::ffi::hipGraphInstantiate(
+                    &mut exec,
+                    graph,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                ) != 0
+                {
+                    let _ = crate::ffi::hipGraphDestroy(graph);
+                    return None;
+                }
+                let _ = crate::ffi::hipGraphDestroy(graph);
+                self.mlm_graph = Some(exec);
+            }
+        }
+        let exec = self.mlm_graph?;
+        unsafe {
+            if crate::ffi::hipGraphLaunch(exec, self.gpu.stream) != 0 {
+                return None;
+            }
+        }
+        self.gpu.sync().ok()?;
+        self.gemv_y.download::<f32>(head_out).ok()
+    }
+
+    /// Upload device pos for the graph token.
+    fn mlm_set_pos(&mut self, pos: i32) -> bool {
+        self.mlm_pos.upload(&[pos]).is_ok()
+    }
+
+    /// Upload BOTH rope table sets (sliding, full).
+    fn mlm_rope_tables2(&mut self, cs_s: &[f32], sn_s: &[f32], cs_f: &[f32], sn_f: &[f32]) -> bool {
+        self.mlm_cs.upload(cs_s).is_ok()
+            && self.mlm_sn.upload(sn_s).is_ok()
+            && self.mlm_cs2.upload(cs_f).is_ok()
+            && self.mlm_sn2.upload(sn_f).is_ok()
     }
 
     fn mlm_logits(&mut self) -> Option<Vec<f32>> {

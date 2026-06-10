@@ -593,7 +593,6 @@ impl MellumModel {
         let max_seq = 2048usize;
         if pos + 1 > max_seq {
             {
-                eprintln!("[fused bail 1]");
                 return Ok(None);
             }
         }
@@ -601,7 +600,6 @@ impl MellumModel {
             let a = self.accel.as_mut().unwrap();
             if !a.mlm_prepare(cfg.n_layer, kv_dim, max_seq) || !a.mlm_begin(&h) {
                 {
-                    eprintln!("[fused bail 2]");
                     return Ok(None);
                 }
             }
@@ -612,7 +610,6 @@ impl MellumModel {
                 let a = self.accel.as_mut().unwrap();
                 if !a.mlm_seed_kv(il, &kc, &vc) {
                     {
-                        eprintln!("[fused bail 3]");
                         return Ok(None);
                     }
                 }
@@ -641,36 +638,21 @@ impl MellumModel {
         };
         let (cs_s, sn_s) = mk_tab(1.0, 0.0, 1.0);
         let (cs_f, sn_f) = mk_tab(1.0 / cfg.yarn_factor, 1.0, cfg.yarn_attn_factor);
-        let mut last_swa = 2u8;
-        for il in 0..cfg.n_layer {
-            let is_swa = cfg.is_swa(il);
-            let a = self.accel.as_mut().unwrap();
-            let cur = is_swa as u8;
-            if cur != last_swa {
-                let (cs, sn) = if is_swa {
-                    (&cs_s, &sn_s)
-                } else {
-                    (&cs_f, &sn_f)
-                };
-                if !a.mlm_rope_tables(cs, sn) {
-                    {
-                        eprintln!("[fused bail 4]");
-                        return Ok(None);
-                    }
-                }
-                last_swa = cur;
-            }
-            let win = if is_swa { cfg.sliding_window } else { 0 };
-            if !a.mlm_layer_nosync(il, pos, win, topk) {
-                {
-                    eprintln!("[fused bail 5]");
-                    return Ok(None);
-                }
-            }
-        }
-        self.pos += 1;
         let a = self.accel.as_mut().unwrap();
-        Ok(a.mlm_logits())
+        if !a.mlm_rope_tables2(&cs_s, &sn_s, &cs_f, &sn_f) || !a.mlm_set_pos(pos as i32) {
+            return Ok(None);
+        }
+        let layers: Vec<(usize, bool)> = (0..cfg.n_layer)
+            .map(|il| {
+                let swa = cfg.is_swa(il);
+                (if swa { cfg.sliding_window } else { 0 }, !swa)
+            })
+            .collect();
+        let Some(logits) = a.mlm_token_graph(&layers, topk) else {
+            return Ok(None);
+        };
+        self.pos += 1;
+        Ok(Some(logits))
     }
 
     /// iGPU dense GEMM for batched prefill (chunks of 256). False = fall back.
@@ -1616,7 +1598,7 @@ impl Decoder for MellumModel {
     }
 
     fn decode_one(&mut self, token: u32) -> Result<Logits> {
-        if self.fused_ok && std::env::var("STRIX_GPU_FULL").is_ok() {
+        if self.fused_ok && std::env::var("STRIX_NO_GPU_FULL").is_err() {
             if let Some(l) = self.forward_fused(token)? {
                 return Ok(Logits::new(l));
             }

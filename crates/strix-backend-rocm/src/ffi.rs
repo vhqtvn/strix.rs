@@ -21,6 +21,21 @@ pub const HIP_MEMCPY_DTOH: c_int = 2;
 
 #[link(name = "amdhip64")]
 extern "C" {
+    // hipGraph capture/replay (token-record once, replay per token)
+    pub fn hipStreamBeginCapture(stream: hipStream_t, mode: u32) -> i32;
+    pub fn hipStreamEndCapture(stream: hipStream_t, graph: *mut *mut c_void) -> i32;
+    pub fn hipGraphInstantiate(
+        exec: *mut *mut c_void,
+        graph: *mut c_void,
+        err_node: *mut c_void,
+        log: *mut c_void,
+        sz: usize,
+    ) -> i32;
+    pub fn hipGraphLaunch(exec: *mut c_void, stream: hipStream_t) -> i32;
+    pub fn hipGraphDestroy(graph: *mut c_void) -> i32;
+}
+
+extern "C" {
     pub fn hipInit(flags: c_uint) -> hipError_t;
     pub fn hipSetDevice(device: c_int) -> hipError_t;
     pub fn hipGetDeviceCount(count: *mut c_int) -> hipError_t;
