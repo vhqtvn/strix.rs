@@ -1292,6 +1292,80 @@ extern "C" __global__ void q8w_gemm(const float* __restrict__ scales,
     }
 }
 
+
+// 32-token WMMA tile: A loaded once per block, two B sub-tiles. grid=(out/128, m/32), block=256
+extern "C" __global__ void q8w_gemm32(const float* __restrict__ scales,
+                                      const signed char* __restrict__ quants,
+                                      const signed char* __restrict__ xq,
+                                      const float* __restrict__ xd,
+                                      float* __restrict__ y, int in_dim, int out_dim, int m) {
+    int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, t = lane & 15, hs = lane >> 4;
+    int row0 = blockIdx.x * 128 + w * 16, tok0 = blockIdx.y * 32;
+    int nb = in_dim / 32;
+    int rrow = row0 + t;
+    bool rok = rrow < out_dim;
+    __shared__ int bt[32][32];
+    __shared__ float bd[32][4];
+    float f0[8] = {0.f}, f1[8] = {0.f};
+    for (int b4 = 0; b4 < nb; b4 += 4) {
+        __syncthreads();
+        {
+            int tk = tid >> 3, c = tid & 7;
+            if (tok0 + tk < m) {
+                const int* xp = (const int*)(xq + (long long)(tok0 + tk) * in_dim + b4 * 32) + c * 4;
+                #pragma unroll
+                for (int q = 0; q < 4; q++) bt[tk][c * 4 + q] = xp[q];
+                if (c < 4) bd[tk][c] = b4 + c < nb ? xd[(long long)(tok0 + tk) * nb + b4 + c] : 0.f;
+            } else {
+                #pragma unroll
+                for (int q = 0; q < 4; q++) bt[tk][c * 4 + q] = 0;
+                if (c < 4) bd[tk][c] = 0.f;
+            }
+        }
+        __syncthreads();
+        int bmax = nb - b4 < 4 ? nb - b4 : 4;
+        for (int bi = 0; bi < bmax; bi++) {
+            int blk = b4 + bi;
+            w4i_t a0 = {0, 0, 0, 0}, a1 = {0, 0, 0, 0};
+            if (rok) {
+                const int* wp = (const int*)(quants + ((long long)rrow * nb + blk) * 32);
+                a0[0] = wp[0]; a0[1] = wp[1]; a0[2] = wp[2]; a0[3] = wp[3];
+                a1[0] = wp[4]; a1[1] = wp[5]; a1[2] = wp[6]; a1[3] = wp[7];
+            }
+            w4i_t b0, b1, c0, c1;
+            #pragma unroll
+            for (int q = 0; q < 4; q++) {
+                b0[q] = bt[t][bi * 8 + q];      b1[q] = bt[t][bi * 8 + 4 + q];
+                c0[q] = bt[t + 16][bi * 8 + q]; c1[q] = bt[t + 16][bi * 8 + 4 + q];
+            }
+            w8i_t acc0 = {0,0,0,0,0,0,0,0}, acc1 = {0,0,0,0,0,0,0,0};
+            acc0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, b0, acc0, true);
+            acc0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, b1, acc0, true);
+            acc1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, c0, acc1, true);
+            acc1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, c1, acc1, true);
+            float dx0 = bd[t][bi], dx1 = bd[t + 16][bi];
+            #pragma unroll
+            for (int l = 0; l < 8; l++) {
+                int r = row0 + 2 * l + hs;
+                float dw = r < out_dim ? scales[(long long)r * nb + blk] : 0.f;
+                f0[l] += dw * dx0 * (float)acc0[l];
+                f1[l] += dw * dx1 * (float)acc1[l];
+            }
+        }
+    }
+    #pragma unroll
+    for (int half = 0; half < 2; half++) {
+        int tok = tok0 + t + 16 * half;
+        if (tok >= m) continue;
+        float* f = half ? f1 : f0;
+        #pragma unroll
+        for (int l = 0; l < 8; l++) {
+            int r = row0 + 2 * l + hs;
+            if (r < out_dim) y[(long long)tok * out_dim + r] = f[l];
+        }
+    }
+}
+
 // ===== Native-Q6_K MoE GEMV (NO repack: 210 B/superblock as in the GGUF) =====
 // w = full 3D expert tensor (native bytes), expert stride ebytes. Per superblock:
 // ql[128] qh[64] sc[16xi8] d[f16]. 8 waves/block, 32 lanes on the SAME superblock
