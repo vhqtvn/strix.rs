@@ -285,6 +285,8 @@ pub struct RocmWeightAccel {
     pf_tab: Dbuf,
     pf_act: Dbuf,
     pf_xq: Dbuf,
+    pf_cs: Dbuf,
+    pf_sn: Dbuf,
     pf_xd: Dbuf,
     /// f16 KV cache (STRIX_F16_KV=1): halves KV memory + decode KV traffic, at a
     /// small prefill cost (the prefill SDPA is occupancy-bound, so the h2f isn't
@@ -376,6 +378,10 @@ impl RocmWeightAccel {
             "moe_silu_mul",
             "moe_wsum",
             "gather_xq8",
+            "rmsnorm_heads",
+            "rope_rows",
+            "kv_append_rows",
+            "sdpa_rows",
             "silu_quant_rows",
             "scatter_add_w",
             "zerof",
@@ -447,6 +453,8 @@ impl RocmWeightAccel {
         let pf_tab = gpu.alloc(64 * 1024).ok()?;
         let pf_act = gpu.alloc(2048 * 1024 * 4).ok()?;
         let pf_xq = gpu.alloc(2048 * 4096).ok()?;
+        let pf_cs = gpu.alloc(512 * 64 * 4).ok()?;
+        let pf_sn = gpu.alloc(512 * 64 * 4).ok()?;
         let pf_xd = gpu.alloc(2048 * 128 * 4).ok()?;
         let mut batch_x = Vec::new();
         let mut batch_y = Vec::new();
@@ -504,6 +512,8 @@ impl RocmWeightAccel {
             pf_tab,
             pf_act,
             pf_xq,
+            pf_cs,
+            pf_sn,
             pf_xd,
             kv_f16: std::env::var("STRIX_F16_KV").is_ok(),
             // pinned split if STRIX_N_SPLIT set, else 0 = context-adaptive (~len/64).
@@ -2890,6 +2900,138 @@ impl WeightAccel for RocmWeightAccel {
             base += oc;
         }
         Some(best.into_iter().map(|(_, i)| i).collect())
+    }
+
+
+    fn mlm_attn_prefill(
+        &mut self,
+        layer: usize,
+        xs: &[f32],
+        m: usize,
+        base: usize,
+        win: usize,
+        cs: &[f32],
+        sn: &[f32],
+    ) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let wq = self.q8.get(&format!("blk.{layer}.attn_q.weight"))?;
+        let wk = self.q8.get(&format!("blk.{layer}.attn_k.weight"))?;
+        let wv = self.q8.get(&format!("blk.{layer}.attn_v.weight"))?;
+        let wo = self.q8.get(&format!("blk.{layer}.attn_output.weight"))?;
+        let qn = self.f32w.get(&format!("blk.{layer}.attn_q_norm.weight"))?;
+        let kn = self.f32w.get(&format!("blk.{layer}.attn_k_norm.weight"))?;
+        let (hidden, q_dim, kv_dim) = (wq.in_dim, wq.out_dim, wk.out_dim);
+        let hd = 128usize;
+        let (nh, nkv) = (q_dim / hd, kv_dim / hd);
+        if layer >= self.mlm_kc.len() || base + m > self.mlm_seq || m > 512 || xs.len() != m * hidden {
+            return None;
+        }
+        self.gpu.upload_at(&self.pf_x, 0, xs).ok()?;
+        self.gpu.upload_at(&self.pf_cs, 0, cs).ok()?;
+        self.gpu.upload_at(&self.pf_sn, 0, sn).ok()?;
+        let (xq, xd) = self.pf_quant(self.pf_x.ptr, m, hidden);
+        let qb = self.pf_y.ptr;
+        let kb = self.pf_a.ptr;
+        let vb = self.pf_b.ptr;
+        for (w, y, od) in [(&wq, qb, q_dim), (&wk, kb, kv_dim), (&wv, vb, kv_dim)] {
+            self.launch2(
+                "q8i_gemm_lds2",
+                od.div_ceil(16) as u32,
+                m.div_ceil(32) as u32,
+                256,
+                0,
+                Args::new()
+                    .ptr(w.scales.ptr)
+                    .ptr(w.quants.ptr)
+                    .ptr(xq)
+                    .ptr(xd)
+                    .ptr(y)
+                    .i(hidden as i32)
+                    .i(od as i32)
+                    .i(m as i32),
+            );
+        }
+        for (y, n, w) in [(qb, nh, qn.ptr), (kb, nkv, kn.ptr)] {
+            self.launch2(
+                "rmsnorm_heads",
+                n as u32,
+                m as u32,
+                256,
+                0,
+                Args::new().ptr(y).ptr(w).ptr(y).i(hd as i32).i((n * hd) as i32).i(m as i32),
+            );
+        }
+        let half = hd / 2;
+        for (y, n) in [(qb, nh), (kb, nkv)] {
+            self.launch2(
+                "rope_rows",
+                ((n * half).div_ceil(64)) as u32,
+                m as u32,
+                64,
+                0,
+                Args::new()
+                    .ptr(y)
+                    .ptr(self.pf_cs.ptr)
+                    .ptr(self.pf_sn.ptr)
+                    .i(hd as i32)
+                    .i(n as i32)
+                    .i(m as i32),
+            );
+        }
+        for (src, cache) in [(kb, &self.mlm_kc[layer]), (vb, &self.mlm_vc[layer])] {
+            self.launch2(
+                "kv_append_rows",
+                kv_dim.div_ceil(256) as u32,
+                m as u32,
+                256,
+                0,
+                Args::new().ptr(src).ptr(cache.ptr).i(base as i32).i(kv_dim as i32).i(m as i32),
+            );
+        }
+        let attn = self.pf_dy.ptr;
+        let scale = 1.0 / (hd as f32).sqrt();
+        self.launch2(
+            "sdpa_rows",
+            nh as u32,
+            m as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(qb)
+                .ptr(self.mlm_kc[layer].ptr)
+                .ptr(self.mlm_vc[layer].ptr)
+                .ptr(attn)
+                .i(hd as i32)
+                .i(base as i32)
+                .i(win as i32)
+                .i((nh / nkv) as i32)
+                .i(nkv as i32)
+                .f(scale)
+                .i(m as i32)
+                .i(q_dim as i32),
+        );
+        let (aq, ad) = self.pf_quant(attn, m, q_dim);
+        let outp = unsafe { (self.pf_y.ptr as *mut f32).add(m * q_dim) } as *mut c_void;
+        self.launch2(
+            "q8i_gemm_lds2",
+            hidden.div_ceil(16) as u32,
+            m.div_ceil(32) as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(wo.scales.ptr)
+                .ptr(wo.quants.ptr)
+                .ptr(aq)
+                .ptr(ad)
+                .ptr(outp)
+                .i(q_dim as i32)
+                .i(hidden as i32)
+                .i(m as i32),
+        );
+        self.gpu.sync().ok()?;
+        let out = self.pf_y.download_at::<f32>(m * q_dim * 4, m * hidden).ok()?;
+        let kk = self.pf_a.download::<f32>(m * kv_dim).ok()?;
+        let vv = self.pf_b.download::<f32>(m * kv_dim).ok()?;
+        Some((out, kk, vv))
     }
 
     fn moe_expert_flush(&self, rows: usize, hidden: usize) -> Option<Vec<f32>> {

@@ -1131,6 +1131,86 @@ extern "C" __global__ void zerof(float* __restrict__ y, int n) {
     if (i < n) y[i] = 0.f;
 }
 
+
+// ===== Batched prefill attention (m rows) =====
+// per-head RMSNorm over hd for m rows: grid=(heads, m), block=256
+extern "C" __global__ void rmsnorm_heads(const float* __restrict__ x, const float* __restrict__ w,
+                                         float* __restrict__ y, int hd, int stride, int m) {
+    int h = blockIdx.x, r = blockIdx.y, t = threadIdx.x;
+    if (r >= m) return;
+    const float* xr = x + (long long)r * stride + h * hd;
+    float* yr = y + (long long)r * stride + h * hd;
+    __shared__ float red[256];
+    float ss = 0.f;
+    for (int i = t; i < hd; i += 256) ss += xr[i] * xr[i];
+    red[t] = ss; __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) { if (t < o) red[t] += red[t + o]; __syncthreads(); }
+    float inv = rsqrtf(red[0] / hd + 1e-6f);
+    for (int i = t; i < hd; i += 256) yr[i] = xr[i] * inv * w[i];
+}
+
+// rope for m rows: per-row tables (cs/sn [m][half]). grid=(heads*half/64*m grid: x = pairs, y = row)
+extern "C" __global__ void rope_rows(float* __restrict__ x, const float* __restrict__ cs,
+                                     const float* __restrict__ sn, int hd, int nh, int m) {
+    int i = blockIdx.x * 64 + threadIdx.x, r = blockIdx.y;
+    int half = hd / 2;
+    if (i >= nh * half || r >= m) return;
+    int h = i / half, p = i % half;
+    float c = cs[(long long)r * half + p], sv = sn[(long long)r * half + p];
+    float* xb = x + (long long)r * nh * hd + h * hd;
+    float a = xb[p], b = xb[p + half];
+    xb[p] = a * c - b * sv;
+    xb[p + half] = a * sv + b * c;
+}
+
+// append m rows to KV cache at base: grid=(kv_dim/256, m)
+extern "C" __global__ void kv_append_rows(const float* __restrict__ src, float* __restrict__ cache,
+                                          int base, int kv_dim, int m) {
+    int i = blockIdx.x * 256 + threadIdx.x, r = blockIdx.y;
+    if (i >= kv_dim || r >= m) return;
+    cache[(long long)(base + r) * kv_dim + i] = src[(long long)r * kv_dim + i];
+}
+
+// batched causal/window SDPA over cache: grid=(nh, m), len = base+r+1
+extern "C" __global__ void sdpa_rows(const float* __restrict__ q, const float* __restrict__ kc,
+                                     const float* __restrict__ vc, float* __restrict__ out,
+                                     int hd, int base, int win, int groups, int n_kv,
+                                     float scale, int m, int q_dim) {
+    int h = blockIdx.x, r = blockIdx.y, t = threadIdx.x;
+    if (r >= m) return;
+    int kvh = h / groups;
+    const float* qr = q + (long long)r * q_dim + h * hd;
+    float* outr = out + (long long)r * q_dim + h * hd;
+    int len = base + r + 1;
+    int ws = (win > 0 && len > win) ? len - win : 0;
+    int wlen = len - ws;
+    if (wlen > 2048) wlen = 2048;
+    __shared__ float scores[2048];
+    __shared__ float red[256];
+    for (int i = t; i < wlen; i += 256) {
+        float s = 0.f;
+        long long kb = ((long long)(ws + i) * n_kv + kvh) * hd;
+        for (int d = 0; d < hd; d++) s += qr[d] * kc[kb + d];
+        scores[i] = s * scale;
+    }
+    __syncthreads();
+    float mx0 = -3.0e38f;
+    for (int i = t; i < wlen; i += 256) mx0 = fmaxf(mx0, scores[i]);
+    red[t] = mx0; __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) { if (t < o) red[t] = fmaxf(red[t], red[t + o]); __syncthreads(); }
+    float mx = red[0]; __syncthreads();
+    float ls = 0.f;
+    for (int i = t; i < wlen; i += 256) { float e = __expf(scores[i] - mx); scores[i] = e; ls += e; }
+    red[t] = ls; __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) { if (t < o) red[t] += red[t + o]; __syncthreads(); }
+    float inv = 1.f / red[0]; __syncthreads();
+    for (int d = t; d < hd; d += 256) {
+        float acc = 0.f;
+        for (int i = 0; i < wlen; i++) acc += scores[i] * vc[((long long)(ws + i) * n_kv + kvh) * hd + d];
+        outr[d] = acc * inv;
+    }
+}
+
 // ===== Native-Q6_K MoE GEMV (NO repack: 210 B/superblock as in the GGUF) =====
 // w = full 3D expert tensor (native bytes), expert stride ebytes. Per superblock:
 // ql[128] qh[64] sc[16xi8] d[f16]. 8 waves/block, 32 lanes on the SAME superblock

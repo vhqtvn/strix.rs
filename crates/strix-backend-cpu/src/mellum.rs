@@ -920,7 +920,42 @@ impl MellumModel {
                 );
                 rmsnorm(ns, hs, &an, eps);
             }
-            {
+            let mut gpu_attn = false;
+            if std::env::var("STRIX_NO_INT8").is_err() && self.accel.is_some() {
+                let is_swa0 = cfg.is_swa(il);
+                let win = if is_swa0 { cfg.sliding_window } else { 0 };
+                let (fs, ef, ms) = if is_swa0 {
+                    (1.0, 0.0, 1.0)
+                } else {
+                    (1.0 / cfg.yarn_factor, 1.0, cfg.yarn_attn_factor)
+                };
+                let half = hd / 2;
+                let mut cs = vec![0.0f32; m * half];
+                let mut sn = vec![0.0f32; m * half];
+                let theta_scale = cfg.rope_freq_base.powf(-2.0 / cfg.n_rot as f32);
+                for t in 0..m {
+                    let mut theta = (self.pos + t) as f32;
+                    for kk in 0..half {
+                        let (c, s2) = rope_yarn(theta, fs, corr, 2 * kk, ef, ms);
+                        cs[t * half + kk] = c;
+                        sn[t * half + kk] = s2;
+                        theta *= theta_scale;
+                    }
+                }
+                let pos0 = self.pos;
+                let a = self.accel.as_mut().unwrap();
+                if a.mlm_prepare(cfg.n_layer, kv_dim, 2048) {
+                    if let Some((out, kk, vv)) = a.mlm_attn_prefill(il, &n, m, pos0, win, &cs, &sn) {
+                        self.kc[il].extend_from_slice(&kk);
+                        self.vc[il].extend_from_slice(&vv);
+                        for i in 0..m * hidden {
+                            h[i] += out[i];
+                        }
+                        gpu_attn = true;
+                    }
+                }
+            }
+            if !gpu_attn {
                 if !self.gpu_gemm(&b("attn_q.weight"), &n, m, hidden, q_dim, &mut q)
                     && !self.npu_mm(il, 0, &n, m, hidden, q_dim, &mut q)
                 {
@@ -940,6 +975,7 @@ impl MellumModel {
                     qmatmul_batch(&mut v, &n, m, wv.bytes, wv.ty, hidden, kv_dim);
                 }
             }
+            if !gpu_attn {
             let is_swa = cfg.is_swa(il);
             let (freq_scale, ext_factor, mscale) = if is_swa {
                 (1.0, 0.0, 1.0)
@@ -1043,6 +1079,7 @@ impl MellumModel {
             }
             for i in 0..m * hidden {
                 h[i] += o[i];
+            }
             }
 
             // MoE: route per token, group tokens by expert, batch each expert's GEMMs.

@@ -166,6 +166,22 @@ pub trait WeightAccel: Send + Sync {
     /// Sync + download `rows` of hidden from the dy pool.
     /// Whole-layer MoE on device (int8 prefill): one upload (normed acts) + one
     /// download (m*hidden out). plan = (expert, slot_off, count); slot_tok/wslot per slot.
+    /// Whole-layer batched attention on device (int8 prefill): norm acts in,
+    /// returns (attn_out m*hidden, roped k m*kv_dim, v m*kv_dim).
+    #[allow(clippy::too_many_arguments)]
+    fn mlm_attn_prefill(
+        &mut self,
+        _layer: usize,
+        _xs: &[f32],
+        _m: usize,
+        _base: usize,
+        _win: usize,
+        _cs: &[f32],
+        _sn: &[f32],
+    ) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        None
+    }
+
     fn moe_layer_q8_dev(
         &self,
         _layer: usize,

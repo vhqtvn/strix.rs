@@ -88,6 +88,23 @@ impl Dbuf {
             "memcpy h2d",
         )
     }
+    pub fn download_at<T: Copy + Default + Clone>(&self, byte_off: usize, n: usize) -> Result<Vec<T>> {
+        let bytes = n * std::mem::size_of::<T>();
+        assert!(byte_off + bytes <= self.bytes, "rocm: download_at overruns buffer");
+        let mut out = vec![T::default(); n];
+        ck(
+            unsafe {
+                hipMemcpy(
+                    out.as_mut_ptr() as *mut c_void,
+                    (self.ptr as *mut u8).add(byte_off) as *mut c_void,
+                    bytes,
+                    HIP_MEMCPY_DTOH,
+                )
+            },
+            "memcpy d2h",
+        )?;
+        Ok(out)
+    }
     pub fn download<T: Copy + Default + Clone>(&self, n: usize) -> Result<Vec<T>> {
         let bytes = n * std::mem::size_of::<T>();
         assert!(bytes <= self.bytes, "rocm: download overruns buffer");
