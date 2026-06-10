@@ -985,32 +985,34 @@ extern "C" __global__ void q8i_gemm_lds(const float* __restrict__ scales,
     int row = blockIdx.x * 8 + w, t0 = blockIdx.y * 32;
     int tm = m - t0; if (tm > 32) tm = 32;
     int nb = in_dim / 32, rb = row * nb;
-    __shared__ int   xs[32][32];   // 32 tokens x 128 i8
-    __shared__ float sd[32][4];    // 32 tokens x 4 block scales
+    __shared__ int   xs[32][64];   // 32 tokens x 256 i8
+    __shared__ float sd[32][8];    // 32 tokens x 8 block scales
     int e = (l & 7) * 4;
     float acc[32] = {0.f};
-    for (int b4 = 0; b4 < nb; b4 += 4) {
+    for (int b8 = 0; b8 < nb; b8 += 8) {
         __syncthreads();
-        {   // stage: thread covers token t=tid/8, 16B chunk c=tid%8 -> 4 ints
+        {   // stage: thread covers token t=tid/8, 32B chunk c=tid%8 -> 8 ints
             int t = tid >> 3, c = tid & 7;
             if (t < tm) {
-                const int* src = (const int*)(xq + (long long)(t0 + t) * in_dim + b4 * 32) + c * 4;
-                xs[t][c * 4 + 0] = src[0];
-                xs[t][c * 4 + 1] = src[1];
-                xs[t][c * 4 + 2] = src[2];
-                xs[t][c * 4 + 3] = src[3];
-                if (c < 4) sd[t][c] = xd[(long long)(t0 + t) * nb + b4 + c];
+                const int* src = (const int*)(xq + (long long)(t0 + t) * in_dim + b8 * 32) + c * 8;
+                #pragma unroll
+                for (int q = 0; q < 8; q++) xs[t][c * 8 + q] = src[q];
+                sd[t][c] = b8 + c < nb ? xd[(long long)(t0 + t) * nb + b8 + c] : 0.f;
             }
         }
         __syncthreads();
         if (row >= out_dim) continue;
-        int bi = b4 + (l >> 3);
-        float dw = scales[rb + bi];
-        const int w4 = *(const int*)(quants + ((long long)(rb + bi) * 32 + e));
-        int xo = ((l >> 3) * 32 + e) >> 2;
+        int bi0 = b8 + (l >> 3);
+        int has1 = bi0 + 4 < nb;
+        float dw0 = scales[rb + bi0];
+        float dw1 = has1 ? scales[rb + bi0 + 4] : 0.f;
+        const int w40 = *(const int*)(quants + ((long long)(rb + bi0) * 32 + e));
+        const int w41 = has1 ? *(const int*)(quants + ((long long)(rb + bi0 + 4) * 32 + e)) : 0;
+        int xo0 = ((l >> 3) * 32 + e) >> 2;
         for (int j = 0; j < tm; j++) {
-            int si = __builtin_amdgcn_sudot4(true, w4, true, xs[j][xo], 0, false);
-            acc[j] += dw * sd[j][l >> 3] * (float)si;
+            int s0 = __builtin_amdgcn_sudot4(true, w40, true, xs[j][xo0], 0, false);
+            int s1 = __builtin_amdgcn_sudot4(true, w41, true, xs[j][xo0 + 32], 0, false);
+            acc[j] += dw0 * sd[j][l >> 3] * (float)s0 + dw1 * sd[j][(l >> 3) + 4] * (float)s1;
         }
     }
     if (row >= out_dim) return;
