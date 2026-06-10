@@ -171,6 +171,22 @@ pub trait WeightAccel: Send + Sync {
     fn mlm_begin(&mut self, _h: &[f32]) -> bool {
         false
     }
+    /// Full on-GPU layer (norm→qkv→rope→SDPA→o→norm→router); 1 sync; router logits.
+    fn mlm_layer(&mut self, _il: usize, _pos: usize, _win: usize) -> Option<Vec<f32>> {
+        None
+    }
+    /// Allocate device KV caches for the fused token path.
+    fn mlm_prepare(&mut self, _n_layers: usize, _kv_dim: usize, _max_seq: usize) -> bool {
+        false
+    }
+    /// Seed the device KV cache for layer `il` from host data (len rows of kv_dim).
+    fn mlm_seed_kv(&mut self, _il: usize, _k: &[f32], _v: &[f32]) -> bool {
+        false
+    }
+    /// Upload rope cos/sin tables for the current pos/layer-type.
+    fn mlm_rope_tables(&mut self, _cs: &[f32], _sn: &[f32]) -> bool {
+        false
+    }
     /// attn_norm + q/k/v projections for layer `il`; returns (q,k,v).
     fn mlm_qkv(&mut self, _il: usize) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         None

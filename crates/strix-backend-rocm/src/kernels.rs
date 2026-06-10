@@ -821,6 +821,19 @@ extern "C" __global__ void shexp_add(float* __restrict__ out, const float* __res
     if (i < n) out[i] += sd[i] * sgate;
 }
 
+// Table RoPE: pairwise rotate with precomputed cos/sin per dim (yarn/mscale baked).
+extern "C" __global__ void rope_tab(float* __restrict__ v, const float* __restrict__ cs,
+                                    const float* __restrict__ sn, int head_dim, int n_heads) {
+    int idx = blockIdx.x * 64 + threadIdx.x, half = head_dim / 2;
+    if (idx >= n_heads * half) return;
+    int head = idx / half, j = idx % half;
+    int base = head * head_dim;
+    float c = cs[j], s = sn[j];
+    float x1 = v[base + j], x2 = v[base + j + half];
+    v[base + j] = x1 * c - x2 * s;
+    v[base + j + half] = x1 * s + x2 * c;
+}
+
 // h[i] += x[i] (plain residual). grid=ceil(n/256), block=256.
 extern "C" __global__ void vec_add(float* __restrict__ h, const float* __restrict__ x, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
