@@ -105,7 +105,8 @@ pub trait WeightAccel: Send + Sync {
 
     /// Fused MoE FFN for one token: y = Σ_k wexp[k]·down(silu(gate)·up)(x) over the
     /// routed experts — one device round-trip. `None` if layer not adopted.
-    fn moe_ffn(&self, _layer: usize, _ids: &[i32], _wexp: &[f32], _x: &[f32]) -> Option<Vec<f32>> {
+    /// `sgate`: sigmoid-gated shared-expert scale to fuse (0.0 = no shared expert).
+    fn moe_ffn(&self, _layer: usize, _ids: &[i32], _wexp: &[f32], _x: &[f32], _sgate: f32) -> Option<Vec<f32>> {
         None
     }
 

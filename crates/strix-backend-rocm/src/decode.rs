@@ -335,6 +335,7 @@ impl RocmWeightAccel {
             "moe_silu_mul",
             "moe_wsum",
             "vec_add",
+            "shexp_add",
             "argmax_f32",
             "rmsnorm",
             "addnorm",
@@ -482,6 +483,44 @@ impl RocmWeightAccel {
             0,
             Args::new().ptr(x).ptr(w).ptr(y).i(dim as i32).i(1).f(1e-6),
         );
+    }
+
+    /// Queue shared-expert launches into moe_out (no sync). x already in gemv_x.
+    fn queue_shexp(&self, layer: usize, hidden: usize, sgate: f32) -> bool {
+        let (Some(g), Some(u), Some(d)) = (
+            self.q8.get(&format!("blk.{layer}.ffn_gate_shexp.weight")),
+            self.q8.get(&format!("blk.{layer}.ffn_up_shexp.weight")),
+            self.q8.get(&format!("blk.{layer}.ffn_down_shexp.weight")),
+        ) else {
+            return false;
+        };
+        let sff = g.out_dim;
+        self.q8_launch(g, self.gemv_x.ptr, self.batch_y[0].ptr);
+        self.q8_launch(u, self.gemv_x.ptr, self.batch_y[1].ptr);
+        self.launch(
+            "moe_silu_mul",
+            sff.div_ceil(256) as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(self.batch_y[0].ptr)
+                .ptr(self.batch_y[1].ptr)
+                .ptr(self.moe_act.ptr)
+                .i(sff as i32),
+        );
+        self.q8_launch(d, self.moe_act.ptr, self.batch_y[2].ptr);
+        self.launch(
+            "shexp_add",
+            hidden.div_ceil(256) as u32,
+            256,
+            0,
+            Args::new()
+                .ptr(self.moe_out.ptr)
+                .ptr(self.batch_y[2].ptr)
+                .f(sgate)
+                .i(hidden as i32),
+        );
+        true
     }
 
     /// No-sync fused Q6_K MoE launches (native bytes) — same scratch as Q8.
@@ -1247,7 +1286,7 @@ impl WeightAccel for RocmWeightAccel {
         true
     }
 
-    fn moe_ffn(&self, layer: usize, ids: &[i32], wexp: &[f32], x: &[f32]) -> Option<Vec<f32>> {
+    fn moe_ffn(&self, layer: usize, ids: &[i32], wexp: &[f32], x: &[f32], sgate: f32) -> Option<Vec<f32>> {
         if let Some(m) = self.moe6.get(&layer) {
             let k = ids.len();
             if x.len() != m.hidden || wexp.len() != k || k > 16 {
@@ -1257,6 +1296,9 @@ impl WeightAccel for RocmWeightAccel {
             self.moe_ids.upload(ids).ok()?;
             self.moe_w.upload(wexp).ok()?;
             self.moe6_launches(m, k, self.gemv_x.ptr);
+            if sgate != 0.0 && !self.queue_shexp(layer, m.hidden, sgate) {
+                return None;
+            }
             self.gpu.sync().ok()?;
             return self.moe_out.download::<f32>(m.hidden).ok();
         }
@@ -1269,6 +1311,9 @@ impl WeightAccel for RocmWeightAccel {
         self.moe_ids.upload(ids).ok()?;
         self.moe_w.upload(wexp).ok()?;
         self.moe_launches(m, k, self.gemv_x.ptr);
+        if sgate != 0.0 && !self.queue_shexp(layer, m.hidden, sgate) {
+            return None;
+        }
         self.gpu.sync().ok()?;
         self.moe_out.download::<f32>(m.hidden).ok()
     }

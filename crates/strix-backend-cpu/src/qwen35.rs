@@ -543,7 +543,7 @@ impl Qwen35Model {
                     names.push(format!("blk.{il}.{t}.weight"));
                 }
             }
-            for t in ["ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp"] {
+            for t in ["ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp", "ffn_gate_inp_shexp"] {
                 names.push(format!("blk.{il}.{t}.weight"));
             }
         }
@@ -1455,7 +1455,16 @@ impl Qwen35Model {
         if let Some(a) = &self.accel {
             let ids: Vec<i32> = idx.iter().map(|&e| e as i32).collect();
             let wexp: Vec<f32> = idx.iter().map(|&e| probs[e] / wsum).collect();
-            gpu_out = a.moe_ffn(il, &ids, &wexp, x).filter(|y| y.len() == hidden);
+            // shared-expert sigmoid gate computed CPU (its router weight is F32);
+            // the shexp FFN itself is fused on-GPU under the same sync.
+            let mut sgate = 0.0f32;
+            if cfg.shared_ff > 0 {
+                let wgis = self.w(&b("ffn_gate_inp_shexp.weight"))?;
+                let mut sg = [0.0f32; 1];
+                qmatmul(&mut sg, x, wgis.bytes, wgis.ty, wgis.in_dim, row);
+                sgate = sigmoid(sg[0]);
+            }
+            gpu_out = a.moe_ffn(il, &ids, &wexp, x, sgate).filter(|y| y.len() == hidden);
         }
 
         let wge = self.w(&b("ffn_gate_exps.weight"))?; // [hidden, eff, ne]
@@ -1516,9 +1525,10 @@ impl Qwen35Model {
             }
         }
 
-        // shared expert (sigmoid-gated)
+        // shared expert (sigmoid-gated). When routed on GPU, moe_ffn already fused
+        // the shared expert into the result — skip CPU.
         let sff = cfg.shared_ff;
-        if sff > 0 {
+        if sff > 0 && !routed_on_gpu {
             let wgs = self.w(&b("ffn_gate_shexp.weight"))?;
             let wus = self.w(&b("ffn_up_shexp.weight"))?;
             let wds = self.w(&b("ffn_down_shexp.weight"))?;

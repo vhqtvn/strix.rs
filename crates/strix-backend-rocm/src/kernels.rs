@@ -680,6 +680,13 @@ extern "C" __global__ void moe_silu_mul(const float* __restrict__ g, const float
     act[i] = (gv / (1.f + __expf(-gv))) * u[i];
 }
 
+// out[i] += sigmoid(sg[0]) * sd[i] (shared-expert combine). grid=ceil(n/256).
+extern "C" __global__ void shexp_add(float* __restrict__ out, const float* __restrict__ sd,
+                                     float sgate, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] += sd[i] * sgate;
+}
+
 // h[i] += x[i] (plain residual). grid=ceil(n/256), block=256.
 extern "C" __global__ void vec_add(float* __restrict__ h, const float* __restrict__ x, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;

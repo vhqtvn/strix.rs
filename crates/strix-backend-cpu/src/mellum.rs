@@ -1408,7 +1408,7 @@ impl MellumModel {
         if let Some(a) = &self.accel {
             let ids: Vec<i32> = idx.iter().map(|&e| e as i32).collect();
             let wexp: Vec<f32> = idx.iter().map(|&e| probs[e] / wsum).collect();
-            if let Some(y) = a.moe_ffn(il, &ids, &wexp, x) {
+            if let Some(y) = a.moe_ffn(il, &ids, &wexp, x, 0.0) {
                 if y.len() == hidden {
                     return Ok(y);
                 }
