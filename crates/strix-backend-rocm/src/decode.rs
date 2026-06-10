@@ -261,6 +261,8 @@ pub struct RocmWeightAccel {
     mlm_v: Dbuf,
     mlm_attn: Dbuf,
     mlm_rl: Dbuf,
+    batch_x: Vec<Dbuf>,
+    batch_y: Vec<Dbuf>,
     /// f16 KV cache (STRIX_F16_KV=1): halves KV memory + decode KV traffic, at a
     /// small prefill cost (the prefill SDPA is occupancy-bound, so the h2f isn't
     /// free there). Default false (f32) — best for prefill-heavy workloads.
@@ -378,6 +380,12 @@ impl RocmWeightAccel {
         let mlm_v = gpu.alloc(1024 * 4).ok()?;
         let mlm_attn = gpu.alloc(8192 * 4).ok()?;
         let mlm_rl = gpu.alloc(256 * 4).ok()?;
+        let mut batch_x = Vec::new();
+        let mut batch_y = Vec::new();
+        for _ in 0..4 {
+            batch_x.push(gpu.alloc(GEMV_MAX_IN * 4).ok()?);
+            batch_y.push(gpu.alloc(16384 * 4).ok()?);
+        }
         Some(Self {
             gpu,
             funcs,
@@ -405,6 +413,8 @@ impl RocmWeightAccel {
             mlm_v,
             mlm_attn,
             mlm_rl,
+            batch_x,
+            batch_y,
             kv_f16: std::env::var("STRIX_F16_KV").is_ok(),
             // pinned split if STRIX_N_SPLIT set, else 0 = context-adaptive (~len/64).
             n_split: std::env::var("STRIX_N_SPLIT")
@@ -1342,6 +1352,36 @@ impl WeightAccel for RocmWeightAccel {
         self.q8_launch(head, self.mlm_n.ptr, self.gemv_y.ptr);
         self.gpu.sync().ok()?;
         self.gemv_y.download::<f32>(head.out_dim).ok()
+    }
+
+    fn gemv_batch(&self, calls: &[(&str, &[f32])]) -> Vec<Option<Vec<f32>>> {
+        // All launches queued stream-ordered, ONE sync, then downloads. Falls back to
+        // per-call gemv only for keys not Q8-resident.
+        if calls.len() > 4 || !calls.iter().all(|(k, _)| self.q8.contains_key(*k)) {
+            return calls.iter().map(|(k, x)| self.gemv(k, x)).collect();
+        }
+        let mut metas = Vec::with_capacity(calls.len());
+        for (i, (k, x)) in calls.iter().enumerate() {
+            let e = &self.q8[*k];
+            if x.len() != e.in_dim || e.out_dim > 16384 {
+                return calls.iter().map(|(k, x)| self.gemv(k, x)).collect();
+            }
+            let xbuf = &self.batch_x[i];
+            let ybuf = &self.batch_y[i];
+            if xbuf.upload(x).is_err() {
+                return calls.iter().map(|(k, x)| self.gemv(k, x)).collect();
+            }
+            self.q8_launch(e, xbuf.ptr, ybuf.ptr);
+            metas.push(e.out_dim);
+        }
+        if self.gpu.sync().is_err() {
+            return calls.iter().map(|_| None).collect();
+        }
+        metas
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| self.batch_y[i].download::<f32>(n).ok())
+            .collect()
     }
 
     fn gemv(&self, key: &str, x: &[f32]) -> Option<Vec<f32>> {

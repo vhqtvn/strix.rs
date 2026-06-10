@@ -1181,12 +1181,26 @@ impl Qwen35Model {
         let mut k = vec![0.0f32; kv_dim];
         let mut v = vec![0.0f32; kv_dim];
         {
-            let wq = self.w(&b("attn_q.weight"))?;
-            self.mm(&b("attn_q.weight"), &mut qg, x, &wq, row);
-            let wk = self.w(&b("attn_k.weight"))?;
-            self.mm(&b("attn_k.weight"), &mut k, x, &wk, row);
-            let wv = self.w(&b("attn_v.weight"))?;
-            self.mm(&b("attn_v.weight"), &mut v, x, &wv, row);
+            let mut got = false;
+            if let Some(a) = &self.accel {
+                let r = a.gemv_batch(&[(&b("attn_q.weight"), x), (&b("attn_k.weight"), x), (&b("attn_v.weight"), x)]);
+                if let (Some(qv), Some(kv), Some(vv)) = (&r[0], &r[1], &r[2]) {
+                    if qv.len() == qg.len() && kv.len() == k.len() && vv.len() == v.len() {
+                        qg.copy_from_slice(qv);
+                        k.copy_from_slice(kv);
+                        v.copy_from_slice(vv);
+                        got = true;
+                    }
+                }
+            }
+            if !got {
+                let wq = self.w(&b("attn_q.weight"))?;
+                self.mm(&b("attn_q.weight"), &mut qg, x, &wq, row);
+                let wk = self.w(&b("attn_k.weight"))?;
+                self.mm(&b("attn_k.weight"), &mut k, x, &wk, row);
+                let wv = self.w(&b("attn_v.weight"))?;
+                self.mm(&b("attn_v.weight"), &mut v, x, &wv, row);
+            }
         }
 
         // per-head Q (+gate) norm + rope; per-kv-head K norm + rope
@@ -1279,11 +1293,22 @@ impl Qwen35Model {
         let mut alpha_raw = vec![0.0f32; n_vh];
         {
             let wqkv = self.w(&b("attn_qkv.weight"))?;
-            if !self.try_gemv(&b("attn_qkv.weight"), x, &mut qkv) {
+            let mut got = false;
+            if let Some(a) = &self.accel {
+                let r = a.gemv_batch(&[(&b("attn_qkv.weight"), x), (&b("attn_gate.weight"), x)]);
+                if let (Some(qv), Some(zv)) = (&r[0], &r[1]) {
+                    if qv.len() == qkv.len() && zv.len() == z.len() {
+                        qkv.copy_from_slice(qv);
+                        z.copy_from_slice(zv);
+                        got = true;
+                    }
+                }
+            }
+            if !got {
                 qmatmul(&mut qkv, x, wqkv.bytes, wqkv.ty, wqkv.in_dim, row);
             }
             let wgate = self.w(&b("attn_gate.weight"))?;
-            if !self.try_gemv(&b("attn_gate.weight"), x, &mut z) {
+            if !got {
                 qmatmul(&mut z, x, wgate.bytes, wgate.ty, wgate.in_dim, row);
             }
             let wbeta = self.w(&b("ssm_beta.weight"))?;
