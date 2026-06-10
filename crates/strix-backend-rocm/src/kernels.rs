@@ -927,29 +927,34 @@ extern "C" __global__ void f32_gemv(const float* __restrict__ w, const float* __
 
 // GPU router top-k: logits[ne] -> ids[k] + renormalized softmax weights[k].
 // Single wave; iterative argmax (ne<=256, k<=16). Matches CPU softmax-all+topk+renorm.
+// Warp-parallel: 32 lanes, up to 4 logits/lane (ne<=128). Repeated warp argmax
+// (ties -> lowest index = CPU first-found order), softmax over all, top-k renorm.
 extern "C" __global__ void topk_router(const float* __restrict__ logits, int ne, int k,
                                        int* __restrict__ ids, float* __restrict__ w) {
-    if (threadIdx.x != 0) return;
-    float mx = -3e38f;
-    for (int e = 0; e < ne; e++) mx = fmaxf(mx, logits[e]);
+    int l = threadIdx.x;
+    float v[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) { int e = l + 32 * j; v[j] = e < ne ? logits[e] : -3e38f; }
+    float mx = fmaxf(fmaxf(v[0], v[1]), fmaxf(v[2], v[3]));
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor(mx, o));
     float sum = 0.f;
-    for (int e = 0; e < ne; e++) sum += __expf(logits[e] - mx);
-    float taken[16];
-    int tid[16];
-    for (int i = 0; i < k; i++) {
-        float best = -3e38f;
-        int bj = 0;
-        for (int e = 0; e < ne; e++) {
-            bool used = false;
-            for (int j = 0; j < i; j++) used |= (tid[j] == e);
-            if (!used && logits[e] > best) { best = logits[e]; bj = e; }
-        }
-        tid[i] = bj;
-        taken[i] = __expf(best - mx) / sum;
-    }
+    #pragma unroll
+    for (int j = 0; j < 4; j++) if (l + 32 * j < ne) sum += __expf(v[j] - mx);
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor(sum, o);
     float ws = 0.f;
-    for (int i = 0; i < k; i++) ws += taken[i];
-    for (int i = 0; i < k; i++) { ids[i] = tid[i]; w[i] = taken[i] / ws; }
+    for (int i = 0; i < k; i++) {
+        float b = fmaxf(fmaxf(v[0], v[1]), fmaxf(v[2], v[3]));
+        for (int o = 16; o > 0; o >>= 1) b = fmaxf(b, __shfl_xor(b, o));
+        int mi = 1 << 30;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) if (v[j] == b) mi = min(mi, l + 32 * j);
+        for (int o = 16; o > 0; o >>= 1) mi = min(mi, __shfl_xor(mi, o));
+        if (l == 0) { ids[i] = mi; w[i] = __expf(b - mx) / sum; }
+        ws += __expf(b - mx) / sum;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) if (l + 32 * j == mi) v[j] = -3e38f;
+    }
+    if (l == 0) for (int i = 0; i < k; i++) w[i] /= ws;
 }
 
 // out[o] = sum_k wexp[k]*dy[k][o] — deterministic accumulation in routed order.
