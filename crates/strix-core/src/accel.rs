@@ -74,6 +74,7 @@ pub trait WeightAccel: Send + Sync {
 
     /// Adopt a whole MoE layer's expert tensors in NATIVE Q8_0 layout (gate/up:
     /// [hidden→eff]×ne; down: [eff→hidden]×ne). Default: not adopted.
+    #[allow(clippy::too_many_arguments)]
     fn upload_moe_q8(
         &mut self,
         _layer: usize,

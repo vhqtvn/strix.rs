@@ -1071,6 +1071,7 @@ impl WeightAccel for RocmWeightAccel {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn upload_moe_q8(
         &mut self,
         layer: usize,
