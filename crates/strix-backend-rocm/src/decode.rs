@@ -270,6 +270,7 @@ pub struct RocmWeightAccel {
     mlm_pos: Dbuf,
     /// int8-activation scratch (STRIX_INT8): quantized acts + per-32-block scales.
     mlm_xq: Dbuf,
+    mlm_arg: Dbuf,
     mlm_xd: Dbuf,
     mlm_int8: bool,
     mlm_graph: Option<*mut std::os::raw::c_void>,
@@ -432,6 +433,7 @@ impl RocmWeightAccel {
         let mlm_sn2 = gpu.alloc(128 * 4).ok()?;
         let mlm_pos = gpu.alloc(4).ok()?;
         let mlm_xq = gpu.alloc(16 * 4096).ok()?;
+        let mlm_arg = gpu.alloc(8).ok()?;
         let mlm_xd = gpu.alloc(2048 * 4).ok()?;
         let pf_x = gpu.alloc(2048 * 4096 * 4).ok()?;
         let pf_a = gpu.alloc(2048 * 1024 * 4).ok()?;
@@ -483,6 +485,7 @@ impl RocmWeightAccel {
             mlm_sn2,
             mlm_pos,
             mlm_xq,
+            mlm_arg,
             mlm_xd,
             mlm_int8: std::env::var("STRIX_INT8").is_ok(),
             mlm_graph: None,
@@ -2328,6 +2331,19 @@ impl WeightAccel for RocmWeightAccel {
                     );
                 }
             }
+            if ok {
+                self.launch(
+                    "argmax_f32",
+                    1,
+                    1024,
+                    0,
+                    Args::new()
+                        .ptr(self.gemv_y.ptr)
+                        .i(head_out as i32)
+                        .ptr(self.mlm_arg.ptr)
+                        .ptr(unsafe { (self.mlm_arg.ptr as *mut f32).add(1) as *mut c_void }),
+                );
+            }
             let mut graph: *mut c_void = std::ptr::null_mut();
             unsafe {
                 if crate::ffi::hipStreamEndCapture(self.gpu.stream, &mut graph) != 0 || !ok {
@@ -2356,7 +2372,13 @@ impl WeightAccel for RocmWeightAccel {
             }
         }
         self.gpu.sync().ok()?;
-        self.gemv_y.download::<f32>(head_out).ok()
+        let idx = self.mlm_arg.download::<i32>(1).ok()?;
+        let mut oh = vec![0.0f32; head_out];
+        let i = idx[0] as usize;
+        if i < head_out {
+            oh[i] = 1.0;
+        }
+        Some(oh)
     }
 
     /// Upload device pos for the graph token.
