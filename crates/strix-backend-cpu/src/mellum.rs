@@ -586,12 +586,18 @@ impl MellumModel {
         let topk = cfg.n_expert_used;
         let max_seq = 2048usize;
         if pos + 1 > max_seq {
-            { eprintln!("[fused bail 1]"); return Ok(None); }
+            {
+                eprintln!("[fused bail 1]");
+                return Ok(None);
+            }
         }
         {
             let a = self.accel.as_mut().unwrap();
             if !a.mlm_prepare(cfg.n_layer, kv_dim, max_seq) || !a.mlm_begin(&h) {
-                { eprintln!("[fused bail 2]"); return Ok(None); }
+                {
+                    eprintln!("[fused bail 2]");
+                    return Ok(None);
+                }
             }
         }
         if !self.kv_seeded {
@@ -599,7 +605,10 @@ impl MellumModel {
                 let (kc, vc) = (self.kc[il].clone(), self.vc[il].clone());
                 let a = self.accel.as_mut().unwrap();
                 if !a.mlm_seed_kv(il, &kc, &vc) {
-                    { eprintln!("[fused bail 3]"); return Ok(None); }
+                    {
+                        eprintln!("[fused bail 3]");
+                        return Ok(None);
+                    }
                 }
             }
             self.kv_seeded = true;
@@ -638,13 +647,19 @@ impl MellumModel {
                     (&cs_f, &sn_f)
                 };
                 if !a.mlm_rope_tables(cs, sn) {
-                    { eprintln!("[fused bail 4]"); return Ok(None); }
+                    {
+                        eprintln!("[fused bail 4]");
+                        return Ok(None);
+                    }
                 }
                 last_swa = cur;
             }
             let win = if is_swa { cfg.sliding_window } else { 0 };
             if !a.mlm_layer_nosync(il, pos, win, topk) {
-                { eprintln!("[fused bail 5]"); return Ok(None); }
+                {
+                    eprintln!("[fused bail 5]");
+                    return Ok(None);
+                }
             }
         }
         self.pos += 1;
@@ -845,6 +860,30 @@ impl MellumModel {
     /// rope/norm/SDPA are the same code, and each token's MoE accumulates in its
     /// own routed-expert order. Returns logits of the LAST token.
     fn prefill_batch(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let m = tokens.len();
+        let hidden = self.cfg.hidden;
+        let h = self.prefill_batch_h(tokens)?;
+        let on = self.vecw("output_norm.weight")?;
+        let mut nh_ = vec![0.0f32; hidden];
+        rmsnorm(
+            &mut nh_,
+            &h[(m - 1) * hidden..m * hidden],
+            &on,
+            self.cfg.rms_eps,
+        );
+        let (head_key, head) = if self.gguf.tensors().contains_key("output.weight") {
+            ("output.weight", self.w("output.weight")?)
+        } else {
+            ("token_embd.weight", self.w("token_embd.weight")?)
+        };
+        let mut logits = vec![0.0f32; self.cfg.vocab];
+        let mut row = vec![0.0f32; 8192];
+        self.mm(head_key, &mut logits, &nh_, &head, &mut row);
+        Ok(logits)
+    }
+
+    /// Batched layers only — returns all m final hidden rows; advances pos/KV.
+    fn prefill_batch_h(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
         let cfg = self.cfg.clone();
         let m = tokens.len();
         let hidden = cfg.hidden;
@@ -1214,20 +1253,22 @@ impl MellumModel {
             }
         }
         self.pos += m;
+        Ok(h)
+    }
 
-        // lm_head on the last token only
-        let on = self.vecw("output_norm.weight")?;
-        let mut nh_ = vec![0.0f32; hidden];
-        rmsnorm(&mut nh_, &h[(m - 1) * hidden..m * hidden], &on, eps);
-        let (head_key, head) = if self.gguf.tensors().contains_key("output.weight") {
-            ("output.weight", self.w("output.weight")?)
-        } else {
-            ("token_embd.weight", self.w("token_embd.weight")?)
-        };
-        let mut logits = vec![0.0f32; cfg.vocab];
-        let mut row = vec![0.0f32; 8192];
-        self.mm(head_key, &mut logits, &nh_, &head, &mut row);
-        Ok(logits)
+    /// Roll back to `pos` (drop KV rows beyond) after speculative rejection.
+    pub fn rollback(&mut self, pos: usize) {
+        let kv_dim = self.cfg.n_head_kv * self.cfg.head_dim;
+        for il in 0..self.cfg.n_layer {
+            self.kc[il].truncate(pos * kv_dim);
+            self.vc[il].truncate(pos * kv_dim);
+        }
+        self.pos = pos;
+        self.kv_seeded = false;
+    }
+
+    pub fn pos(&self) -> usize {
+        self.pos
     }
 
     fn forward(&mut self, token: u32, want_logits: bool) -> Result<Option<Vec<f32>>> {
@@ -1493,6 +1534,44 @@ impl MellumModel {
             for i in 0..hidden {
                 out[i] += wexp * dy[i];
             }
+        }
+        Ok(out)
+    }
+}
+
+impl MellumModel {
+    /// Verify `tokens` (proposed continuation from current pos): batched forward
+    /// through all layers + lm_head per row; returns argmax per position (lossless
+    /// speculative verify). State/caches end positioned after all tokens.
+    pub fn verify_tokens(&mut self, tokens: &[u32]) -> Result<Vec<u32>> {
+        let m = tokens.len();
+        let hidden = self.cfg.hidden;
+        let mut hs = self.prefill_batch_h(tokens)?; // [m * hidden] final hidden
+        let on = self.vecw("output_norm.weight")?;
+        let head = if self.gguf.tensors().contains_key("output.weight") {
+            self.w("output.weight")?
+        } else {
+            self.w("token_embd.weight")?
+        };
+        let mut out = Vec::with_capacity(m);
+        let mut row = vec![0.0f32; 8192];
+        let mut logits = vec![0.0f32; self.cfg.vocab];
+        for t in 0..m {
+            let h = &mut hs[t * hidden..(t + 1) * hidden];
+            let mut nh = vec![0.0f32; hidden];
+            rmsnorm(&mut nh, h, &on, self.cfg.rms_eps);
+            if !self.try_gemv("output.weight", &nh, &mut logits) {
+                qmatmul(&mut logits, &nh, head.bytes, head.ty, hidden, &mut row);
+            }
+            let mut bi = 0usize;
+            let mut bv = f32::NEG_INFINITY;
+            for (i, &v) in logits.iter().enumerate() {
+                if v > bv {
+                    bv = v;
+                    bi = i;
+                }
+            }
+            out.push(bi as u32);
         }
         Ok(out)
     }

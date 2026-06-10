@@ -343,10 +343,59 @@ fn run_mellum(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Res
 
     let mut generated: Vec<u32> = vec![next];
     let decode_start = Instant::now();
-    for _ in 1..max_tokens {
-        let l = model.decode_one(next).context("mellum decode")?;
-        next = sampler.sample(&l)?;
-        generated.push(next);
+    let lookup = std::env::var("STRIX_LOOKUP").is_ok();
+    if lookup {
+        // Lossless n-gram lookup speculation: propose continuation from history,
+        // verify all candidates in ONE batched forward, accept matching prefix.
+        let gamma = 8usize;
+        let mut ctx: Vec<u32> = prompt_ids.clone();
+        ctx.push(next);
+        while generated.len() < max_tokens {
+            // propose: longest n-gram (3..1) suffix match in history
+            let mut prop: Vec<u32> = Vec::new();
+            'find: for n in (1..=3usize).rev() {
+                if ctx.len() < n + 1 {
+                    continue;
+                }
+                let pat = &ctx[ctx.len() - n..];
+                for st in (0..ctx.len() - n).rev() {
+                    if &ctx[st..st + n] == pat {
+                        let cont = &ctx[st + n..(st + n + gamma).min(ctx.len() - 1)];
+                        if !cont.is_empty() {
+                            prop = cont.to_vec();
+                            break 'find;
+                        }
+                    }
+                }
+            }
+            let pos0 = model.pos();
+            let mut cand = vec![next];
+            cand.extend(&prop);
+            let outs = model.verify_tokens(&cand).context("verify")?;
+            // accept prop[i] while it equals model's argmax at i
+            let mut acc = 0usize;
+            while acc < prop.len()
+                && outs[acc] == prop[acc]
+                && generated.len() + acc + 1 < max_tokens
+            {
+                acc += 1;
+            }
+            for t in &prop[..acc] {
+                generated.push(*t);
+                ctx.push(*t);
+            }
+            next = outs[acc];
+            generated.push(next);
+            ctx.push(next);
+            // rollback the rejected suffix (we forwarded all gamma candidates)
+            model.rollback(pos0 + acc + 1);
+        }
+    } else {
+        for _ in 1..max_tokens {
+            let l = model.decode_one(next).context("mellum decode")?;
+            next = sampler.sample(&l)?;
+            generated.push(next);
+        }
     }
     let decode_secs = decode_start.elapsed().as_secs_f64();
 
