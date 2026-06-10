@@ -470,6 +470,21 @@ impl Qwen35Model {
         Ok(n)
     }
 
+    /// iGPU dense GEMM for batched prefill (resident Q8 weight, chunks of 256).
+    fn gpu_gemm(&self, key: &str, xs: &[f32], m: usize, in_dim: usize, out_dim: usize, out: &mut [f32]) -> bool {
+        let Some(a) = &self.accel else { return false };
+        for c in (0..m).step_by(256) {
+            let mc = (m - c).min(256);
+            match a.prefill_q8_gemm(key, &xs[c * in_dim..(c + mc) * in_dim], mc) {
+                Some(y) if y.len() == mc * out_dim => {
+                    out[c * out_dim..(c + mc) * out_dim].copy_from_slice(&y);
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
     /// NPU dense projection for layer `il` during batched prefill (`which`: 0 = the
     /// 2048→8192 shape, 1 = 2048→4096, 2 = 4096→2048), chunked to M=256.
     #[cfg(feature = "npu")]
@@ -753,7 +768,8 @@ impl Qwen35Model {
         let mut k = vec![0.0f32; m * kv_dim];
         let mut v = vec![0.0f32; m * kv_dim];
         {
-            if !self.npu_proj(0, il, x, m, hidden, qg_dim, &mut qg) {
+            if !self.gpu_gemm(&b("attn_q.weight"), x, m, hidden, qg_dim, &mut qg)
+                && !self.npu_proj(0, il, x, m, hidden, qg_dim, &mut qg) {
                 let wq = self.w(&b("attn_q.weight"))?;
                 qmatmul_batch(&mut qg, x, m, wq.bytes, wq.ty, hidden, qg_dim);
             }
@@ -830,7 +846,8 @@ impl Qwen35Model {
                 }
             });
         let mut o = vec![0.0f32; m * hidden];
-        if !self.npu_proj(2, il, &attn_out, m, q_dim, hidden, &mut o) {
+        if !self.gpu_gemm(&b("attn_output.weight"), &attn_out, m, q_dim, hidden, &mut o)
+            && !self.npu_proj(2, il, &attn_out, m, q_dim, hidden, &mut o) {
             let wo = self.w(&b("attn_output.weight"))?;
             qmatmul_batch(&mut o, &attn_out, m, wo.bytes, wo.ty, q_dim, hidden);
         }
@@ -864,11 +881,13 @@ impl Qwen35Model {
         let mut beta_raw = vec![0.0f32; m * n_vh];
         let mut alpha_raw = vec![0.0f32; m * n_vh];
         {
-            if !self.npu_proj(0, il, x, m, hidden, conv_dim, &mut qkv) {
+            if !self.gpu_gemm(&b("attn_qkv.weight"), x, m, hidden, conv_dim, &mut qkv)
+                && !self.npu_proj(0, il, x, m, hidden, conv_dim, &mut qkv) {
                 let wqkv = self.w(&b("attn_qkv.weight"))?;
                 qmatmul_batch(&mut qkv, x, m, wqkv.bytes, wqkv.ty, hidden, conv_dim);
             }
-            if !self.npu_proj(1, il, x, m, hidden, value_dim, &mut z) {
+            if !self.gpu_gemm(&b("attn_gate.weight"), x, m, hidden, value_dim, &mut z)
+                && !self.npu_proj(1, il, x, m, hidden, value_dim, &mut z) {
                 let wgate = self.w(&b("attn_gate.weight"))?;
                 qmatmul_batch(&mut z, x, m, wgate.bytes, wgate.ty, hidden, value_dim);
             }
@@ -963,7 +982,8 @@ impl Qwen35Model {
             }
         }
         let mut o = vec![0.0f32; m * hidden];
-        if !self.npu_proj(2, il, &gated, m, value_dim, hidden, &mut o) {
+        if !self.gpu_gemm(&b("ssm_out.weight"), &gated, m, value_dim, hidden, &mut o)
+            && !self.npu_proj(2, il, &gated, m, value_dim, hidden, &mut o) {
             let wout = self.w(&b("ssm_out.weight"))?;
             qmatmul_batch(&mut o, &gated, m, wout.bytes, wout.ty, value_dim, hidden);
         }
@@ -1023,40 +1043,49 @@ impl Qwen35Model {
             for (i, &(t, _)) in list.iter().enumerate() {
                 xs[i * hidden..(i + 1) * hidden].copy_from_slice(&x[t * hidden..(t + 1) * hidden]);
             }
-            let mut g = vec![0.0f32; me * eff];
-            let mut u = vec![0.0f32; me * eff];
-            qmatmul_batch(
-                &mut g,
-                &xs,
-                me,
-                &wge.bytes[e * g_bpr..(e + 1) * g_bpr],
-                wge.ty,
-                hidden,
-                eff,
-            );
-            qmatmul_batch(
-                &mut u,
-                &xs,
-                me,
-                &wue.bytes[e * u_bpr..(e + 1) * u_bpr],
-                wue.ty,
-                hidden,
-                eff,
-            );
-            let mut act = vec![0.0f32; me * eff];
-            for i in 0..me * eff {
-                act[i] = silu(g[i]) * u[i];
-            }
             let mut d = vec![0.0f32; me * hidden];
-            qmatmul_batch(
-                &mut d,
-                &act,
-                me,
-                &wde.bytes[e * d_bpr..(e + 1) * d_bpr],
-                wde.ty,
-                eff,
-                hidden,
-            );
+            let gpu_d = self
+                .accel
+                .as_ref()
+                .and_then(|a| a.moe_expert_ffn(il, e, &xs, me))
+                .filter(|y| y.len() == me * hidden);
+            if let Some(y) = gpu_d {
+                d.copy_from_slice(&y);
+            } else {
+                let mut g = vec![0.0f32; me * eff];
+                let mut u = vec![0.0f32; me * eff];
+                qmatmul_batch(
+                    &mut g,
+                    &xs,
+                    me,
+                    &wge.bytes[e * g_bpr..(e + 1) * g_bpr],
+                    wge.ty,
+                    hidden,
+                    eff,
+                );
+                qmatmul_batch(
+                    &mut u,
+                    &xs,
+                    me,
+                    &wue.bytes[e * u_bpr..(e + 1) * u_bpr],
+                    wue.ty,
+                    hidden,
+                    eff,
+                );
+                let mut act = vec![0.0f32; me * eff];
+                for i in 0..me * eff {
+                    act[i] = silu(g[i]) * u[i];
+                }
+                qmatmul_batch(
+                    &mut d,
+                    &act,
+                    me,
+                    &wde.bytes[e * d_bpr..(e + 1) * d_bpr],
+                    wde.ty,
+                    eff,
+                    hidden,
+                );
+            }
             for (i, &(t, s)) in list.iter().enumerate() {
                 dy[(t * topk + s) * hidden..(t * topk + s + 1) * hidden]
                     .copy_from_slice(&d[i * hidden..(i + 1) * hidden]);

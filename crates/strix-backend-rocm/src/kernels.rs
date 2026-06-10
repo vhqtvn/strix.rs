@@ -671,6 +671,71 @@ extern "C" __global__ void q6_moe_gemv(const unsigned char* __restrict__ w, long
     if (l == 0) y[(long long)k * out_dim + row] = acc;
 }
 
+// Q8 GEMM rows variant: y[t][row] = W row . xs[t]; grid=(out_dim, m), block=32 (wave/row).
+extern "C" __global__ void q8_gemm_rows(const float* __restrict__ scales,
+                                        const signed char* __restrict__ quants,
+                                        const float* __restrict__ xs,
+                                        float* __restrict__ y, int in_dim, int out_dim) {
+    int l = threadIdx.x & 31;
+    int row = blockIdx.x, t = blockIdx.y;
+    if (row >= out_dim) return;
+    int nb = in_dim / 32, rb = row * nb;
+    const float* x = xs + (long long)t * in_dim;
+    float acc = 0.f;
+    int e = (l & 7) * 4;
+    for (int b4 = 0; b4 < nb; b4 += 4) {
+        int bi = b4 + (l >> 3);
+        float d = scales[rb + bi];
+        const char4 q = *(const char4*)(quants + ((long long)(rb + bi) * 32 + e));
+        const float* xb = x + bi * 32 + e;
+        acc += d * (q.x * xb[0] + q.y * xb[1] + q.z * xb[2] + q.w * xb[3]);
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
+    if (l == 0) y[(long long)t * out_dim + row] = acc;
+}
+
+// Native-Q6 GEMM rows for ONE expert: y[t][row] = expert eid row . xs[t].
+// grid=(out_dim, m), block=32.
+extern "C" __global__ void q6_gemm_rows(const unsigned char* __restrict__ w, long long ebytes,
+                                        int eid, const float* __restrict__ xs,
+                                        float* __restrict__ y, int in_dim, int out_dim) {
+    int l = threadIdx.x & 31;
+    int row = blockIdx.x, t = blockIdx.y;
+    if (row >= out_dim) return;
+    int nb = in_dim / 256;
+    const unsigned char* rowp = w + (long long)eid * ebytes + (long long)row * nb * 210;
+    const float* x = xs + (long long)t * in_dim;
+    int p0 = 4 * l;
+    int lo = p0 < 64;
+    int qb = lo ? p0 : p0 - 64;
+    float acc = 0.f;
+    for (int bi = 0; bi < nb; bi++) {
+        const unsigned char* blk = rowp + bi * 210;
+        const signed char* sc = (const signed char*)(blk + 192);
+        float d = h2f(*(const unsigned short*)(blk + 208));
+        int xb = bi * 256;
+        for (int half = 0; half < 2; half++) {
+            const unsigned char* ql = blk + half * 64;
+            const unsigned char* qh = blk + 128 + half * 32;
+            unsigned q4b, h4b;
+            __builtin_memcpy(&q4b, ql + qb, 4);
+            __builtin_memcpy(&h4b, qh + (p0 & 31), 4);
+            int hsh = (p0 >> 5) * 2;
+            float a4 = 0.f;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                int p = p0 + j;
+                int qn = (q4b >> (8 * j)) & 0xFF;
+                int qv = (lo ? (qn & 0xF) : (qn >> 4)) | ((((h4b >> (8 * j)) >> hsh) & 3) << 4);
+                a4 += sc[half * 8 + p / 16] * (qv - 32) * x[xb + half * 128 + p];
+            }
+            acc += d * a4;
+        }
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
+    if (l == 0) y[(long long)t * out_dim + row] = acc;
+}
+
 // act[k][i] = silu(g[k][i]) * u[k][i]; n = k*eff.
 extern "C" __global__ void moe_silu_mul(const float* __restrict__ g, const float* __restrict__ u,
                                         float* __restrict__ act, int n) {

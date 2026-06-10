@@ -110,6 +110,15 @@ pub trait WeightAccel: Send + Sync {
         None
     }
 
+    /// Prefill GEMM on a resident Q8 dense weight: y[m][out] = W·xs (one sync).
+    fn prefill_q8_gemm(&self, _key: &str, _xs: &[f32], _m: usize) -> Option<Vec<f32>> {
+        None
+    }
+    /// Whole expert FFN for m grouped tokens (gate/up/silu/down, one sync).
+    fn moe_expert_ffn(&self, _layer: usize, _e: usize, _xs: &[f32], _m: usize) -> Option<Vec<f32>> {
+        None
+    }
+
     // --- Mellum fused decode: h stays resident on-device across the whole token;
     // the host round-trips only q/k/v (rope+SDPA on CPU) and the router logits.
 

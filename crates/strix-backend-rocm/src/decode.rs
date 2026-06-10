@@ -263,6 +263,10 @@ pub struct RocmWeightAccel {
     mlm_rl: Dbuf,
     batch_x: Vec<Dbuf>,
     batch_y: Vec<Dbuf>,
+    pf_x: Dbuf,
+    pf_a: Dbuf,
+    pf_b: Dbuf,
+    pf_y: Dbuf,
     /// f16 KV cache (STRIX_F16_KV=1): halves KV memory + decode KV traffic, at a
     /// small prefill cost (the prefill SDPA is occupancy-bound, so the h2f isn't
     /// free there). Default false (f32) — best for prefill-heavy workloads.
@@ -332,6 +336,8 @@ impl RocmWeightAccel {
             "q8_0_gemv",
             "q8_moe_gemv",
             "q6_moe_gemv",
+            "q8_gemm_rows",
+            "q6_gemm_rows",
             "moe_silu_mul",
             "moe_wsum",
             "vec_add",
@@ -381,6 +387,10 @@ impl RocmWeightAccel {
         let mlm_v = gpu.alloc(1024 * 4).ok()?;
         let mlm_attn = gpu.alloc(8192 * 4).ok()?;
         let mlm_rl = gpu.alloc(256 * 4).ok()?;
+        let pf_x = gpu.alloc(256 * 8192 * 4).ok()?;
+        let pf_a = gpu.alloc(256 * 4096 * 4).ok()?;
+        let pf_b = gpu.alloc(256 * 4096 * 4).ok()?;
+        let pf_y = gpu.alloc(256 * 8192 * 4).ok()?;
         let mut batch_x = Vec::new();
         let mut batch_y = Vec::new();
         for _ in 0..4 {
@@ -416,6 +426,10 @@ impl RocmWeightAccel {
             mlm_rl,
             batch_x,
             batch_y,
+            pf_x,
+            pf_a,
+            pf_b,
+            pf_y,
             kv_f16: std::env::var("STRIX_F16_KV").is_ok(),
             // pinned split if STRIX_N_SPLIT set, else 0 = context-adaptive (~len/64).
             n_split: std::env::var("STRIX_N_SPLIT")
@@ -1427,6 +1441,82 @@ impl WeightAccel for RocmWeightAccel {
             .enumerate()
             .map(|(i, &n)| self.batch_y[i].download::<f32>(n).ok())
             .collect()
+    }
+
+    fn prefill_q8_gemm(&self, key: &str, xs: &[f32], m: usize) -> Option<Vec<f32>> {
+        let e = self.q8.get(key)?;
+        if xs.len() != m * e.in_dim || m > 256 || e.out_dim > 8192 {
+            return None;
+        }
+        self.pf_x.upload(xs).ok()?;
+        self.launch2(
+            "q8_gemm_rows",
+            e.out_dim as u32,
+            m as u32,
+            32,
+            0,
+            Args::new()
+                .ptr(e.scales.ptr)
+                .ptr(e.quants.ptr)
+                .ptr(self.pf_x.ptr)
+                .ptr(self.pf_y.ptr)
+                .i(e.in_dim as i32)
+                .i(e.out_dim as i32),
+        );
+        self.gpu.sync().ok()?;
+        self.pf_y.download::<f32>(m * e.out_dim).ok()
+    }
+
+    fn moe_expert_ffn(&self, layer: usize, eid: usize, xs: &[f32], m: usize) -> Option<Vec<f32>> {
+        let mo = self.moe6.get(&layer)?;
+        if xs.len() != m * mo.hidden || m > 256 {
+            return None;
+        }
+        self.pf_x.upload(xs).ok()?;
+        let geb = mo.gate_eb as usize as *mut c_void;
+        let deb = mo.down_eb as usize as *mut c_void;
+        for (w, y) in [(&mo.gate, self.pf_a.ptr), (&mo.up, self.pf_b.ptr)] {
+            self.launch2(
+                "q6_gemm_rows",
+                mo.eff as u32,
+                m as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(w.ptr)
+                    .ptr(geb)
+                    .i(eid as i32)
+                    .ptr(self.pf_x.ptr)
+                    .ptr(y)
+                    .i(mo.hidden as i32)
+                    .i(mo.eff as i32),
+            );
+        }
+        let n_act = m * mo.eff;
+        self.launch(
+            "moe_silu_mul",
+            n_act.div_ceil(256) as u32,
+            256,
+            0,
+            Args::new().ptr(self.pf_a.ptr).ptr(self.pf_b.ptr).ptr(self.pf_x.ptr).i(n_act as i32),
+        );
+        self.launch2(
+            "q6_gemm_rows",
+            mo.hidden as u32,
+            m as u32,
+            32,
+            0,
+            Args::new()
+                .ptr(mo.down.ptr)
+                .ptr(deb)
+                .i(eid as i32)
+                .ptr(self.pf_x.ptr)
+                .ptr(self.pf_y.ptr)
+                .i(mo.eff as i32)
+                .i(mo.hidden as i32),
+        );
+        self.gpu.sync().ok()?;
+        self.pf_y.download::<f32>(m * mo.hidden).ok()
     }
 
     fn gemv(&self, key: &str, x: &[f32]) -> Option<Vec<f32>> {
