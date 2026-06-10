@@ -1553,16 +1553,28 @@ impl MellumModel {
         } else {
             self.w("token_embd.weight")?
         };
+        // normalize all rows, then batched lm_head argmax (weights read once)
+        let mut nhs = vec![0.0f32; m * hidden];
+        for t in 0..m {
+            let h = &hs[t * hidden..(t + 1) * hidden];
+            rmsnorm(
+                &mut nhs[t * hidden..(t + 1) * hidden],
+                h,
+                &on,
+                self.cfg.rms_eps,
+            );
+        }
+        if let Some(a) = &self.accel {
+            if let Some(ids) = a.lm_head_argmax_rows("output.weight", &nhs, m) {
+                return Ok(ids);
+            }
+        }
         let mut out = Vec::with_capacity(m);
         let mut row = vec![0.0f32; 8192];
         let mut logits = vec![0.0f32; self.cfg.vocab];
         for t in 0..m {
-            let h = &mut hs[t * hidden..(t + 1) * hidden];
-            let mut nh = vec![0.0f32; hidden];
-            rmsnorm(&mut nh, h, &on, self.cfg.rms_eps);
-            if !self.try_gemv("output.weight", &nh, &mut logits) {
-                qmatmul(&mut logits, &nh, head.bytes, head.ty, hidden, &mut row);
-            }
+            let nh = &nhs[t * hidden..(t + 1) * hidden];
+            qmatmul(&mut logits, nh, head.bytes, head.ty, hidden, &mut row);
             let mut bi = 0usize;
             let mut bv = f32::NEG_INFINITY;
             for (i, &v) in logits.iter().enumerate() {

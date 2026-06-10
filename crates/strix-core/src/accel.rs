@@ -121,6 +121,10 @@ pub trait WeightAccel: Send + Sync {
     fn prefill_q8_gemm(&self, _key: &str, _xs: &[f32], _m: usize) -> Option<Vec<f32>> {
         None
     }
+    /// Batched lm_head: argmax per row of W[vocab,hidden]·xs (m rows, weights read once).
+    fn lm_head_argmax_rows(&self, _key: &str, _xs: &[f32], _m: usize) -> Option<Vec<u32>> {
+        None
+    }
     /// Whole expert FFN for m grouped tokens (gate/up/silu/down, one sync).
     fn moe_expert_ffn(&self, _layer: usize, _e: usize, _xs: &[f32], _m: usize) -> Option<Vec<f32>> {
         None

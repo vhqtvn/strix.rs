@@ -510,16 +510,26 @@ impl RocmWeightAccel {
             1,
             32,
             0,
-            Args::new().ptr(self.mlm_rl.ptr).i(rl_dim as i32).i(topk as i32).ptr(self.moe_ids.ptr).ptr(self.moe_w.ptr),
+            Args::new()
+                .ptr(self.mlm_rl.ptr)
+                .i(rl_dim as i32)
+                .i(topk as i32)
+                .ptr(self.moe_ids.ptr)
+                .ptr(self.moe_w.ptr),
         );
-        let Some(m) = self.moe.get(&il) else { return false };
+        let Some(m) = self.moe.get(&il) else {
+            return false;
+        };
         self.moe_launches(m, topk, self.mlm_n.ptr);
         self.launch(
             "vec_add",
             m.hidden.div_ceil(256) as u32,
             256,
             0,
-            Args::new().ptr(self.mlm_h.ptr).ptr(self.moe_out.ptr).i(m.hidden as i32),
+            Args::new()
+                .ptr(self.mlm_h.ptr)
+                .ptr(self.moe_out.ptr)
+                .i(m.hidden as i32),
         );
         let _ = self.gpu.sync();
         T_MOE.fetch_add(t1.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -557,7 +567,10 @@ impl RocmWeightAccel {
             self.f32w.get(&format!("blk.{il}.attn_k_norm.weight")),
         )
         else {
-            { eprintln!("[mlm_attn_part bail 1]"); return false; }
+            {
+                eprintln!("[mlm_attn_part bail 1]");
+                return false;
+            }
         };
         let hidden = wq.in_dim;
         let q_dim = wq.out_dim;
@@ -566,7 +579,10 @@ impl RocmWeightAccel {
         let nh = q_dim / hd;
         let nkv = kv_dim / hd;
         if il >= self.mlm_kc.len() || (pos + 1) > self.mlm_seq {
-            { eprintln!("[mlm_attn_part bail 2]"); return false; }
+            {
+                eprintln!("[mlm_attn_part bail 2]");
+                return false;
+            }
         }
         self.norm_launch(self.mlm_h.ptr, nw.ptr, self.mlm_n.ptr, hidden);
         self.q8_launch(wq, self.mlm_n.ptr, self.mlm_q.ptr);
@@ -646,7 +662,10 @@ impl RocmWeightAccel {
         let win_start = if win > 0 && len > win { len - win } else { 0 };
         let wlen = len - win_start;
         if wlen > 2048 {
-            { eprintln!("[mlm_attn_part bail 3]"); return false; }
+            {
+                eprintln!("[mlm_attn_part bail 3]");
+                return false;
+            }
         }
         let kbase =
             unsafe { (self.mlm_kc[il].ptr as *mut f32).add(win_start * kv_dim) } as *mut c_void;
@@ -688,7 +707,12 @@ impl RocmWeightAccel {
             64,
             32,
             0,
-            Args::new().ptr(wgi.ptr).ptr(self.mlm_n.ptr).ptr(self.mlm_rl.ptr).i(hidden as i32).i(64),
+            Args::new()
+                .ptr(wgi.ptr)
+                .ptr(self.mlm_n.ptr)
+                .ptr(self.mlm_rl.ptr)
+                .i(hidden as i32)
+                .i(64),
         );
         true
     }
@@ -1596,11 +1620,17 @@ impl WeightAccel for RocmWeightAccel {
             .get(&format!("blk.{il}.ffn_gate_inp.weight"))
             .map(|w| w.out_dim)
         else {
-            { eprintln!("[mlm_layer_nosync bail 1]"); return false; }
+            {
+                eprintln!("[mlm_layer_nosync bail 1]");
+                return false;
+            }
         };
         // attn part: reuse the mlm_layer body up to the router (without sync/download)
         if !self.mlm_attn_part(il, pos, win) {
-            { eprintln!("[mlm_layer_nosync bail 2]"); return false; }
+            {
+                eprintln!("[mlm_layer_nosync bail 2]");
+                return false;
+            }
         }
         self.launch(
             "topk_router",
@@ -1615,7 +1645,10 @@ impl WeightAccel for RocmWeightAccel {
                 .ptr(self.moe_w.ptr),
         );
         let Some(m) = self.moe.get(&il) else {
-            { eprintln!("[mlm_layer_nosync bail 3]"); return false; }
+            {
+                eprintln!("[mlm_layer_nosync bail 3]");
+                return false;
+            }
         };
         self.moe_launches(m, topk, self.mlm_n.ptr);
         self.launch(
@@ -2085,6 +2118,50 @@ impl WeightAccel for RocmWeightAccel {
         );
         self.gpu.sync().ok()?;
         self.pf_dy.download::<f32>(rows * mo.hidden).ok()
+    }
+
+    fn lm_head_argmax_rows(&self, key: &str, xs: &[f32], m: usize) -> Option<Vec<u32>> {
+        let e = self.q8.get(key)?;
+        if xs.len() != m * e.in_dim || m > 16 {
+            return None;
+        }
+        self.pf_x.upload(xs).ok()?;
+        let nb = e.in_dim / 32;
+        let chunk = 8192usize;
+        let mut best = vec![(f32::NEG_INFINITY, 0u32); m];
+        let mut base = 0usize;
+        while base < e.out_dim {
+            let oc = (e.out_dim - base).min(chunk);
+            let sp = unsafe { (e.scales.ptr as *mut f32).add(base * nb) } as *mut c_void;
+            let qp = unsafe { (e.quants.ptr as *mut i8).add(base * nb * 32) } as *mut c_void;
+            self.launch2(
+                "q8_gemm_rows",
+                oc as u32,
+                m.div_ceil(16) as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(sp)
+                    .ptr(qp)
+                    .ptr(self.pf_x.ptr)
+                    .ptr(self.pf_y.ptr)
+                    .i(e.in_dim as i32)
+                    .i(oc as i32)
+                    .i(m as i32),
+            );
+            self.gpu.sync().ok()?;
+            let y = self.pf_y.download::<f32>(m * oc).ok()?;
+            for t in 0..m {
+                for r in 0..oc {
+                    let v = y[t * oc + r];
+                    if v > best[t].0 {
+                        best[t] = (v, (base + r) as u32);
+                    }
+                }
+            }
+            base += oc;
+        }
+        Some(best.into_iter().map(|(_, i)| i).collect())
     }
 
     fn moe_expert_flush(&self, rows: usize, hidden: usize) -> Option<Vec<f32>> {
