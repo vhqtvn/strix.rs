@@ -343,9 +343,8 @@ struct Scratch {
 /// Scratch + device KV for the gemma3n (MatFormer) on-device decode. The 4 AltUp
 /// streams (h/pred/corr) stay resident across all layers; the rest are per-op temps.
 struct G3nScratch {
-    h: Dbuf,      // [4*hidden] the 4 AltUp streams
+    h: Dbuf,      // [4*hidden] the 4 AltUp streams (AltUp-correct writes here directly)
     pred: Dbuf,   // [4*hidden]
-    corr: Dbuf,   // [4*hidden]
     x0: Dbuf,     // [hidden] base (scaled) embedding
     cur: Dbuf,    // [hidden] normed active prediction
     q: Dbuf,      // [n_heads*hd]
@@ -372,9 +371,7 @@ struct G3nScratch {
     merged: Dbuf, // [hidden]
     u: Dbuf,      // [hidden] merge temp
     tgt: Dbuf,    // [1] l2 target scalar
-    xn: Dbuf,     // [hidden] final norm
-    logits: Dbuf, // [vocab]
-    argmax_out: Dbuf, // [2]
+    xn: Dbuf,     // [hidden] final norm (returned; lm_head runs on CPU — token_embd is Q4_K)
     // int8-activation quant buffers for the Q4 GEMMs (packed char4 dp4a format).
     xq_lo: Dbuf,
     xq_hi: Dbuf,
@@ -3887,7 +3884,6 @@ impl WeightAccel for RocmWeightAccel {
         self.g3s = Some(G3nScratch {
             h: mk(4 * hidden),
             pred: mk(4 * hidden),
-            corr: mk(4 * hidden),
             x0: mk(hidden),
             cur: mk(hidden),
             q: mk(qd),
@@ -3915,8 +3911,6 @@ impl WeightAccel for RocmWeightAccel {
             u: mk(hidden),
             tgt: mk(1),
             xn: mk(hidden),
-            logits: mk(cfg.vocab),
-            argmax_out: mk(2),
             xq_lo: self.gpu.alloc(nb_max * 16).expect("g3n xq_lo"),
             xq_hi: self.gpu.alloc(nb_max * 16).expect("g3n xq_hi"),
             xq_d: mk(nb_max),
@@ -4308,6 +4302,7 @@ impl WeightAccel for RocmWeightAccel {
             k_cache,
             v_cache,
         });
+        #[cfg_attr(not(feature = "npu"), allow(unused_variables))]
         let gpu_prefill = cfg.gpu_prefill;
         self.cfg = Some(cfg);
         // Only open the backend's own NPU-hybrid when it will run GPU prefill
