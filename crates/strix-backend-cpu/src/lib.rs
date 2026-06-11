@@ -13,6 +13,7 @@ pub mod mellum;
 #[cfg(feature = "npu")]
 pub mod mellum_npu;
 pub mod ops;
+pub mod qwen3;
 pub mod qwen35;
 pub mod smollm3;
 
