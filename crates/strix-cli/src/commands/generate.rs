@@ -429,6 +429,20 @@ fn run_qwen3(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Resu
         load.elapsed().as_secs_f64(),
         prompt_ids.len()
     );
+    #[cfg(feature = "npu-cpu")]
+    if std::env::var("STRIX_NPU").is_ok() {
+        let dir = std::env::var("STRIX_NPU_DIR").unwrap_or_else(|_| {
+            "external/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build"
+                .into()
+        });
+        match strix_backend_cpu::mellum_npu::Qwen3Npu::open(&dir) {
+            Ok(npu) => match model.attach_npu(npu) {
+                Ok(n) => eprintln!("[qwen3] {n} projections staged on NPU"),
+                Err(e) => eprintln!("[qwen3] NPU staging failed: {e}"),
+            },
+            Err(e) => eprintln!("[qwen3] NPU open failed ({dir}): {e}"),
+        }
+    }
     if gpu {
         match build_weight_accel() {
             Some(accel) => {
