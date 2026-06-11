@@ -1458,6 +1458,30 @@ extern "C" __global__ void fht128(const float* __restrict__ x, float* __restrict
     y[base + t] = v[t] * 0.08838834764831845f;  // 1/sqrt(128)
 }
 
+
+// int4 plain GEMV (lm_head): no expert ids. unpack nibble->i8->sudot4.
+extern "C" __global__ void q4i_gemv(const float* __restrict__ ws, const unsigned char* __restrict__ wq,
+                                    const float* __restrict__ xd, const signed char* __restrict__ xq,
+                                    float* __restrict__ y, int in_dim, int out_dim) {
+    int l = threadIdx.x & 31, row = blockIdx.x;
+    if (row >= out_dim) return;
+    int nb = in_dim / 32, rb = row * nb, e = (l & 7) * 4;
+    float acc = 0.f;
+    for (int b4 = 0; b4 < nb; b4 += 4) {
+        int bi = b4 + (l >> 3);
+        float d = ws[rb + bi];
+        unsigned short pk = *(const unsigned short*)(wq + (long long)(rb + bi) * 16 + (e >> 1));
+        int w = ((int)((pk & 0xF) - 8) & 0xFF)
+              | (((int)(((pk >> 4) & 0xF) - 8) & 0xFF) << 8)
+              | (((int)(((pk >> 8) & 0xF) - 8) & 0xFF) << 16)
+              | (((int)(((pk >> 12) & 0xF) - 8) & 0xFF) << 24);
+        const int x4 = *(const int*)(xq + bi * 32 + e);
+        acc += d * (float)__builtin_amdgcn_sudot4(true, w, true, x4, 0, false);
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
+    if (l == 0) y[row] = acc;
+}
+
 // ===== Native-Q6_K MoE GEMV (NO repack: 210 B/superblock as in the GGUF) =====
 // w = full 3D expert tensor (native bytes), expert stride ebytes. Per superblock:
 // ql[128] qh[64] sc[16xi8] d[f16]. 8 waves/block, 32 lanes on the SAME superblock

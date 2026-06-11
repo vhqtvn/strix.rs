@@ -368,6 +368,8 @@ pub struct RocmWeightAccel {
     use_wmma: bool,
     use_q4: bool,
     use_had: bool,
+    use_q4head: bool,
+    head_q4: Option<(Dbuf, Dbuf)>,
     mlm_graph: Option<*mut std::os::raw::c_void>,
     mlm_seq: usize,
     batch_x: Vec<Dbuf>,
@@ -472,6 +474,7 @@ impl RocmWeightAccel {
             "q4i_moe_gu",
             "q4i_moe_down",
             "fht128",
+            "q4i_gemv",
             "q6_moe_gemv",
             "q8_gemm_rows",
             "q8_gemm_rows32",
@@ -614,6 +617,8 @@ impl RocmWeightAccel {
             use_wmma: std::env::var("STRIX_NO_WMMA").is_err(),
             use_q4: std::env::var("STRIX_Q4PROBE").is_ok() || std::env::var("STRIX_HAD").is_ok(),
             use_had: std::env::var("STRIX_HAD").is_ok(),
+            use_q4head: std::env::var("STRIX_Q4HEAD").is_ok(),
+            head_q4: None,
             mlm_graph: None,
             mlm_seq: 0,
             batch_x,
@@ -2797,6 +2802,18 @@ impl WeightAccel for RocmWeightAccel {
         let on = self.f32w.get("output_norm.weight")?;
         let (head_in, head_out) = (head.in_dim, head.out_dim);
         let (head_s, head_q, on_ptr) = (head.scales.ptr, head.quants.ptr, on.ptr);
+        if self.use_q4head && self.head_q4.is_none() {
+            let nbt = head_out * (head_in / 32);
+            if let (Ok(sc), Ok(q)) = (
+                head.scales.download::<f32>(nbt),
+                head.quants.download::<i8>(nbt * 32),
+            ) {
+                let (s4, q4) = pack_q4(&sc, &q);
+                if let (Ok(sb), Ok(qb)) = (self.gpu.upload_new(&s4), self.gpu.upload_new(&q4)) {
+                    self.head_q4 = Some((sb, qb));
+                }
+            }
+        }
         if self.mlm_graph.is_none() {
             unsafe {
                 if crate::ffi::hipStreamBeginCapture(self.gpu.stream, 0) != 0 {
@@ -2825,20 +2842,37 @@ impl WeightAccel for RocmWeightAccel {
                             .ptr(self.mlm_xd.ptr)
                             .i((head_in / 32) as i32),
                     );
-                    self.launch(
-                        "q8i_gemv",
-                        head_out as u32,
-                        32,
-                        0,
-                        Args::new()
-                            .ptr(head_s)
-                            .ptr(head_q)
-                            .ptr(self.mlm_xd.ptr)
-                            .ptr(self.mlm_xq.ptr)
-                            .ptr(self.gemv_y.ptr)
-                            .i(head_in as i32)
-                            .i(head_out as i32),
-                    );
+                    if let (true, Some((hs4, hq4))) = (self.use_q4head, self.head_q4.as_ref()) {
+                        self.launch(
+                            "q4i_gemv",
+                            head_out as u32,
+                            32,
+                            0,
+                            Args::new()
+                                .ptr(hs4.ptr)
+                                .ptr(hq4.ptr)
+                                .ptr(self.mlm_xd.ptr)
+                                .ptr(self.mlm_xq.ptr)
+                                .ptr(self.gemv_y.ptr)
+                                .i(head_in as i32)
+                                .i(head_out as i32),
+                        );
+                    } else {
+                        self.launch(
+                            "q8i_gemv",
+                            head_out as u32,
+                            32,
+                            0,
+                            Args::new()
+                                .ptr(head_s)
+                                .ptr(head_q)
+                                .ptr(self.mlm_xd.ptr)
+                                .ptr(self.mlm_xq.ptr)
+                                .ptr(self.gemv_y.ptr)
+                                .i(head_in as i32)
+                                .i(head_out as i32),
+                        );
+                    }
                 } else {
                     self.launch(
                         "q8_0_gemv",
