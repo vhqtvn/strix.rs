@@ -137,6 +137,39 @@ fn rope_neox(vec: &mut [f32], pos: usize, n_dims: usize, freq_base: f32) {
     }
 }
 
+/// NEOX RoPE applied from a precomputed per-position cos/sin table (`cs`/`sn` of
+/// length `half`). Identical to `rope_neox` but with no per-call transcendentals —
+/// the table is shared across all heads/layers at a given position.
+#[inline]
+fn rope_apply(vec: &mut [f32], cs: &[f32], sn: &[f32], half: usize) {
+    for k in 0..half {
+        let (c, s) = (cs[k], sn[k]);
+        let x0 = vec[k];
+        let x1 = vec[k + half];
+        vec[k] = x0 * c - x1 * s;
+        vec[k + half] = x0 * s + x1 * c;
+    }
+}
+
+/// Precompute the NEOX rope cos/sin table for positions `0..m` (the prefill range),
+/// `half = head_dim/2` entries per position. Shared across all heads and layers
+/// (qwen3 uses one rope_base for every layer).
+fn rope_table(m: usize, half: usize, freq_base: f32) -> (Vec<f32>, Vec<f32>) {
+    let theta_scale = freq_base.powf(-1.0 / half as f32);
+    let mut cs = vec![0.0f32; m * half];
+    let mut sn = vec![0.0f32; m * half];
+    for t in 0..m {
+        let mut theta = t as f32;
+        for k in 0..half {
+            let (s, c) = theta.sin_cos();
+            cs[t * half + k] = c;
+            sn[t * half + k] = s;
+            theta *= theta_scale;
+        }
+    }
+    (cs, sn)
+}
+
 fn qmatmul(out: &mut [f32], x: &[f32], bytes: &[u8], ty: GgmlType, in_dim: usize) {
     let bpr = (in_dim / ty.block_elems()) * ty.block_bytes();
     out.par_iter_mut().enumerate().for_each_init(
@@ -435,16 +468,13 @@ impl Qwen3Model {
             .map_err(|e| StrixError::invalid(format!("qwen3 embd: {e}")))?;
         }
         let mut nrm = vec![0.0f32; m * hidden];
+        // Precompute the rope cos/sin table once (shared across all heads + layers).
+        let (rope_cs, rope_sn) = rope_table(m, hd / 2, cfg.rope_base);
         for il in 0..cfg.n_layers {
             let bnm = |s: &str| format!("blk.{il}.{s}");
-            for t in 0..m {
-                rmsnorm(
-                    &mut nrm[t * hidden..(t + 1) * hidden],
-                    &h[t * hidden..(t + 1) * hidden],
-                    &self.norms[il].attn_norm,
-                    cfg.eps,
-                );
-            }
+            nrm.par_chunks_mut(hidden)
+                .zip(h.par_chunks(hidden))
+                .for_each(|(nr, hr)| rmsnorm(nr, hr, &self.norms[il].attn_norm, cfg.eps));
             let mut q = vec![0.0f32; m * q_dim];
             let mut k = vec![0.0f32; m * kv_dim];
             let mut v = vec![0.0f32; m * kv_dim];
@@ -462,23 +492,37 @@ impl Qwen3Model {
                 self.bmm(&bnm("attn_k.weight"), NpuW::K, &nrm, m, hidden, kv_dim, &mut k)?;
                 self.bmm(&bnm("attn_v.weight"), NpuW::V, &nrm, m, hidden, kv_dim, &mut v)?;
             }
-            for t in 0..m {
-                for hh in 0..nh {
-                    let qh = &mut q[t * q_dim + hh * hd..t * q_dim + hh * hd + hd];
-                    rmsnorm_inplace(qh, &self.norms[il].q_norm, cfg.eps);
-                    rope_neox(qh, t, hd, cfg.rope_base);
-                }
-                for kh in 0..nkv {
-                    let kk = &mut k[t * kv_dim + kh * hd..t * kv_dim + kh * hd + hd];
-                    rmsnorm_inplace(kk, &self.norms[il].k_norm, cfg.eps);
-                    rope_neox(kk, t, hd, cfg.rope_base);
-                }
-            }
+            // QK-norm + RoPE, parallel over tokens, using the precomputed rope table
+            // (cos/sin depend only on (pos,dim) — shared across all heads, so the
+            // 80×-redundant per-head sin_cos in rope_neox is replaced by table lookups).
+            let half = hd / 2;
+            let qn = &self.norms[il].q_norm;
+            let kn = &self.norms[il].k_norm;
+            let eps = cfg.eps;
+            q.par_chunks_mut(q_dim)
+                .zip(k.par_chunks_mut(kv_dim))
+                .enumerate()
+                .for_each(|(t, (qrow, krow))| {
+                    let cs = &rope_cs[t * half..(t + 1) * half];
+                    let sn = &rope_sn[t * half..(t + 1) * half];
+                    for hh in 0..nh {
+                        let qh = &mut qrow[hh * hd..hh * hd + hd];
+                        rmsnorm_inplace(qh, qn, eps);
+                        rope_apply(qh, cs, sn, half);
+                    }
+                    for kh in 0..nkv {
+                        let kk = &mut krow[kh * hd..kh * hd + hd];
+                        rmsnorm_inplace(kk, kn, eps);
+                        rope_apply(kk, cs, sn, half);
+                    }
+                });
             self.kc[il].extend_from_slice(&k);
             self.vc[il].extend_from_slice(&v);
             let kc = &self.kc[il];
             let vc = &self.vc[il];
             let mut attn = vec![0.0f32; m * q_dim];
+            #[cfg(feature = "npu")]
+            let _attn_t0 = crate::mellum_npu::prof::on().then(std::time::Instant::now);
             attn.par_chunks_mut(q_dim)
                 .enumerate()
                 .for_each(|(t, arow)| {
@@ -517,6 +561,10 @@ impl Qwen3Model {
                         }
                     }
                 });
+            #[cfg(feature = "npu")]
+            if let Some(t0) = _attn_t0 {
+                crate::mellum_npu::prof::add_attn(t0.elapsed().as_nanos() as u64);
+            }
             let mut o = vec![0.0f32; m * hidden];
             self.bmm(
                 &bnm("attn_output.weight"),
@@ -527,17 +575,10 @@ impl Qwen3Model {
                 hidden,
                 &mut o,
             )?;
-            for i in 0..m * hidden {
-                h[i] += o[i];
-            }
-            for t in 0..m {
-                rmsnorm(
-                    &mut nrm[t * hidden..(t + 1) * hidden],
-                    &h[t * hidden..(t + 1) * hidden],
-                    &self.norms[il].ffn_norm,
-                    cfg.eps,
-                );
-            }
+            h.par_iter_mut().zip(o.par_iter()).for_each(|(hh, oo)| *hh += *oo);
+            nrm.par_chunks_mut(hidden)
+                .zip(h.par_chunks(hidden))
+                .for_each(|(nr, hr)| rmsnorm(nr, hr, &self.norms[il].ffn_norm, cfg.eps));
             let mut gate = vec![0.0f32; m * ffn];
             let mut up = vec![0.0f32; m * ffn];
             // Fused gate‖up (one NPU dispatch, shared activation quant) when staged.
@@ -553,10 +594,9 @@ impl Qwen3Model {
                 self.bmm(&bnm("ffn_gate.weight"), NpuW::Gate, &nrm, m, hidden, ffn, &mut gate)?;
                 self.bmm(&bnm("ffn_up.weight"), NpuW::Up, &nrm, m, hidden, ffn, &mut up)?;
             }
-            for i in 0..m * ffn {
-                let g = gate[i];
-                gate[i] = (g / (1.0 + (-g).exp())) * up[i];
-            }
+            gate.par_iter_mut()
+                .zip(up.par_iter())
+                .for_each(|(g, u)| *g = (*g / (1.0 + (-*g).exp())) * *u);
             self.bmm(
                 &bnm("ffn_down.weight"),
                 NpuW::Down,
@@ -566,9 +606,7 @@ impl Qwen3Model {
                 hidden,
                 &mut o,
             )?;
-            for i in 0..m * hidden {
-                h[i] += o[i];
-            }
+            h.par_iter_mut().zip(o.par_iter()).for_each(|(hh, oo)| *hh += *oo);
         }
         self.pos = m;
         #[cfg(feature = "npu")]

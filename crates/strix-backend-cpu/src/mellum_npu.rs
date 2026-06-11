@@ -29,6 +29,7 @@ pub mod prof {
     pub static QUANT_NS: AtomicU64 = AtomicU64::new(0);
     pub static NPU_NS: AtomicU64 = AtomicU64::new(0);
     pub static RESCALE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static ATTN_NS: AtomicU64 = AtomicU64::new(0);
     pub static CALLS: AtomicU64 = AtomicU64::new(0);
     pub fn on() -> bool {
         std::env::var("STRIX_NPU_PROF").is_ok()
@@ -39,15 +40,19 @@ pub mod prof {
         RESCALE_NS.fetch_add(r, Ordering::Relaxed);
         CALLS.fetch_add(1, Ordering::Relaxed);
     }
+    pub fn add_attn(ns: u64) {
+        ATTN_NS.fetch_add(ns, Ordering::Relaxed);
+    }
     pub fn dump(tag: &str) {
-        let (q, n, r, c) = (
+        let (q, n, r, a, c) = (
             QUANT_NS.load(Ordering::Relaxed) as f64 / 1e6,
             NPU_NS.load(Ordering::Relaxed) as f64 / 1e6,
             RESCALE_NS.load(Ordering::Relaxed) as f64 / 1e6,
+            ATTN_NS.load(Ordering::Relaxed) as f64 / 1e6,
             CALLS.load(Ordering::Relaxed),
         );
         eprintln!(
-            "[npu-prof {tag}] {c} gemms | quant {q:.1}ms | NPU(start+wait) {n:.1}ms | rescale {r:.1}ms",
+            "[npu-prof {tag}] {c} gemms | quant {q:.1}ms | NPU {n:.1}ms | rescale {r:.1}ms | attn(CPU) {a:.1}ms",
         );
     }
 }
