@@ -228,26 +228,120 @@ impl Qwen3Model {
     #[cfg(feature = "npu")]
     pub fn attach_npu(&mut self, mut npu: crate::mellum_npu::Qwen3Npu) -> Result<usize> {
         let mut n = 0;
-        for l in 0..self.cfg.n_layers {
-            let b = |s: &str| format!("blk.{l}.{s}");
-            let mut st =
-                |sh: &mut crate::mellum_npu::NpuShape, slot: u64, name: &str| -> Result<()> {
-                    let (bytes, ty, _, _) = self.w(name)?;
-                    sh.stage_q8(slot, bytes, ty)?;
-                    n += 1;
-                    Ok(())
-                };
-            let l = l as u64;
-            st(&mut npu.q, l, &b("attn_q.weight"))?;
-            st(&mut npu.kv, 2 * l, &b("attn_k.weight"))?;
-            st(&mut npu.kv, 2 * l + 1, &b("attn_v.weight"))?;
-            st(&mut npu.o, l, &b("attn_output.weight"))?;
-            st(&mut npu.gu, 2 * l, &b("ffn_gate.weight"))?;
-            st(&mut npu.gu, 2 * l + 1, &b("ffn_up.weight"))?;
-            st(&mut npu.down, l, &b("ffn_down.weight"))?;
+        let q_dim = self.cfg.n_heads * self.cfg.head_dim;
+        let kv_dim = self.cfg.n_kv * self.cfg.head_dim;
+        for li in 0..self.cfg.n_layers {
+            let b = |s: &str| format!("blk.{li}.{s}");
+            let l = li as u64;
+            let stage = |sh: &mut crate::mellum_npu::NpuShape, slot: u64, name: &str| -> Result<()> {
+                let (bytes, ty, _, _) = self.w(name)?;
+                sh.stage_q8(slot, bytes, ty)
+            };
+            stage(&mut npu.o, l, &b("attn_output.weight"))?;
+            stage(&mut npu.down, l, &b("ffn_down.weight"))?;
+            n += 2;
+            // q‖k‖v: one fused dispatch if the fused xclbin is present, else 3 shapes.
+            if npu.qkv.is_some() {
+                let (qb, ty, _, _) = self.w(&b("attn_q.weight"))?;
+                let (kb, _, _, _) = self.w(&b("attn_k.weight"))?;
+                let (vb, _, _, _) = self.w(&b("attn_v.weight"))?;
+                npu.qkv
+                    .as_mut()
+                    .unwrap()
+                    .stage_q8_triple(l, qb, kb, vb, q_dim, kv_dim, ty)?;
+                n += 1;
+            } else {
+                stage(&mut npu.q, l, &b("attn_q.weight"))?;
+                stage(&mut npu.kv, 2 * l, &b("attn_k.weight"))?;
+                stage(&mut npu.kv, 2 * l + 1, &b("attn_v.weight"))?;
+                n += 3;
+            }
+            // gate‖up: one fused dispatch if present, else 2.
+            if npu.gu2.is_some() {
+                let (gb, ty, _, _) = self.w(&b("ffn_gate.weight"))?;
+                let (ub, _, _, _) = self.w(&b("ffn_up.weight"))?;
+                npu.gu2.as_mut().unwrap().stage_q8_pair(l, gb, ub, ty)?;
+                n += 1;
+            } else {
+                stage(&mut npu.gu, 2 * l, &b("ffn_gate.weight"))?;
+                stage(&mut npu.gu, 2 * l + 1, &b("ffn_up.weight"))?;
+                n += 2;
+            }
         }
         self.npu = Some(npu);
         Ok(n)
+    }
+
+    /// Fused q‖k‖v on the NPU (one dispatch, one activation quant, split output),
+    /// chunked over M_NPU. `Some(Ok)` if handled, `None` if no fused xclbin staged
+    /// (caller falls back to 3 separate `bmm`s).
+    #[cfg(feature = "npu")]
+    fn npu_qkv_fused(
+        &self,
+        il: usize,
+        nrm: &[f32],
+        m: usize,
+        q: &mut [f32],
+        k: &mut [f32],
+        v: &mut [f32],
+    ) -> Option<Result<()>> {
+        let qkv = self.npu.as_ref()?.qkv.as_ref()?;
+        if !qkv.has(il as u64) {
+            return None;
+        }
+        let (hidden, q_dim, kv_dim) = (
+            self.cfg.hidden,
+            self.cfg.n_heads * self.cfg.head_dim,
+            self.cfg.n_kv * self.cfg.head_dim,
+        );
+        let mp = crate::mellum_npu::M_NPU;
+        for c in (0..m).step_by(mp) {
+            let mc = (m - c).min(mp);
+            if let Err(e) = qkv.gemm_split3(
+                il as u64,
+                &nrm[c * hidden..(c + mc) * hidden],
+                mc,
+                q_dim,
+                kv_dim,
+                &mut q[c * q_dim..(c + mc) * q_dim],
+                &mut k[c * kv_dim..(c + mc) * kv_dim],
+                &mut v[c * kv_dim..(c + mc) * kv_dim],
+            ) {
+                return Some(Err(e));
+            }
+        }
+        Some(Ok(()))
+    }
+
+    /// Fused gate‖up on the NPU (one dispatch, split output), chunked over M_NPU.
+    #[cfg(feature = "npu")]
+    fn npu_gu_fused(
+        &self,
+        il: usize,
+        nrm: &[f32],
+        m: usize,
+        gate: &mut [f32],
+        up: &mut [f32],
+    ) -> Option<Result<()>> {
+        let gu2 = self.npu.as_ref()?.gu2.as_ref()?;
+        if !gu2.has(il as u64) {
+            return None;
+        }
+        let (hidden, ffn) = (self.cfg.hidden, self.cfg.ffn);
+        let mp = crate::mellum_npu::M_NPU;
+        for c in (0..m).step_by(mp) {
+            let mc = (m - c).min(mp);
+            if let Err(e) = gu2.gemm_split2(
+                il as u64,
+                &nrm[c * hidden..(c + mc) * hidden],
+                mc,
+                &mut gate[c * ffn..(c + mc) * ffn],
+                &mut up[c * ffn..(c + mc) * ffn],
+            ) {
+                return Some(Err(e));
+            }
+        }
+        Some(Ok(()))
     }
 
     /// Batched matmul out[m*n] = W·xs[m*k] by name; NPU shape (chunked M=256) if
@@ -354,33 +448,20 @@ impl Qwen3Model {
             let mut q = vec![0.0f32; m * q_dim];
             let mut k = vec![0.0f32; m * kv_dim];
             let mut v = vec![0.0f32; m * kv_dim];
-            self.bmm(
-                &bnm("attn_q.weight"),
-                NpuW::Q,
-                &nrm,
-                m,
-                hidden,
-                q_dim,
-                &mut q,
-            )?;
-            self.bmm(
-                &bnm("attn_k.weight"),
-                NpuW::K,
-                &nrm,
-                m,
-                hidden,
-                kv_dim,
-                &mut k,
-            )?;
-            self.bmm(
-                &bnm("attn_v.weight"),
-                NpuW::V,
-                &nrm,
-                m,
-                hidden,
-                kv_dim,
-                &mut v,
-            )?;
+            // Fused q‖k‖v (one NPU dispatch, shared activation quant) when staged.
+            let mut qkv_done = false;
+            #[cfg(feature = "npu")]
+            {
+                if let Some(r) = self.npu_qkv_fused(il, &nrm, m, &mut q, &mut k, &mut v) {
+                    r?;
+                    qkv_done = true;
+                }
+            }
+            if !qkv_done {
+                self.bmm(&bnm("attn_q.weight"), NpuW::Q, &nrm, m, hidden, q_dim, &mut q)?;
+                self.bmm(&bnm("attn_k.weight"), NpuW::K, &nrm, m, hidden, kv_dim, &mut k)?;
+                self.bmm(&bnm("attn_v.weight"), NpuW::V, &nrm, m, hidden, kv_dim, &mut v)?;
+            }
             for t in 0..m {
                 for hh in 0..nh {
                     let qh = &mut q[t * q_dim + hh * hd..t * q_dim + hh * hd + hd];
@@ -450,24 +531,19 @@ impl Qwen3Model {
             }
             let mut gate = vec![0.0f32; m * ffn];
             let mut up = vec![0.0f32; m * ffn];
-            self.bmm(
-                &bnm("ffn_gate.weight"),
-                NpuW::Gate,
-                &nrm,
-                m,
-                hidden,
-                ffn,
-                &mut gate,
-            )?;
-            self.bmm(
-                &bnm("ffn_up.weight"),
-                NpuW::Up,
-                &nrm,
-                m,
-                hidden,
-                ffn,
-                &mut up,
-            )?;
+            // Fused gate‖up (one NPU dispatch, shared activation quant) when staged.
+            let mut gu_done = false;
+            #[cfg(feature = "npu")]
+            {
+                if let Some(r) = self.npu_gu_fused(il, &nrm, m, &mut gate, &mut up) {
+                    r?;
+                    gu_done = true;
+                }
+            }
+            if !gu_done {
+                self.bmm(&bnm("ffn_gate.weight"), NpuW::Gate, &nrm, m, hidden, ffn, &mut gate)?;
+                self.bmm(&bnm("ffn_up.weight"), NpuW::Up, &nrm, m, hidden, ffn, &mut up)?;
+            }
             for i in 0..m * ffn {
                 let g = gate[i];
                 gate[i] = (g / (1.0 + (-g).exp())) * up[i];

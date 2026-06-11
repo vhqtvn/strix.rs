@@ -128,6 +128,98 @@ impl NpuShape {
         Ok(())
     }
 
+    /// Stage three stacked Q8_0 weights (q‖k‖v) as one [K, N] weight: output
+    /// channels [0,n0) from `a`, [n0,n0+n1) from `b`, [n0+n1,n) from `c`.
+    pub fn stage_q8_triple(
+        &mut self,
+        slot: u64,
+        a: &[u8],
+        b: &[u8],
+        c: &[u8],
+        n0: usize,
+        n1: usize,
+        ty: GgmlType,
+    ) -> Result<()> {
+        let (k, n) = (self.k, self.n);
+        let bpr = (k / ty.block_elems()) * ty.block_bytes();
+        let mut b8 = vec![0i8; k * n];
+        let mut ws = vec![0.0f32; n];
+        let b8p = SendPtr(b8.as_mut_ptr());
+        ws.par_iter_mut().enumerate().for_each_init(
+            || vec![0.0f32; k],
+            |rowf, (o, wso)| {
+                let b8p = &b8p;
+                let (src, r) = if o < n0 {
+                    (a, o)
+                } else if o < n0 + n1 {
+                    (b, o - n0)
+                } else {
+                    (c, o - n0 - n1)
+                };
+                dequantize_into(ty, &src[r * bpr..(r + 1) * bpr], rowf).unwrap();
+                let amax = rowf.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+                let s = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                *wso = s;
+                let inv = 1.0 / s;
+                for i in 0..k {
+                    unsafe {
+                        *b8p.0.add(i * n + o) = (rowf[i] * inv).round().clamp(-127.0, 127.0) as i8
+                    };
+                }
+            },
+        );
+        let wid = self.gemm.stage(&b8).map_err(StrixError::backend)?;
+        self.weights.insert(slot, (wid, ws));
+        Ok(())
+    }
+
+    /// Fused GEMM that splits the [m,n] output into three column ranges
+    /// [0,n0)/[n0,n0+n1)/[n0+n1,n) → `o0`/`o1`/`o2` (each row-major [m, width]).
+    pub fn gemm_split3(
+        &self,
+        slot: u64,
+        xs: &[f32],
+        m: usize,
+        n0: usize,
+        n1: usize,
+        o0: &mut [f32],
+        o1: &mut [f32],
+        o2: &mut [f32],
+    ) -> Result<()> {
+        let n = self.n;
+        let mut fused = vec![0.0f32; m * n];
+        self.gemm(slot, xs, m, &mut fused)?;
+        let n2 = n - n0 - n1;
+        for t in 0..m {
+            let row = &fused[t * n..(t + 1) * n];
+            o0[t * n0..(t + 1) * n0].copy_from_slice(&row[..n0]);
+            o1[t * n1..(t + 1) * n1].copy_from_slice(&row[n0..n0 + n1]);
+            o2[t * n2..(t + 1) * n2].copy_from_slice(&row[n0 + n1..]);
+        }
+        Ok(())
+    }
+
+    /// Fused GEMM splitting [m,n] into two equal halves → `o0`/`o1` (gate‖up).
+    pub fn gemm_split2(
+        &self,
+        slot: u64,
+        xs: &[f32],
+        m: usize,
+        o0: &mut [f32],
+        o1: &mut [f32],
+    ) -> Result<()> {
+        let n = self.n;
+        let half = n / 2;
+        let mut fused = vec![0.0f32; m * n];
+        self.gemm(slot, xs, m, &mut fused)?;
+        for t in 0..m {
+            let row = &fused[t * n..(t + 1) * n];
+            o0[t * half..(t + 1) * half].copy_from_slice(&row[..half]);
+            o1[t * half..(t + 1) * half].copy_from_slice(&row[half..]);
+        }
+        Ok(())
+    }
+
     pub fn has(&self, slot: u64) -> bool {
         self.weights.contains_key(&slot)
     }
@@ -222,6 +314,8 @@ pub struct SmolLm3Npu {
     pub kv: NpuShape,
     pub gu: NpuShape,
     pub down: NpuShape,
+    pub qkv: Option<NpuShape>, // 2048 -> 3072 (2048+512+512)
+    pub gu2: Option<NpuShape>, // 2048 -> 22016 (11008+11008)
 }
 
 impl SmolLm3Npu {
@@ -231,6 +325,8 @@ impl SmolLm3Npu {
             kv: NpuShape::open(dir, 2048, 512, 8)?,
             gu: NpuShape::open(dir, 2048, 11008, 4)?,
             down: NpuShape::open(dir, 11008, 2048, 8)?,
+            qkv: NpuShape::open(dir, 2048, 3072, 8).ok(),
+            gu2: NpuShape::open(dir, 2048, 22016, 8).ok(),
         })
     }
 }
@@ -242,6 +338,9 @@ pub struct Qwen3Npu {
     pub o: NpuShape,    // 4096 -> 2560
     pub gu: NpuShape,   // 2560 -> 9728
     pub down: NpuShape, // 9728 -> 2560
+    // Fusion (stage 1): one dispatch for q‖k‖v and gate‖up. None if xclbin absent.
+    pub qkv: Option<NpuShape>, // 2560 -> 6144 (4096+1024+1024)
+    pub gu2: Option<NpuShape>, // 2560 -> 19456 (9728+9728)
 }
 
 impl Qwen3Npu {
@@ -252,6 +351,8 @@ impl Qwen3Npu {
             o: NpuShape::open(dir, 4096, 2560, 8)?,
             gu: NpuShape::open(dir, 2560, 9728, 8)?,
             down: NpuShape::open(dir, 9728, 2560, 8)?,
+            qkv: NpuShape::open(dir, 2560, 6144, 8).ok(),
+            gu2: NpuShape::open(dir, 2560, 19456, 8).ok(),
         })
     }
 }
@@ -263,6 +364,7 @@ pub struct Gemma3nNpu {
     pub gu: NpuShape,     // 2048 -> 16384
     pub down: NpuShape,   // 16384 -> 2048
     pub plproj: NpuShape, // 2048 -> 8960 (per_layer_model_proj)
+    pub qkv: Option<NpuShape>, // 2048 -> 3072 (2048+512+512); gate/up vary per layer → not fused
 }
 
 impl Gemma3nNpu {
@@ -273,6 +375,7 @@ impl Gemma3nNpu {
             gu: NpuShape::open(dir, 2048, 16384, 8)?,
             down: NpuShape::open(dir, 16384, 2048, 8)?,
             plproj: NpuShape::open(dir, 2048, 8960, 4)?,
+            qkv: NpuShape::open(dir, 2048, 3072, 8).ok(),
         })
     }
 }
