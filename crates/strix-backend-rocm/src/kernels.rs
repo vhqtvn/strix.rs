@@ -2511,4 +2511,124 @@ extern "C" __global__ void copyf_h(unsigned short* __restrict__ dst, const float
     int i = blockIdx.x * 256 + threadIdx.x;
     if (i < n) dst[i] = f2h(src[i]);
 }
+
+// ===== gemma3n MatFormer kernels (4 AltUp streams: h[b*hidden + e], b in 0..4) =====
+
+// AltUp predict: pred[b][e] = h[b][e] + sum_a coef[a + 4*b] * h[a][e]. grid ceil(4*hidden/256).
+extern "C" __global__ void g3n_predict(const float* __restrict__ h, const float* __restrict__ coef,
+                                       float* __restrict__ pred, int hidden) {
+    int idx = blockIdx.x * 256 + threadIdx.x;
+    if (idx >= 4 * hidden) return;
+    int b = idx / hidden, e = idx % hidden;
+    float acc = h[b * hidden + e];
+    #pragma unroll
+    for (int a = 0; a < 4; a++) acc += coef[a + 4 * b] * h[a * hidden + e];
+    pred[idx] = acc;
+}
+
+// AltUp correct: corrected[b][e] = pred[b][e] + (afg[e] - pred[iact][e]) * cc[b]. grid ceil(4*hidden/256).
+extern "C" __global__ void g3n_correct(const float* __restrict__ pred, const float* __restrict__ afg,
+                                       const float* __restrict__ cc, float* __restrict__ corr,
+                                       int hidden, int iact) {
+    int idx = blockIdx.x * 256 + threadIdx.x;
+    if (idx >= 4 * hidden) return;
+    int b = idx / hidden, e = idx % hidden;
+    float innov = afg[e] - pred[iact * hidden + e];
+    corr[idx] = pred[idx] + innov * cc[b];
+}
+
+// Gaussian-topk sparsity (in place): cutoff = mean + mul*std(ddof=1); gate = relu(gate-cutoff).
+// One block, two-pass (matches CPU). block=256.
+extern "C" __global__ void g3n_gtopk(float* __restrict__ gate, int n, float mul) {
+    int t = threadIdx.x;
+    __shared__ float red[256];
+    float s = 0.f;
+    for (int i = t; i < n; i += 256) s += gate[i];
+    red[t] = s; __syncthreads();
+    for (int k = 128; k > 0; k >>= 1) { if (t < k) red[t] += red[t + k]; __syncthreads(); }
+    float mean = red[0] / n; __syncthreads();
+    float v2 = 0.f;
+    for (int i = t; i < n; i += 256) { float d = gate[i] - mean; v2 += d * d; }
+    red[t] = v2; __syncthreads();
+    for (int k = 128; k > 0; k >>= 1) { if (t < k) red[t] += red[t + k]; __syncthreads(); }
+    float cutoff = mean + mul * sqrtf(red[0] / (n - 1));
+    for (int i = t; i < n; i += 256) gate[i] = fmaxf(gate[i] - cutoff, 0.f);
+}
+
+// Magnitude-match (in place): s *= l2(ref) / max(l2(s), 1e-12). One block, block=256.
+extern "C" __global__ void g3n_magmatch(const float* __restrict__ ref, float* __restrict__ s, int hidden) {
+    int t = threadIdx.x;
+    __shared__ float rr[256], rs[256];
+    float a = 0.f, b = 0.f;
+    for (int i = t; i < hidden; i += 256) { a += ref[i] * ref[i]; b += s[i] * s[i]; }
+    rr[t] = a; rs[t] = b; __syncthreads();
+    for (int k = 128; k > 0; k >>= 1) { if (t < k) { rr[t] += rr[t + k]; rs[t] += rs[t + k]; } __syncthreads(); }
+    float r = sqrtf(rr[0]) / fmaxf(sqrtf(rs[0]), 1e-12f);
+    for (int i = t; i < hidden; i += 256) s[i] *= r;
+}
+
+// out[i] = (a[i] + b[i]) * scale. grid ceil(n/256).
+extern "C" __global__ void g3n_addscale(const float* __restrict__ a, const float* __restrict__ b,
+                                        float* __restrict__ out, int n, float scale) {
+    int i = blockIdx.x * 256 + threadIdx.x;
+    if (i < n) out[i] = (a[i] + b[i]) * scale;
+}
+
+// out[i] = gelu_tanh(a[i]) * b[i]. grid ceil(n/256).
+extern "C" __global__ void g3n_gelumul(const float* __restrict__ a, const float* __restrict__ b,
+                                       float* __restrict__ out, int n) {
+    int i = blockIdx.x * 256 + threadIdx.x;
+    if (i >= n) return;
+    float g = a[i];
+    float gt = 0.5f * g * (1.f + tanhf(0.7978845608f * (g + 0.044715f * g * g * g)));
+    out[i] = gt * b[i];
+}
+
+// modal[i] = tanh(v[i] * scale), i < 4 (router logits → modalities). grid 1, block 4+.
+extern "C" __global__ void g3n_tanhscale(float* __restrict__ v, int n, float scale) {
+    int i = threadIdx.x;
+    if (i < n) v[i] = tanhf(v[i] * scale);
+}
+
+// cc[i] = v[i] + 1 (AltUp correct coefs). grid 1, block n.
+extern "C" __global__ void g3n_addone(float* __restrict__ v, int n) {
+    int i = threadIdx.x;
+    if (i < n) v[i] += 1.f;
+}
+
+// l2 norm of x[hidden] → out[0]. One block, block=256.
+extern "C" __global__ void g3n_l2(const float* __restrict__ x, float* __restrict__ out, int hidden) {
+    int t = threadIdx.x;
+    __shared__ float red[256];
+    float s = 0.f;
+    for (int i = t; i < hidden; i += 256) s += x[i] * x[i];
+    red[t] = s; __syncthreads();
+    for (int k = 128; k > 0; k >>= 1) { if (t < k) red[t] += red[t + k]; __syncthreads(); }
+    if (t == 0) out[0] = sqrtf(red[0]);
+}
+
+// merged[e] += u[e] * tgt[0] / max(l2(u), 1e-12). tgt[0] precomputed (= l2 of active stream).
+// One block, block=256.
+extern "C" __global__ void g3n_l2add(float* __restrict__ merged, const float* __restrict__ u,
+                                     const float* __restrict__ tgt, int hidden) {
+    int t = threadIdx.x;
+    __shared__ float red[256];
+    float s = 0.f;
+    for (int i = t; i < hidden; i += 256) s += u[i] * u[i];
+    red[t] = s; __syncthreads();
+    for (int k = 128; k > 0; k >>= 1) { if (t < k) red[t] += red[t + k]; __syncthreads(); }
+    float r = tgt[0] / fmaxf(sqrtf(red[0]), 1e-12f);
+    for (int i = t; i < hidden; i += 256) merged[i] += u[i] * r;
+}
+
+// Add pn[hidden] into AltUp streams 1..3 (PLE first_prediction). grid ceil(3*hidden/256).
+extern "C" __global__ void g3n_add_streams123(float* __restrict__ corr, const float* __restrict__ pn, int hidden) {
+    int idx = blockIdx.x * 256 + threadIdx.x;
+    if (idx >= 3 * hidden) return;
+    int e = idx % hidden;
+    corr[(idx / hidden + 1) * hidden + e] += pn[e];
+}
+
+// inp_per_layer[i] = (tmp[i] + pe[i]) * inv_sqrt2, then scale[*] applied elsewhere. grid ceil(n/256).
+// (alias of g3n_addscale; kept distinct for clarity is unnecessary — use g3n_addscale.)
 "#;
