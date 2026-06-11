@@ -854,12 +854,18 @@ impl Gemma3nModel {
                     sum += *s;
                 }
                 let inv = 1.0 / sum;
-                for d in 0..hd {
-                    let mut acc = 0.0f32;
-                    for (i, t) in (ws..len).enumerate() {
-                        acc += sc[i] * vc[(t * nkv + kvh) * hd + d];
+                for x in oh.iter_mut() {
+                    *x = 0.0;
+                }
+                for (i, t) in (ws..len).enumerate() {
+                    let w = sc[i];
+                    let vrow = &vc[(t * nkv + kvh) * hd..(t * nkv + kvh) * hd + hd];
+                    for d in 0..hd {
+                        oh[d] += w * vrow[d];
                     }
-                    oh[d] = acc * inv;
+                }
+                for x in oh.iter_mut() {
+                    *x *= inv;
                 }
             });
             // output proj
@@ -1180,12 +1186,18 @@ impl Gemma3nModel {
                     }
                     let inv = 1.0 / sum;
                     let oh = &mut arow[hh * hd..hh * hd + hd];
-                    for d in 0..hd {
-                        let mut acc = 0.0f32;
-                        for (i, j) in (ws..len).enumerate() {
-                            acc += sc[i] * vc[(j * nkv + kvh) * hd + d];
+                    for x in oh.iter_mut() {
+                        *x = 0.0;
+                    }
+                    for (i, j) in (ws..len).enumerate() {
+                        let w = sc[i];
+                        let vrow = &vc[(j * nkv + kvh) * hd..(j * nkv + kvh) * hd + hd];
+                        for d in 0..hd {
+                            oh[d] += w * vrow[d];
                         }
-                        oh[d] = acc * inv;
+                    }
+                    for x in oh.iter_mut() {
+                        *x *= inv;
                     }
                 }
             });

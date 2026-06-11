@@ -550,12 +550,18 @@ impl SmolLm3Model {
                     sum += *s;
                 }
                 let inv = 1.0 / sum;
-                for d in 0..hd {
-                    let mut acc = 0.0f32;
-                    for t in 0..len {
-                        acc += scores[t] * vc[(t * nkv + kvh) * hd + d];
+                for x in oh.iter_mut() {
+                    *x = 0.0;
+                }
+                for t in 0..len {
+                    let w = scores[t];
+                    let vrow = &vc[(t * nkv + kvh) * hd..(t * nkv + kvh) * hd + hd];
+                    for d in 0..hd {
+                        oh[d] += w * vrow[d];
                     }
-                    oh[d] = acc * inv;
+                }
+                for x in oh.iter_mut() {
+                    *x *= inv;
                 }
             });
 
@@ -766,12 +772,18 @@ impl SmolLm3Model {
                         }
                         let inv = 1.0 / sum;
                         let oh = &mut arow[hh * hd..hh * hd + hd];
-                        for d in 0..hd {
-                            let mut acc = 0.0f32;
-                            for j in 0..len {
-                                acc += sc[j] * vc[(j * nkv + kvh) * hd + d];
+                        for x in oh.iter_mut() {
+                            *x = 0.0;
+                        }
+                        for j in 0..len {
+                            let w = sc[j];
+                            let vrow = &vc[(j * nkv + kvh) * hd..(j * nkv + kvh) * hd + hd];
+                            for d in 0..hd {
+                                oh[d] += w * vrow[d];
                             }
-                            oh[d] = acc * inv;
+                        }
+                        for x in oh.iter_mut() {
+                            *x *= inv;
                         }
                     }
                 });
