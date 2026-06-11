@@ -133,6 +133,35 @@ fn rope_neox(vec: &mut [f32], pos: usize, n_dims: usize, freq_base: f32) {
     }
 }
 
+/// NEOX RoPE from a precomputed per-position cos/sin table (no per-call transcendentals).
+#[inline]
+fn rope_apply(vec: &mut [f32], cs: &[f32], sn: &[f32], half: usize) {
+    for k in 0..half {
+        let (c, s) = (cs[k], sn[k]);
+        let x0 = vec[k];
+        let x1 = vec[k + half];
+        vec[k] = x0 * c - x1 * s;
+        vec[k + half] = x0 * s + x1 * c;
+    }
+}
+
+/// Precompute the NEOX rope cos/sin table for positions `0..m`, `half` entries each.
+fn rope_table(m: usize, half: usize, freq_base: f32) -> (Vec<f32>, Vec<f32>) {
+    let theta_scale = freq_base.powf(-1.0 / half as f32);
+    let mut cs = vec![0.0f32; m * half];
+    let mut sn = vec![0.0f32; m * half];
+    for t in 0..m {
+        let mut theta = t as f32;
+        for k in 0..half {
+            let (s, c) = theta.sin_cos();
+            cs[t * half + k] = c;
+            sn[t * half + k] = s;
+            theta *= theta_scale;
+        }
+    }
+    (cs, sn)
+}
+
 /// out[o] = dequant(W row o) · x, parallel over rows. in_dim = row length.
 fn qmatmul(out: &mut [f32], x: &[f32], bytes: &[u8], ty: GgmlType, in_dim: usize) {
     let bpr = (in_dim / ty.block_elems()) * ty.block_bytes();
@@ -700,16 +729,12 @@ impl SmolLm3Model {
         }
 
         let mut nrm = vec![0.0f32; m * hidden];
+        let (rope_cs, rope_sn) = rope_table(m, hd / 2, cfg.rope_base);
         for il in 0..cfg.n_layers {
             let bnm = |s: &str| format!("blk.{il}.{s}");
-            for t in 0..m {
-                rmsnorm(
-                    &mut nrm[t * hidden..(t + 1) * hidden],
-                    &h[t * hidden..(t + 1) * hidden],
-                    &self.norms[il].attn_norm,
-                    cfg.eps,
-                );
-            }
+            nrm.par_chunks_mut(hidden)
+                .zip(h.par_chunks(hidden))
+                .for_each(|(nr, hr)| rmsnorm(nr, hr, &self.norms[il].attn_norm, cfg.eps));
             let mut q = vec![0.0f32; m * q_dim];
             let mut k = vec![0.0f32; m * kv_dim];
             let mut v = vec![0.0f32; m * kv_dim];
@@ -726,26 +751,22 @@ impl SmolLm3Model {
                 self.bmm(&bnm("attn_k.weight"), NpuW::K, &nrm, m, hidden, kv_dim, &mut k)?;
                 self.bmm(&bnm("attn_v.weight"), NpuW::V, &nrm, m, hidden, kv_dim, &mut v)?;
             }
-            let use_rope = (il + 1) % cfg.nope_step != 0;
-            for t in 0..m {
-                if use_rope {
-                    for hh in 0..nh {
-                        rope_neox(
-                            &mut q[t * q_dim + hh * hd..t * q_dim + hh * hd + hd],
-                            t,
-                            hd,
-                            cfg.rope_base,
-                        );
-                    }
-                    for kh in 0..nkv {
-                        rope_neox(
-                            &mut k[t * kv_dim + kh * hd..t * kv_dim + kh * hd + hd],
-                            t,
-                            hd,
-                            cfg.rope_base,
-                        );
-                    }
-                }
+            // NoPE: skip rope on every nope_step-th layer. Table-driven + parallel.
+            if (il + 1) % cfg.nope_step != 0 {
+                let half = hd / 2;
+                q.par_chunks_mut(q_dim)
+                    .zip(k.par_chunks_mut(kv_dim))
+                    .enumerate()
+                    .for_each(|(t, (qrow, krow))| {
+                        let cs = &rope_cs[t * half..(t + 1) * half];
+                        let sn = &rope_sn[t * half..(t + 1) * half];
+                        for hh in 0..nh {
+                            rope_apply(&mut qrow[hh * hd..hh * hd + hd], cs, sn, half);
+                        }
+                        for kh in 0..nkv {
+                            rope_apply(&mut krow[kh * hd..kh * hd + hd], cs, sn, half);
+                        }
+                    });
             }
             self.kc[il].extend_from_slice(&k);
             self.vc[il].extend_from_slice(&v);
@@ -797,17 +818,10 @@ impl SmolLm3Model {
                 hidden,
                 &mut o,
             )?;
-            for i in 0..m * hidden {
-                h[i] += o[i];
-            }
-            for t in 0..m {
-                rmsnorm(
-                    &mut nrm[t * hidden..(t + 1) * hidden],
-                    &h[t * hidden..(t + 1) * hidden],
-                    &self.norms[il].ffn_norm,
-                    cfg.eps,
-                );
-            }
+            h.par_iter_mut().zip(o.par_iter()).for_each(|(hh, oo)| *hh += *oo);
+            nrm.par_chunks_mut(hidden)
+                .zip(h.par_chunks(hidden))
+                .for_each(|(nr, hr)| rmsnorm(nr, hr, &self.norms[il].ffn_norm, cfg.eps));
             let mut gate = vec![0.0f32; m * ffn];
             let mut up = vec![0.0f32; m * ffn];
             let mut gu_done = false;
@@ -822,10 +836,9 @@ impl SmolLm3Model {
                 self.bmm(&bnm("ffn_gate.weight"), NpuW::Gate, &nrm, m, hidden, ffn, &mut gate)?;
                 self.bmm(&bnm("ffn_up.weight"), NpuW::Up, &nrm, m, hidden, ffn, &mut up)?;
             }
-            for i in 0..m * ffn {
-                let g = gate[i];
-                gate[i] = (g / (1.0 + (-g).exp())) * up[i];
-            }
+            gate.par_iter_mut()
+                .zip(up.par_iter())
+                .for_each(|(g, u)| *g = (*g / (1.0 + (-*g).exp())) * *u);
             self.bmm(
                 &bnm("ffn_down.weight"),
                 NpuW::Down,
@@ -835,9 +848,7 @@ impl SmolLm3Model {
                 hidden,
                 &mut o,
             )?;
-            for i in 0..m * hidden {
-                h[i] += o[i];
-            }
+            h.par_iter_mut().zip(o.par_iter()).for_each(|(hh, oo)| *hh += *oo);
         }
         self.pos = m;
         // last token → logits
