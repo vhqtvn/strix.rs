@@ -21,6 +21,37 @@ pub const M_NPU: usize = 256;
 /// Below this row count CPU wins (per-call NPU latency dominates).
 pub const M_MIN: usize = 64;
 
+/// Phase profiler for the NPU GEMM path (gated by STRIX_NPU_PROF). Accumulates
+/// nanoseconds spent in activation quant / NPU start+wait / CPU rescale across all
+/// gemm() calls so we can see the real bottleneck. Dump with `npu_prof_dump()`.
+pub mod prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static QUANT_NS: AtomicU64 = AtomicU64::new(0);
+    pub static NPU_NS: AtomicU64 = AtomicU64::new(0);
+    pub static RESCALE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static CALLS: AtomicU64 = AtomicU64::new(0);
+    pub fn on() -> bool {
+        std::env::var("STRIX_NPU_PROF").is_ok()
+    }
+    pub fn add(q: u64, n: u64, r: u64) {
+        QUANT_NS.fetch_add(q, Ordering::Relaxed);
+        NPU_NS.fetch_add(n, Ordering::Relaxed);
+        RESCALE_NS.fetch_add(r, Ordering::Relaxed);
+        CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn dump(tag: &str) {
+        let (q, n, r, c) = (
+            QUANT_NS.load(Ordering::Relaxed) as f64 / 1e6,
+            NPU_NS.load(Ordering::Relaxed) as f64 / 1e6,
+            RESCALE_NS.load(Ordering::Relaxed) as f64 / 1e6,
+            CALLS.load(Ordering::Relaxed),
+        );
+        eprintln!(
+            "[npu-prof {tag}] {c} gemms | quant {q:.1}ms | NPU(start+wait) {n:.1}ms | rescale {r:.1}ms",
+        );
+    }
+}
+
 /// Shareable raw pointer for disjoint-index parallel writes.
 struct SendPtr<T>(*mut T);
 unsafe impl<T> Sync for SendPtr<T> {}
@@ -232,6 +263,8 @@ impl NpuShape {
             .weights
             .get(&slot)
             .ok_or_else(|| StrixError::backend("npu: slot not staged"))?;
+        let prof = prof::on();
+        let t0 = std::time::Instant::now();
         let mut xsc = vec![0.0f32; m];
         let ap = SendPtr(self.gemm.a_host as *mut i8);
         xsc.par_iter_mut().enumerate().for_each(|(t, sc)| {
@@ -251,8 +284,10 @@ impl NpuShape {
                 std::ptr::write_bytes((self.gemm.a_host as *mut i8).add(m * k), 0, (M_NPU - m) * k)
             };
         }
+        let t1 = std::time::Instant::now();
         self.gemm.start(*wid).map_err(StrixError::backend)?;
         self.gemm.wait().map_err(StrixError::backend)?;
+        let t2 = std::time::Instant::now();
         let acc = unsafe { std::slice::from_raw_parts(self.gemm.out_host as *const i32, m * n) };
         out[..m * n]
             .par_chunks_mut(n)
@@ -263,6 +298,14 @@ impl NpuShape {
                     orow[o] = s * ws[o] * acc[t * n + o] as f32;
                 }
             });
+        if prof {
+            let t3 = std::time::Instant::now();
+            prof::add(
+                (t1 - t0).as_nanos() as u64,
+                (t2 - t1).as_nanos() as u64,
+                (t3 - t2).as_nanos() as u64,
+            );
+        }
         Ok(())
     }
 }

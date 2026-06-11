@@ -498,13 +498,22 @@ impl Qwen3Model {
                             sum += *s;
                         }
                         let inv = 1.0 / sum;
+                        // weighted V: j-outer / d-inner so each V row is read
+                        // contiguously and the inner loop is a vectorizable axpy
+                        // (the d-outer/j-inner form strided vc by kv_dim = cache death).
                         let oh = &mut arow[hh * hd..hh * hd + hd];
-                        for d in 0..hd {
-                            let mut acc = 0.0f32;
-                            for j in 0..len {
-                                acc += sc[j] * vc[(j * nkv + kvh) * hd + d];
+                        for x in oh.iter_mut() {
+                            *x = 0.0;
+                        }
+                        for j in 0..len {
+                            let w = sc[j];
+                            let vrow = &vc[(j * nkv + kvh) * hd..(j * nkv + kvh) * hd + hd];
+                            for d in 0..hd {
+                                oh[d] += w * vrow[d];
                             }
-                            oh[d] = acc * inv;
+                        }
+                        for x in oh.iter_mut() {
+                            *x *= inv;
                         }
                     }
                 });
@@ -562,6 +571,10 @@ impl Qwen3Model {
             }
         }
         self.pos = m;
+        #[cfg(feature = "npu")]
+        if crate::mellum_npu::prof::on() {
+            crate::mellum_npu::prof::dump("qwen3");
+        }
         let last = &h[(m - 1) * hidden..m * hidden];
         let mut nf = vec![0.0f32; hidden];
         rmsnorm(&mut nf, last, &self.output_norm, cfg.eps);
