@@ -352,6 +352,28 @@ impl SmolLm3Model {
         Ok(logits)
     }
 
+    /// Upload the CPU/NPU-prefilled KV (self.kc/vc, `self.pos` tokens) into the
+    /// device decode KV cache so on-device decode can attend the prompt — keeps
+    /// prefill off the iGPU. Layouts match (roped K incl. NoPE layers, raw V).
+    fn seed_device_kv(&mut self) -> Result<()> {
+        let Some(mut accel) = self.accel.take() else {
+            return Ok(());
+        };
+        let mut ok = true;
+        for il in 0..self.cfg.n_layers {
+            if !accel.seed_decode_kv(il, &self.kc[il], &self.vc[il]) {
+                ok = false;
+                break;
+            }
+        }
+        self.accel = Some(accel);
+        if ok {
+            Ok(())
+        } else {
+            Err(StrixError::invalid("smollm3: device KV seed failed"))
+        }
+    }
+
     /// Matmul by tensor name: GPU `gemv` if resident, else CPU dequant.
     fn mm(&self, name: &str, x: &[f32]) -> Result<Vec<f32>> {
         if let Some(a) = &self.accel {
@@ -770,13 +792,12 @@ impl Decoder for SmolLm3Model {
         if self.npu.is_some() {
             return Ok(Logits::new(self.prefill_batch(input_tokens)?));
         }
-        // Stage C: run the prompt through the on-device forward token-by-token,
-        // populating the GPU KV cache; last token's logits sample the first output.
+        // Stage C: prefill stays OFF the iGPU (sustained GPU load crashes this box —
+        // see never-gpu-prefill). Run the batched CPU/NPU prefill to fill self.kc/vc,
+        // then seed the device KV cache so on-device decode can attend the prompt.
         if self.gpu_decode {
-            let mut last = Vec::new();
-            for &t in input_tokens {
-                last = self.gpu_decode_step(t)?;
-            }
+            let last = self.prefill_batch(input_tokens)?;
+            self.seed_device_kv()?;
             return Ok(Logits::new(last));
         }
         let mut last = Vec::new();

@@ -342,6 +342,14 @@ pub trait WeightAccel: Send + Sync {
         false
     }
 
+    /// Seed the on-device decode KV cache for layer `il` with `k`/`v` from a
+    /// CPU/NPU prefill (roped+normed K, raw V, token-major `[tokens][n_kv*head_dim]`
+    /// — the same layout `decode_step` appends). Lets prefill run off-GPU (CPU/NPU)
+    /// and only decode on the iGPU. Returns false if unsupported. `None` default.
+    fn seed_decode_kv(&mut self, _il: usize, _k: &[f32], _v: &[f32]) -> bool {
+        false
+    }
+
     /// Run one full decode step entirely on-device: `h` is the (already
     /// embedding-scaled) hidden state for the current token, `pos` its position.
     /// Returns the output logits, or `None` if unsupported. Appends to the

@@ -612,6 +612,28 @@ impl Qwen3Model {
         Ok(logits)
     }
 
+    /// Upload the CPU/NPU-prefilled KV (self.kc/vc, `self.pos` tokens) into the
+    /// device decode KV cache so on-device decode can attend the prompt — keeps
+    /// prefill off the iGPU. Layouts match (roped+normed K, raw V, token-major).
+    fn seed_device_kv(&mut self) -> Result<()> {
+        let Some(mut accel) = self.accel.take() else {
+            return Ok(());
+        };
+        let mut ok = true;
+        for il in 0..self.cfg.n_layers {
+            if !accel.seed_decode_kv(il, &self.kc[il], &self.vc[il]) {
+                ok = false;
+                break;
+            }
+        }
+        self.accel = Some(accel);
+        if ok {
+            Ok(())
+        } else {
+            Err(StrixError::invalid("qwen3: device KV seed failed"))
+        }
+    }
+
     fn w<'a>(&'a self, name: &str) -> Result<(&'a [u8], GgmlType, usize, usize)> {
         let t = self
             .gguf
@@ -752,13 +774,12 @@ impl Decoder for Qwen3Model {
         if self.npu.is_some() {
             return Ok(Logits::new(self.prefill_batch(input_tokens)?));
         }
-        // Stage C: run the prompt through the on-device forward token-by-token,
-        // populating the GPU KV cache. Last token's logits sample the first output.
+        // Stage C: prefill stays OFF the iGPU (sustained GPU load crashes this box —
+        // see never-gpu-prefill). Run the batched CPU/NPU prefill to fill self.kc/vc,
+        // then seed the device KV cache so on-device decode can attend the prompt.
         if self.gpu_decode {
-            let mut last = Vec::new();
-            for &t in input_tokens {
-                last = self.gpu_decode_step(t)?;
-            }
+            let last = self.prefill_batch(input_tokens)?;
+            self.seed_device_kv()?;
             return Ok(Logits::new(last));
         }
         let mut last = Vec::new();

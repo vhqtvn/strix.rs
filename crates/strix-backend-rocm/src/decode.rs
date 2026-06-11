@@ -95,6 +95,29 @@ fn f16_to_f32(h: u16) -> f32 {
     f32::from_bits((s << 31) | ((e + 112) << 23) | (m << 13))
 }
 
+// f32 → IEEE f16 (round-to-nearest-even), matching the kernels' f2h. Used to seed
+// the f16 KV cache from a CPU/NPU prefill.
+fn f32_to_f16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let mut exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let mant = bits & 0x7f_ffff;
+    if exp >= 0x1f {
+        return sign | 0x7c00; // inf/overflow (NaN mantissa dropped — fine for KV)
+    }
+    if exp <= 0 {
+        if exp < -10 {
+            return sign; // underflow to zero
+        }
+        let m = (mant | 0x80_0000) >> (1 - exp);
+        let round = (m & 0x1000) != 0;
+        return sign | ((m >> 13) as u16) + round as u16;
+    }
+    let half = sign | ((exp as u16) << 10) | ((mant >> 13) as u16);
+    let round = (mant & 0x1000) != 0;
+    half + round as u16
+}
+
 struct ResQ6 {
     scales: Dbuf,
     ql: Dbuf,
@@ -3757,6 +3780,25 @@ impl WeightAccel for RocmWeightAccel {
     fn upload_f32(&mut self, key: &str, data: &[f32]) {
         if let Ok(b) = self.gpu.upload_new(data) {
             self.f32w.insert(key.to_string(), b);
+        }
+    }
+
+    fn seed_decode_kv(&mut self, il: usize, k: &[f32], v: &[f32]) -> bool {
+        let Some(s) = self.scratch.as_ref() else {
+            return false;
+        };
+        if il >= s.k_cache.len() {
+            return false;
+        }
+        // KV cache holds f16 when STRIX_F16_KV, else f32 — convert if needed.
+        if self.kv_f16 {
+            let kh: Vec<u16> = k.iter().map(|&x| f32_to_f16(x)).collect();
+            let vh: Vec<u16> = v.iter().map(|&x| f32_to_f16(x)).collect();
+            self.gpu.upload_at(&s.k_cache[il], 0, &kh).is_ok()
+                && self.gpu.upload_at(&s.v_cache[il], 0, &vh).is_ok()
+        } else {
+            self.gpu.upload_at(&s.k_cache[il], 0, k).is_ok()
+                && self.gpu.upload_at(&s.v_cache[il], 0, v).is_ok()
         }
     }
 
