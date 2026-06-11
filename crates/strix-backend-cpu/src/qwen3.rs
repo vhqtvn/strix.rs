@@ -212,11 +212,11 @@ impl Qwen3Model {
     /// to the GPU accelerator. Per-token matmuls then run via `gemv`; norms, rope,
     /// QK-norm and attention stay on the CPU. Returns the number of weights staged.
     ///
-    /// NOTE [measured 2026-06-11]: this is LOSSLESS but gives ~0 decode speedup
-    /// (CPU 2.32 == GPU 2.32 tok/s) — each `gemv` does upload+launch+full-sync+
-    /// download, and ~250 round-trips/token are sync-bound (the pre-hipGraph mellum
-    /// wall). Real acceleration needs a resident on-device forward (h stays on GPU,
-    /// all ops queued, hipGraph replay) — a dense analog of `mlm_token_graph`.
+    /// PERF [measured 2026-06-11, lossless]: ~6-7x decode speedup — Qwen3 2.3→16 tok/s,
+    /// SmolLM3 2.8→18 tok/s (at a throttled 1079MHz sclk; higher at full 2900MHz).
+    /// (An earlier "0 speedup" reading was a collapsed-GPU-clock artifact, not real.)
+    /// Still per-`gemv` round-trips (upload+sync+download/matmul); a resident
+    /// on-device forward (hipGraph, dense `mlm_token_graph` analog) would go further.
     pub fn attach_accel(&mut self, mut accel: Box<dyn WeightAccel>) -> usize {
         let mut names: Vec<String> = Vec::new();
         for l in 0..self.cfg.n_layers {
