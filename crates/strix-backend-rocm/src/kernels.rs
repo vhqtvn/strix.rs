@@ -2574,6 +2574,13 @@ extern "C" __global__ void g3n_addscale(const float* __restrict__ a, const float
     if (i < n) out[i] = (a[i] + b[i]) * scale;
 }
 
+// out[i] = a[i] * b[i] (elementwise). grid ceil(n/256).
+extern "C" __global__ void g3n_mul(const float* __restrict__ a, const float* __restrict__ b,
+                                   float* __restrict__ out, int n) {
+    int i = blockIdx.x * 256 + threadIdx.x;
+    if (i < n) out[i] = a[i] * b[i];
+}
+
 // out[i] = gelu_tanh(a[i]) * b[i]. grid ceil(n/256).
 extern "C" __global__ void g3n_gelumul(const float* __restrict__ a, const float* __restrict__ b,
                                        float* __restrict__ out, int n) {

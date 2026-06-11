@@ -68,6 +68,32 @@ pub struct GpuDecodeConfig {
     pub layers: Vec<GpuLayerCfg>,
 }
 
+/// Whole-model config for the gemma3n (MatFormer) on-device decode forward.
+/// gemma3n's forward is wholly different from the generic transformer
+/// `decode_step` (4 AltUp streams, Laurel, PLE, gaussian-topk sparsity), so it
+/// has its own config + `decode_step_g3n`.
+#[derive(Debug, Clone)]
+pub struct G3nConfig {
+    pub hidden: usize,
+    pub embd_altup: usize, // per-layer input dim (256)
+    pub n_heads: usize,
+    pub n_kv: usize,
+    pub head_dim: usize,
+    pub n_layers: usize,
+    pub vocab: usize,
+    pub eps: f32,
+    pub rope_global: f32,
+    pub rope_local: f32,
+    pub n_swa: usize,
+    pub kv_from_start: usize,
+    pub n_sparsity: usize,
+    pub sparsity_mul: f32,
+    pub laurel_rank: usize,
+    pub max_seq: usize,
+    /// Per-layer FFN hidden size.
+    pub ffn: Vec<usize>,
+}
+
 /// A device that can hold weights resident and compute their GEMV.
 ///
 /// `key` is an opaque, caller-chosen weight identifier (we use GGUF tensor
@@ -385,6 +411,26 @@ pub trait WeightAccel: Send + Sync {
     /// unsupported). The caller chunks longer prompts.
     fn prefill_max(&self) -> usize {
         0
+    }
+
+    // --- gemma3n (MatFormer) on-device decode ---
+    /// Configure the gemma3n on-device forward (after weights uploaded). Returns
+    /// true if the backend can run `decode_step_g3n`.
+    fn configure_decode_g3n(&mut self, _cfg: G3nConfig) -> bool {
+        false
+    }
+
+    /// Seed the gemma3n decode KV cache for own-KV layer `il` (il < kv_from_start)
+    /// with roped+normed K / rms-normed V from a CPU/NPU prefill (token-major).
+    fn seed_decode_kv_g3n(&mut self, _il: usize, _k: &[f32], _v: &[f32]) -> bool {
+        false
+    }
+
+    /// One full gemma3n decode step on-device. `x0` = sqrt(hidden)-scaled token
+    /// embedding `[hidden]`; `pe` = sqrt(embd_altup)-scaled per-layer token
+    /// embedding `[embd_altup * n_layers]`. Returns logits, appends to device KV.
+    fn decode_step_g3n(&mut self, _x0: &[f32], _pe: &[f32], _pos: usize) -> Option<Vec<f32>> {
+        None
     }
 
     /// Speculative-decoding verify: like [`WeightAccel::prefill`] but returns

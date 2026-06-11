@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::os::raw::c_void;
 
-use strix_core::accel::{GpuDecodeConfig, WeightAccel};
+use strix_core::accel::{G3nConfig, GpuDecodeConfig, WeightAccel};
 
 use crate::ffi::hipFunction_t;
 use crate::hip::{Dbuf, HipGpu};
@@ -340,6 +340,51 @@ struct Scratch {
     v_cache: Vec<Dbuf>,
 }
 
+/// Scratch + device KV for the gemma3n (MatFormer) on-device decode. The 4 AltUp
+/// streams (h/pred/corr) stay resident across all layers; the rest are per-op temps.
+struct G3nScratch {
+    h: Dbuf,      // [4*hidden] the 4 AltUp streams
+    pred: Dbuf,   // [4*hidden]
+    corr: Dbuf,   // [4*hidden]
+    x0: Dbuf,     // [hidden] base (scaled) embedding
+    cur: Dbuf,    // [hidden] normed active prediction
+    q: Dbuf,      // [n_heads*hd]
+    k: Dbuf,      // [n_kv*hd]
+    v: Dbuf,      // [n_kv*hd]
+    attn: Dbuf,   // [n_heads*hd]
+    t_hid: Dbuf,  // [hidden] generic hidden temp (ao / ff / pj)
+    rn: Dbuf,     // [hidden] rmsnorm temp (modalities / norms)
+    modal: Dbuf,  // [4]
+    coef: Dbuf,   // [16] predict coefs
+    cc: Dbuf,     // [4] correct coefs
+    lo: Dbuf,     // [laurel_rank]
+    laurel: Dbuf, // [hidden] laurel_out
+    pa: Dbuf,     // [hidden] post-attn gated
+    attn_laurel: Dbuf, // [hidden]
+    gate: Dbuf,   // [max_ffn]
+    up: Dbuf,     // [max_ffn]
+    afg: Dbuf,    // [hidden] attn_ffw_laurel_gated
+    pe: Dbuf,     // [ea*n_layers] per-layer token embd (scaled), uploaded per token
+    proj: Dbuf,   // [ea*n_layers] per_layer_model_proj output
+    inp_per_layer: Dbuf, // [ea*n_layers]
+    g: Dbuf,      // [ea] PLE gate
+    pn: Dbuf,     // [hidden] PLE post-norm
+    merged: Dbuf, // [hidden]
+    u: Dbuf,      // [hidden] merge temp
+    tgt: Dbuf,    // [1] l2 target scalar
+    xn: Dbuf,     // [hidden] final norm
+    logits: Dbuf, // [vocab]
+    argmax_out: Dbuf, // [2]
+    // int8-activation quant buffers for the Q4 GEMMs (packed char4 dp4a format).
+    xq_lo: Dbuf,
+    xq_hi: Dbuf,
+    xq_d: Dbuf,
+    xq_sum: Dbuf,
+    ones: Dbuf, // [hd/2] rope_freqs=1 (gemma3n uses plain NEOX rope)
+    k_cache: Vec<Dbuf>, // own-KV layers (0..kv_from_start)
+    v_cache: Vec<Dbuf>,
+}
+
 /// Max flash-decoding key-split factor (buffer sizing cap). The actual split is
 /// context-ADAPTIVE: ~len/64 (constant ≈64 keys/chunk → steady occupancy at any
 /// context), clamped to [8, N_SPLIT_MAX]. Measured: 8→32 was +14% decode @2k,
@@ -365,6 +410,8 @@ pub struct RocmWeightAccel {
     f32w: HashMap<String, Dbuf>,
     cfg: Option<GpuDecodeConfig>,
     scratch: Option<Scratch>,
+    g3n: Option<G3nConfig>,
+    g3s: Option<G3nScratch>,
     /// Persistent per-weight `gemv` scratch (x input / y output), reused across calls
     /// (Dbuf has no free-on-drop, so per-call alloc would leak). Sized to GEMV_MAX_*.
     gemv_x: Dbuf,
@@ -499,6 +546,7 @@ impl RocmWeightAccel {
             "g3n_gtopk",
             "g3n_magmatch",
             "g3n_addscale",
+            "g3n_mul",
             "g3n_gelumul",
             "g3n_tanhscale",
             "g3n_addone",
@@ -633,6 +681,8 @@ impl RocmWeightAccel {
             f32w: HashMap::new(),
             cfg: None,
             scratch: None,
+            g3n: None,
+            g3s: None,
             gemv_x,
             gemv_y,
             moe: HashMap::new(),
@@ -3811,6 +3861,377 @@ impl WeightAccel for RocmWeightAccel {
             self.gpu.upload_at(&s.k_cache[il], 0, k).is_ok()
                 && self.gpu.upload_at(&s.v_cache[il], 0, v).is_ok()
         }
+    }
+
+    fn configure_decode_g3n(&mut self, cfg: G3nConfig) -> bool {
+        let hidden = cfg.hidden;
+        let ea = cfg.embd_altup;
+        let nl = cfg.n_layers;
+        let qd = cfg.n_heads * cfg.head_dim;
+        let kvd = cfg.n_kv * cfg.head_dim;
+        let max_ffn = cfg.ffn.iter().copied().max().unwrap_or(0);
+        let max_in = max_ffn.max(hidden).max(qd);
+        let nb_max = max_in.div_ceil(32);
+        let kvb = if self.kv_f16 { 2 } else { 4 };
+        let mk = |n: usize| self.gpu.alloc((n.max(1)) * 4).expect("g3n scratch");
+        let mkkv = |n: usize| self.gpu.alloc((n.max(1)) * kvb).expect("g3n kv");
+        let half = (cfg.head_dim / 2).max(1);
+        let ones = mk(half);
+        ones.upload(&vec![1.0f32; half]).ok();
+        let k_cache = (0..cfg.kv_from_start)
+            .map(|_| mkkv(cfg.n_kv * cfg.max_seq * cfg.head_dim))
+            .collect();
+        let v_cache = (0..cfg.kv_from_start)
+            .map(|_| mkkv(cfg.n_kv * cfg.max_seq * cfg.head_dim))
+            .collect();
+        self.g3s = Some(G3nScratch {
+            h: mk(4 * hidden),
+            pred: mk(4 * hidden),
+            corr: mk(4 * hidden),
+            x0: mk(hidden),
+            cur: mk(hidden),
+            q: mk(qd),
+            k: mk(kvd),
+            v: mk(kvd),
+            attn: mk(qd),
+            t_hid: mk(hidden),
+            rn: mk(hidden),
+            modal: mk(4),
+            coef: mk(16),
+            cc: mk(4),
+            lo: mk(cfg.laurel_rank),
+            laurel: mk(hidden),
+            pa: mk(hidden),
+            attn_laurel: mk(hidden),
+            gate: mk(max_ffn),
+            up: mk(max_ffn),
+            afg: mk(hidden),
+            pe: mk(ea * nl),
+            proj: mk(ea * nl),
+            inp_per_layer: mk(ea * nl),
+            g: mk(ea),
+            pn: mk(hidden),
+            merged: mk(hidden),
+            u: mk(hidden),
+            tgt: mk(1),
+            xn: mk(hidden),
+            logits: mk(cfg.vocab),
+            argmax_out: mk(2),
+            xq_lo: self.gpu.alloc(nb_max * 16).expect("g3n xq_lo"),
+            xq_hi: self.gpu.alloc(nb_max * 16).expect("g3n xq_hi"),
+            xq_d: mk(nb_max),
+            xq_sum: mk(nb_max),
+            ones,
+            k_cache,
+            v_cache,
+        });
+        self.g3n = Some(cfg);
+        true
+    }
+
+    fn seed_decode_kv_g3n(&mut self, il: usize, k: &[f32], v: &[f32]) -> bool {
+        let Some(s) = self.g3s.as_ref() else {
+            return false;
+        };
+        if il >= s.k_cache.len() {
+            return false;
+        }
+        if self.kv_f16 {
+            let kh: Vec<u16> = k.iter().map(|&x| f32_to_f16(x)).collect();
+            let vh: Vec<u16> = v.iter().map(|&x| f32_to_f16(x)).collect();
+            self.gpu.upload_at(&s.k_cache[il], 0, &kh).is_ok()
+                && self.gpu.upload_at(&s.v_cache[il], 0, &vh).is_ok()
+        } else {
+            self.gpu.upload_at(&s.k_cache[il], 0, k).is_ok()
+                && self.gpu.upload_at(&s.v_cache[il], 0, v).is_ok()
+        }
+    }
+
+    fn decode_step_g3n(&mut self, x0: &[f32], pe: &[f32], pos: usize) -> Option<Vec<f32>> {
+        let cfg = self.g3n.as_ref()?;
+        let s = self.g3s.as_ref()?;
+        let (hidden, ea, nl, nh, nkv, hd) = (
+            cfg.hidden,
+            cfg.embd_altup,
+            cfg.n_layers,
+            cfg.n_heads,
+            cfg.n_kv,
+            cfg.head_dim,
+        );
+        let (kvd, qd, groups, eps) = (nkv * hd, nh * hd, (nh / nkv.max(1)).max(1), cfg.eps);
+        let (kvfrom, nspar, smul, lrank) = (
+            cfg.kv_from_start,
+            cfg.n_sparsity,
+            cfg.sparsity_mul,
+            cfg.laurel_rank,
+        );
+        let inv_sqrt2 = 1.0f32 / 2.0f32.sqrt();
+        let elsz = if self.kv_f16 { 2 } else { 4 };
+        let cells = |n: usize| n.div_ceil(256) as u32;
+
+        // --- helper closures (mirror decode_step) ---
+        let ff = |n: &str| {
+            self.f32w
+                .get(n)
+                .unwrap_or_else(|| panic!("g3n: missing f32 {n}"))
+                .ptr
+        };
+        let f32g = |wname: &str, x: *mut c_void, y: *mut c_void, in_dim: usize, out_dim: usize| {
+            self.launch(
+                "f32_gemv",
+                out_dim as u32,
+                32,
+                0,
+                Args::new().ptr(ff(wname)).ptr(x).ptr(y).i(in_dim as i32).i(out_dim as i32),
+            );
+        };
+        let rms = |x: *mut c_void, w: *mut c_void, y: *mut c_void, dim: usize, rows: usize| {
+            self.launch(
+                "rmsnorm",
+                rows as u32,
+                256,
+                0,
+                Args::new().ptr(x).ptr(w).ptr(y).i(dim as i32).i(1).f(eps),
+            );
+        };
+        let vadd = |h: *mut c_void, x: *mut c_void, n: usize| {
+            self.launch("vec_add", cells(n), 256, 0, Args::new().ptr(h).ptr(x).i(n as i32));
+        };
+        let addscale = |a: *mut c_void, b: *mut c_void, o: *mut c_void, n: usize, sc: f32| {
+            self.launch("g3n_addscale", cells(n), 256, 0, Args::new().ptr(a).ptr(b).ptr(o).i(n as i32).f(sc));
+        };
+        let quantize = |src: *mut c_void, in_dim: usize| {
+            self.launch(
+                "xquant",
+                (in_dim / 32) as u32,
+                32,
+                0,
+                Args::new().ptr(src).ptr(s.xq_lo.ptr).ptr(s.xq_hi.ptr).ptr(s.xq_d.ptr).ptr(s.xq_sum.ptr).i(in_dim as i32),
+            );
+        };
+        let q4dp = |w: &ResQ4, y: *mut c_void| {
+            self.launch(
+                "q4_gemv_dp",
+                (w.out_dim.div_ceil(8)) as u32,
+                256,
+                0,
+                Args::new().ptr(w.scales.ptr).ptr(w.quants.ptr).ptr(s.xq_lo.ptr).ptr(s.xq_hi.ptr).ptr(s.xq_d.ptr).ptr(s.xq_sum.ptr).ptr(y).i(w.in_dim as i32).i(w.out_dim as i32),
+            );
+        };
+        let q41dp = |w: &ResQ41, y: *mut c_void| {
+            self.launch(
+                "q4_1_gemv_dp",
+                (w.out_dim.div_ceil(8)) as u32,
+                256,
+                0,
+                Args::new().ptr(w.scales.ptr).ptr(w.mins.ptr).ptr(w.quants.ptr).ptr(s.xq_lo.ptr).ptr(s.xq_hi.ptr).ptr(s.xq_d.ptr).ptr(s.xq_sum.ptr).ptr(y).i(w.in_dim as i32).i(w.out_dim as i32),
+            );
+        };
+        // GEMM by GGUF tensor name (Q4_0 / Q4_1 / Q6_K), device->device.
+        let mmdev = |name: &str, x: *mut c_void, in_dim: usize, y: *mut c_void| {
+            if let Some(w) = self.q4.get(name) {
+                quantize(x, in_dim);
+                q4dp(w, y);
+            } else if let Some(w) = self.q41.get(name) {
+                quantize(x, in_dim);
+                q41dp(w, y);
+            } else if let Some(w) = self.q6.get(name) {
+                self.launch(
+                    "q6_gemv",
+                    w.out_dim.div_ceil(16) as u32,
+                    256,
+                    0,
+                    Args::new().ptr(w.scales.ptr).ptr(w.ql.ptr).ptr(w.qh.ptr).ptr(x).ptr(y).i(w.in_dim as i32).i(w.out_dim as i32),
+                );
+            } else {
+                panic!("g3n: missing GEMM weight {name}");
+            }
+        };
+        let hp = |b: usize| unsafe { (s.h.ptr as *mut f32).add(b * hidden) as *mut c_void };
+        let predp = |b: usize| unsafe { (s.pred.ptr as *mut f32).add(b * hidden) as *mut c_void };
+
+        // ---- setup ----
+        s.x0.upload(x0).ok()?;
+        s.pe.upload(pe).ok()?;
+        self.gpu.upload_at(&s.h, 0, x0).ok()?; // h[stream0] = x0
+        // per_layer_model_proj·x0 → proj ; rmsnorm per ea-slice (scale-invariant, skip 1/sqrt(hidden))
+        mmdev("per_layer_model_proj.weight", s.x0.ptr, hidden, s.proj.ptr);
+        self.launch(
+            "rmsnorm",
+            nl as u32,
+            256,
+            0,
+            Args::new().ptr(s.proj.ptr).ptr(ff("per_layer_proj_norm.weight")).ptr(s.inp_per_layer.ptr).i(ea as i32).i(1).f(eps),
+        );
+        addscale(s.inp_per_layer.ptr, s.pe.ptr, s.inp_per_layer.ptr, ea * nl, inv_sqrt2);
+        // AltUp init: streams 1..3 = magnitude-matched altup_proj·x0
+        for i in 0..3 {
+            f32g(&format!("altup_proj.{i}"), s.x0.ptr, hp(i + 1), hidden, hidden);
+            self.launch("g3n_magmatch", 1, 256, 0, Args::new().ptr(s.x0.ptr).ptr(hp(i + 1)).i(hidden as i32));
+        }
+
+        for il in 0..nl {
+            let lc = |n: &str| format!("blk.{il}.{n}");
+            let swa = (il + 1) % 5 != 0;
+            let rope_base = if swa { cfg.rope_local } else { cfg.rope_global };
+            let own_kv = il < kvfrom;
+
+            // AltUp predict
+            let modal = |x: *mut c_void| {
+                rms(x, ff(&lc("altup_router_norm.weight")), s.rn.ptr, hidden, 1);
+                f32g(&lc("altup_router.weight"), s.rn.ptr, s.modal.ptr, hidden, 4);
+                self.launch("g3n_tanhscale", 1, 4, 0, Args::new().ptr(s.modal.ptr).i(4).f(1.0 / hidden as f32));
+            };
+            modal(hp(0));
+            f32g(&lc("altup_predict_coef.weight"), s.modal.ptr, s.coef.ptr, 4, 16);
+            self.launch("g3n_predict", cells(4 * hidden), 256, 0, Args::new().ptr(s.h.ptr).ptr(s.coef.ptr).ptr(s.pred.ptr).i(hidden as i32));
+
+            // attention on predicted active stream
+            rms(predp(0), ff(&lc("attn_norm.weight")), s.cur.ptr, hidden, 1);
+            // laurel branch: rmsnorm(laurel_r·laurel_l·cur) + cur
+            f32g(&lc("laurel_l.weight"), s.cur.ptr, s.lo.ptr, hidden, lrank);
+            f32g(&lc("laurel_r.weight"), s.lo.ptr, s.t_hid.ptr, lrank, hidden);
+            rms(s.t_hid.ptr, ff(&lc("laurel_post_norm.weight")), s.laurel.ptr, hidden, 1);
+            vadd(s.laurel.ptr, s.cur.ptr, hidden);
+
+            mmdev(&lc("attn_q.weight"), s.cur.ptr, hidden, s.q.ptr);
+            let koff = pos * kvd * elsz;
+            if own_kv {
+                mmdev(&lc("attn_k.weight"), s.cur.ptr, hidden, s.k.ptr);
+                mmdev(&lc("attn_v.weight"), s.cur.ptr, hidden, s.v.ptr);
+            }
+            let (kdst, vdst) = if own_kv {
+                (
+                    unsafe { (s.k_cache[il].ptr as *mut u8).add(koff) as *mut c_void },
+                    unsafe { (s.v_cache[il].ptr as *mut u8).add(koff) as *mut c_void },
+                )
+            } else {
+                (s.k.ptr, s.v.ptr)
+            };
+            // qkv_post: per-head q/k norm + rope + V rms(no weight) + KV append.
+            // grid = nh (q only) for shared layers, nh+nkv for own layers.
+            let grid = if own_kv { (nh + nkv) as u32 } else { nh as u32 };
+            self.launch(
+                "qkv_post",
+                grid,
+                256,
+                0,
+                Args::new()
+                    .ptr(s.q.ptr)
+                    .ptr(s.k.ptr)
+                    .ptr(s.v.ptr)
+                    .ptr(ff(&lc("attn_q_norm.weight")))
+                    .ptr(ff(&lc("attn_k_norm.weight")))
+                    .ptr(s.ones.ptr)
+                    .ptr(s.q.ptr)
+                    .ptr(kdst)
+                    .ptr(vdst)
+                    .i(hd as i32)
+                    .i(nh as i32)
+                    .i(nkv as i32)
+                    .i(pos as i32)
+                    .f(rope_base)
+                    .f(eps)
+                    .i(1) // norm_v: V rms-normed (no weight)
+                    .i(if self.kv_f16 { 1 } else { 0 })
+                    .i(1) // qk_norm
+                    .i(1), // do_rope
+            );
+            // SDPA against the source layer's cache (own = self; shared = 18/19)
+            let src = if own_kv {
+                il
+            } else if swa {
+                kvfrom - 2
+            } else {
+                kvfrom - 1
+            };
+            let full_len = pos + 1;
+            let win = if swa && cfg.n_swa > 0 { cfg.n_swa } else { usize::MAX };
+            let ws = full_len.saturating_sub(win);
+            let len = (full_len - ws) as i32;
+            let so = ws * kvd * elsz;
+            let kbase = unsafe { (s.k_cache[src].ptr as *mut u8).add(so) as *mut c_void };
+            let vbase = unsafe { (s.v_cache[src].ptr as *mut u8).add(so) as *mut c_void };
+            self.launch(
+                "sdpa",
+                nh as u32,
+                256,
+                0,
+                Args::new().ptr(s.q.ptr).ptr(kbase).ptr(vbase).ptr(s.attn.ptr).i(hd as i32).i(len).i(groups as i32).i(nkv as i32).f(1.0).i(if self.kv_f16 { 1 } else { 0 }),
+            );
+            // output proj → t_hid; pa = rmsnorm(ao,post_attn)+active_pred
+            mmdev(&lc("attn_output.weight"), s.attn.ptr, qd, s.t_hid.ptr);
+            rms(s.t_hid.ptr, ff(&lc("post_attention_norm.weight")), s.pa.ptr, hidden, 1);
+            vadd(s.pa.ptr, predp(0), hidden);
+            addscale(s.pa.ptr, s.laurel.ptr, s.attn_laurel.ptr, hidden, inv_sqrt2);
+
+            // FFN (reuse cur as fn_in, pa as ff temp)
+            let nff = cfg.ffn[il];
+            rms(s.attn_laurel.ptr, ff(&lc("ffn_norm.weight")), s.cur.ptr, hidden, 1);
+            mmdev(&lc("ffn_gate.weight"), s.cur.ptr, hidden, s.gate.ptr);
+            mmdev(&lc("ffn_up.weight"), s.cur.ptr, hidden, s.up.ptr);
+            if il < nspar {
+                self.launch("g3n_gtopk", 1, 256, 0, Args::new().ptr(s.gate.ptr).i(nff as i32).f(smul));
+            }
+            // gelu(gate)*up → packed Q8 for the down GEMV
+            self.launch(
+                "geglu_xquant",
+                (nff / 32) as u32,
+                32,
+                0,
+                Args::new().ptr(s.gate.ptr).ptr(s.up.ptr).ptr(s.xq_lo.ptr).ptr(s.xq_hi.ptr).ptr(s.xq_d.ptr).ptr(s.xq_sum.ptr).i(nff as i32),
+            );
+            if let Some(w) = self.q4.get(&lc("ffn_down.weight")) {
+                q4dp(w, s.t_hid.ptr);
+            } else if let Some(w) = self.q41.get(&lc("ffn_down.weight")) {
+                q41dp(w, s.t_hid.ptr);
+            } else {
+                panic!("g3n: ffn_down not Q4");
+            }
+            rms(s.t_hid.ptr, ff(&lc("post_ffw_norm.weight")), s.afg.ptr, hidden, 1);
+            vadd(s.afg.ptr, s.attn_laurel.ptr, hidden);
+
+            // AltUp correct → write into h directly
+            modal(s.afg.ptr);
+            f32g(&lc("altup_correct_coef.weight"), s.modal.ptr, s.cc.ptr, 4, 4);
+            self.launch("g3n_addone", 1, 4, 0, Args::new().ptr(s.cc.ptr).i(4));
+            self.launch("g3n_correct", cells(4 * hidden), 256, 0, Args::new().ptr(s.pred.ptr).ptr(s.afg.ptr).ptr(s.cc.ptr).ptr(s.h.ptr).i(hidden as i32).i(0));
+
+            // PLE first_prediction: fp = corrected[act]*correct_scale; g=gelu(inp_gate·fp)*inp_per_layer;
+            // pn = rmsnorm(per_layer_proj·g); streams 1..3 += pn
+            self.launch("g3n_mul", cells(hidden), 256, 0, Args::new().ptr(hp(0)).ptr(ff(&lc("altup_correct_scale.weight"))).ptr(s.t_hid.ptr).i(hidden as i32));
+            f32g(&lc("per_layer_inp_gate.weight"), s.t_hid.ptr, s.g.ptr, hidden, ea);
+            let ipl = unsafe { (s.inp_per_layer.ptr as *mut f32).add(il * ea) as *mut c_void };
+            self.launch("g3n_gelumul", cells(ea), 256, 0, Args::new().ptr(s.g.ptr).ptr(ipl).ptr(s.g.ptr).i(ea as i32));
+            f32g(&lc("per_layer_proj.weight"), s.g.ptr, s.t_hid.ptr, ea, hidden);
+            rms(s.t_hid.ptr, ff(&lc("per_layer_post_norm.weight")), s.pn.ptr, hidden, 1);
+            self.launch("g3n_add_streams123", cells(3 * hidden), 256, 0, Args::new().ptr(s.h.ptr).ptr(s.pn.ptr).i(hidden as i32));
+        }
+
+        // merge streams: merged = h[act] + Σ unembd_proj_i·h[i+1] (l2-matched); rmsnorm absorbs 1/4
+        self.launch("g3n_l2", 1, 256, 0, Args::new().ptr(hp(0)).ptr(s.tgt.ptr).i(hidden as i32));
+        self.gpu.zero(s.merged.ptr, hidden * 4).ok()?;
+        vadd(s.merged.ptr, hp(0), hidden);
+        for i in 0..3 {
+            f32g(&format!("altup_unembd_proj.{i}"), hp(i + 1), s.u.ptr, hidden, hidden);
+            self.launch("g3n_l2add", 1, 256, 0, Args::new().ptr(s.merged.ptr).ptr(s.u.ptr).ptr(s.tgt.ptr).i(hidden as i32));
+        }
+        rms(s.merged.ptr, ff("output_norm.weight"), s.xn.ptr, hidden, 1);
+        self.lm_head(s.xn.ptr, s.logits.ptr);
+        if self.want_argmax {
+            self.launch(
+                "argmax_f32",
+                1,
+                1024,
+                0,
+                Args::new().ptr(s.logits.ptr).i(cfg.vocab as i32).ptr(s.argmax_out.ptr).ptr(unsafe { (s.argmax_out.ptr as *mut f32).add(1) as *mut c_void }),
+            );
+            self.gpu.sync().ok()?;
+            let idx = s.argmax_out.download::<i32>(1).ok()?;
+            return Some(vec![idx[0] as f32]);
+        }
+        self.gpu.sync().ok()?;
+        s.logits.download::<f32>(cfg.vocab).ok()
     }
 
     fn configure_decode(&mut self, cfg: GpuDecodeConfig) -> bool {
