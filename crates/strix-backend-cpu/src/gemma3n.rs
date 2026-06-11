@@ -476,6 +476,11 @@ impl Gemma3nModel {
             for e in 0..hidden {
                 laurel_out[e] = ln[e] + cur[e];
             }
+            // bisection: STRIX_G3N_NOLAUREL makes laurel a pass-through (=cur), so
+            // attn_laurel = (attn_gated + cur)/sqrt2 — isolates the laurel branch.
+            if std::env::var("STRIX_G3N_NOLAUREL").is_ok() {
+                laurel_out.copy_from_slice(&cur);
+            }
 
             // Q always computed
             {
@@ -583,7 +588,7 @@ impl Gemma3nModel {
                 let (wu, tu, inu) = self.w(&b("ffn_up.weight"))?;
                 qmatmul(&mut up, &fn_in, wu, tu, inu);
             }
-            if il < cfg.n_sparsity {
+            if il < cfg.n_sparsity && std::env::var("STRIX_G3N_NOSPARSE").is_err() {
                 // gaussian_topk: cutoff = mean + mul*std(ddof=1); relu(x-cutoff)
                 let mean = gate.iter().sum::<f32>() / nff as f32;
                 let var =
