@@ -186,6 +186,45 @@ extern "C" __global__ void geglu_xquant(const float* __restrict__ gate, const fl
     xhi[blk * 4 + 3] = make_char4(qv[28], qv[29], qv[30], qv[31]);
 }
 
+// SwiGLU directly into Q8 blocks (llama-family: smollm3, qwen3). Identical
+// packed output to geglu_xquant but uses SiLU gate: out = (g*sigmoid(g)) * up.
+extern "C" __global__ void silu_xquant(const float* __restrict__ gate, const float* __restrict__ up,
+                                       char4* __restrict__ xlo, char4* __restrict__ xhi,
+                                       float* __restrict__ xd, int* __restrict__ xsum, int n) {
+    int blk = blockIdx.x, t = threadIdx.x, base = blk * 32;
+    signed char qv[32];
+    float vals[32];
+    float mx = 0.f;
+    #pragma unroll
+    for (int j = 0; j < 32; j++) {
+        int i = base + j;
+        float g = gate[i];
+        float v = (g / (1.f + __expf(-g))) * up[i];
+        vals[j] = v;
+        mx = fmaxf(mx, fabsf(v));
+    }
+    float sc = mx / 127.f;
+    float inv = sc > 0.f ? 1.f / sc : 0.f;
+    int sm = 0;
+    #pragma unroll
+    for (int j = 0; j < 32; j++) {
+        int qi = (int)rintf(vals[j] * inv);
+        qi = max(-127, min(127, qi));
+        qv[j] = (signed char)qi;
+        sm += qi;
+    }
+    xd[blk] = sc;
+    xsum[blk] = sm;
+    xlo[blk * 4 + 0] = make_char4(qv[0], qv[1], qv[2], qv[3]);
+    xlo[blk * 4 + 1] = make_char4(qv[4], qv[5], qv[6], qv[7]);
+    xlo[blk * 4 + 2] = make_char4(qv[8], qv[9], qv[10], qv[11]);
+    xlo[blk * 4 + 3] = make_char4(qv[12], qv[13], qv[14], qv[15]);
+    xhi[blk * 4 + 0] = make_char4(qv[16], qv[17], qv[18], qv[19]);
+    xhi[blk * 4 + 1] = make_char4(qv[20], qv[21], qv[22], qv[23]);
+    xhi[blk * 4 + 2] = make_char4(qv[24], qv[25], qv[26], qv[27]);
+    xhi[blk * 4 + 3] = make_char4(qv[28], qv[29], qv[30], qv[31]);
+}
+
 __device__ __forceinline__ void q4_gemv_dp_row(const unsigned short* __restrict__ scales,
                                                const uint4* __restrict__ quants,
                                                const char4* __restrict__ xlo, const char4* __restrict__ xhi,
@@ -242,6 +281,39 @@ extern "C" __global__ void q4_gemv_dp(const unsigned short* __restrict__ scales,
         }
         isum -= 8 * xsum[b];
         acc += dw * xd[b] * (float)isum;
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
+    if (lane == 0) y[row] = acc;
+}
+
+// Q4_1 GEMV via dp4a. Q4_1 block = scale d + min m, value = d*q + m (q in 0..15,
+// NO -8 centering). Per block: d*xd*dot(q,a) + m*xd*sum(a) = xd*(d*isum + m*xsum).
+// 8 rows / 256-thread block (one wave/row).
+extern "C" __global__ void q4_1_gemv_dp(const unsigned short* __restrict__ scales,
+                                        const unsigned short* __restrict__ mins,
+                                        const uint4* __restrict__ quants,
+                                        const char4* __restrict__ xlo, const char4* __restrict__ xhi,
+                                        const float* __restrict__ xd, const int* __restrict__ xsum,
+                                        float* __restrict__ y, int in_dim, int out_dim) {
+    int row = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= out_dim) return;
+    int nb = in_dim / 32, rb = row * nb;
+    float acc = 0.f;
+    for (int b = lane; b < nb; b += 32) {
+        int blk = rb + b;
+        float dw = h2f(scales[blk]), mw = h2f(mins[blk]);
+        uint4 v = quants[blk];
+        unsigned ws[4] = {v.x, v.y, v.z, v.w};
+        int isum = 0;
+        #pragma unroll
+        for (int g = 0; g < 4; g++) {
+            unsigned lo = ws[g] & 0x0f0f0f0fu, hi = (ws[g] >> 4) & 0x0f0f0f0fu;
+            char4 xl = xlo[b * 4 + g], xh = xhi[b * 4 + g];
+            int xli = *(int*)&xl, xhi_i = *(int*)&xh;
+            isum = __builtin_amdgcn_sudot4(true, (int)lo, true, xli, isum, false);
+            isum = __builtin_amdgcn_sudot4(true, (int)hi, true, xhi_i, isum, false);
+        }
+        acc += xd[b] * (dw * (float)isum + mw * (float)xsum[b]);
     }
     for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
     if (lane == 0) y[row] = acc;
@@ -1843,48 +1915,60 @@ extern "C" __global__ void rope(float* __restrict__ v, const float* __restrict__
 // - v: RMSNorm/no-weight or copy -> token-major V cache slot
 // This collapses q_norm + k_norm + v_norm/copy + q_rope + k_rope + K/V copies
 // from seven tiny launches into one launch per layer.
+// qk_norm: 1 = RMS-normalize q/k per head by qw/kw (gemma3, qwen3); 0 = skip
+//   (no per-head QK-norm: smollm3, vanilla llama) — rs=1, weights treated as 1.
+// do_rope: 1 = apply RoPE; 0 = identity (smollm3 NoPE layers).
 extern "C" __global__ void qkv_post(const float* __restrict__ q, const float* __restrict__ k,
                                     const float* __restrict__ v, const float* __restrict__ qw,
                                     const float* __restrict__ kw, const float* __restrict__ ff,
                                     float* __restrict__ qout, float* __restrict__ kdst,
                                     float* __restrict__ vdst, int hd, int n_heads, int n_kv,
-                                    int pos, float theta, float eps, int norm_v, int kvf16) {
+                                    int pos, float theta, float eps, int norm_v, int kvf16,
+                                    int qk_norm, int do_rope) {
     int b = blockIdx.x, t = threadIdx.x, half = hd / 2;
     __shared__ float red[256];
     if (b < n_heads) {
         int h = b, base = h * hd;
-        float ss = 0.f;
-        for (int i = t; i < hd; i += 256) { float x = q[base + i]; ss += x * x; }
-        red[t] = ss; __syncthreads();
-        for (int s = 128; s > 0; s >>= 1) { if (t < s) red[t] += red[t + s]; __syncthreads(); }
-        float rs = rsqrtf(red[0] / hd + eps);
+        float rs = 1.f;
+        if (qk_norm) {
+            float ss = 0.f;
+            for (int i = t; i < hd; i += 256) { float x = q[base + i]; ss += x * x; }
+            red[t] = ss; __syncthreads();
+            for (int s = 128; s > 0; s >>= 1) { if (t < s) red[t] += red[t + s]; __syncthreads(); }
+            rs = rsqrtf(red[0] / hd + eps);
+        }
         for (int j = t; j < half; j += 256) {
-            float inv = __powf(theta, -2.f * j / hd) / ff[j];
-            float ang = pos * inv, sn = sinf(ang), cs = cosf(ang);
-            float x1 = q[base + j] * rs * qw[j];
-            float x2 = q[base + j + half] * rs * qw[j + half];
+            float sn = 0.f, cs = 1.f;
+            if (do_rope) { float inv = __powf(theta, -2.f * j / hd) / ff[j]; float ang = pos * inv; sn = sinf(ang); cs = cosf(ang); }
+            float wj = qk_norm ? qw[j] : 1.f, wjh = qk_norm ? qw[j + half] : 1.f;
+            float x1 = q[base + j] * rs * wj;
+            float x2 = q[base + j + half] * rs * wjh;
             qout[base + j] = x1 * cs - x2 * sn;
             qout[base + j + half] = x2 * cs + x1 * sn;
         }
     } else {
         int h = b - n_heads, base = h * hd;
         if (h >= n_kv) return;
-        float ss = 0.f;
-        for (int i = t; i < hd; i += 256) { float x = k[base + i]; ss += x * x; }
-        red[t] = ss; __syncthreads();
-        for (int s = 128; s > 0; s >>= 1) { if (t < s) red[t] += red[t + s]; __syncthreads(); }
-        float rs = rsqrtf(red[0] / hd + eps);
+        float rs = 1.f;
+        if (qk_norm) {
+            float ss = 0.f;
+            for (int i = t; i < hd; i += 256) { float x = k[base + i]; ss += x * x; }
+            red[t] = ss; __syncthreads();
+            for (int s = 128; s > 0; s >>= 1) { if (t < s) red[t] += red[t + s]; __syncthreads(); }
+            rs = rsqrtf(red[0] / hd + eps);
+        }
         for (int j = t; j < half; j += 256) {
-            float inv = __powf(theta, -2.f * j / hd) / ff[j];
-            float ang = pos * inv, sn = sinf(ang), cs = cosf(ang);
-            float x1 = k[base + j] * rs * kw[j];
-            float x2 = k[base + j + half] * rs * kw[j + half];
+            float sn = 0.f, cs = 1.f;
+            if (do_rope) { float inv = __powf(theta, -2.f * j / hd) / ff[j]; float ang = pos * inv; sn = sinf(ang); cs = cosf(ang); }
+            float wj = qk_norm ? kw[j] : 1.f, wjh = qk_norm ? kw[j + half] : 1.f;
+            float x1 = k[base + j] * rs * wj;
+            float x2 = k[base + j + half] * rs * wjh;
             float ka = x1 * cs - x2 * sn, kb2 = x2 * cs + x1 * sn;
             if (kvf16) { ((unsigned short*)kdst)[base + j] = f2h(ka); ((unsigned short*)kdst)[base + j + half] = f2h(kb2); }
             else { kdst[base + j] = ka; kdst[base + j + half] = kb2; }
         }
         if (norm_v) {
-            ss = 0.f;
+            float ss = 0.f;
             for (int i = t; i < hd; i += 256) { float x = v[base + i]; ss += x * x; }
             red[t] = ss; __syncthreads();
             for (int s = 128; s > 0; s >>= 1) { if (t < s) red[t] += red[t + s]; __syncthreads(); }

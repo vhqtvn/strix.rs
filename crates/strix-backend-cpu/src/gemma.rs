@@ -490,6 +490,7 @@ impl GemmaModel {
                 rope_theta: lc.rope_theta,
                 is_local: lc.is_local,
                 output_scale: nrm.output_scale,
+                no_rope: false,
             })
             .collect();
         let gpu_cfg = GpuDecodeConfig {
@@ -502,6 +503,9 @@ impl GemmaModel {
             final_softcap: self.cfg.final_softcap,
             attn_rsqrt: self.cfg.attn_rsqrt,
             norm_v: self.cfg.norm_v,
+            qk_norm: true,
+            post_norm: true,
+            act_gelu: true,
             n_swa: self.cfg.n_swa,
             max_seq: self.max_seq(),
             layers,

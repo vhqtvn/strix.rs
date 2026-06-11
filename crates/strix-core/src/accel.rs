@@ -29,6 +29,8 @@ pub struct GpuLayerCfg {
     pub is_local: bool,
     /// Per-layer residual-stream scalar (Gemma-4 `layer_output_scale`).
     pub output_scale: f32,
+    /// False = skip RoPE entirely for this layer (smollm3 NoPE every 4th layer).
+    pub no_rope: bool,
 }
 
 /// Whole-model config for the on-device decode forward.
@@ -45,6 +47,14 @@ pub struct GpuDecodeConfig {
     pub attn_rsqrt: bool,
     /// RMS-normalize V per head (no weight) before caching (gemma4).
     pub norm_v: bool,
+    /// Per-head QK-norm before RoPE (gemma3, qwen3). False = no QK-norm (smollm3).
+    pub qk_norm: bool,
+    /// Sandwich post-norm residuals — `h += rmsnorm(proj_out)·post_w` with
+    /// post_attention_norm/post_ffw_norm weights (gemma). False = plain residual
+    /// `h += proj_out` (llama-family: smollm3, qwen3).
+    pub post_norm: bool,
+    /// FFN activation: true = GeGLU (gemma), false = SwiGLU/SiLU (llama-family).
+    pub act_gelu: bool,
     /// Sliding-window size for local layers (0 = no windowing). Local-layer
     /// queries attend only the last `n_swa` keys.
     pub n_swa: usize,
@@ -62,6 +72,12 @@ pub trait WeightAccel: Send + Sync {
     /// Adopt a Q4_0 weight `[out_dim, in_dim]` (raw GGUF block bytes), uploading
     /// it resident. Returns `true` if adopted, `false` to leave it on the CPU.
     fn upload_q4_0(&mut self, key: &str, bytes: &[u8], in_dim: usize, out_dim: usize) -> bool;
+
+    /// Adopt a Q4_1 weight `[out_dim, in_dim]` (raw GGUF block bytes: per-block
+    /// scale+min). Default: not adopted — only backends with a Q4_1 GEMV override.
+    fn upload_q4_1(&mut self, _key: &str, _bytes: &[u8], _in_dim: usize, _out_dim: usize) -> bool {
+        false
+    }
 
     /// Adopt a Q6_K weight `[out_dim, in_dim]` (raw GGUF block bytes).
     fn upload_q6_k(&mut self, key: &str, bytes: &[u8], in_dim: usize, out_dim: usize) -> bool;

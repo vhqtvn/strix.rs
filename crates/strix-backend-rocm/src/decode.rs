@@ -16,6 +16,7 @@ use crate::hip::{Dbuf, HipGpu};
 
 const QK4_0: usize = 32;
 const Q4_0_BYTES: usize = 18;
+const Q4_1_BYTES: usize = 20; // [f16 d][f16 m][16 nibbles]
 const QK_K: usize = 256;
 const Q6_K_BYTES: usize = 210;
 const QK8_0: usize = 32;
@@ -69,6 +70,15 @@ pub fn prof_dump(tag: &str) {
 
 struct ResQ4 {
     scales: Dbuf,
+    quants: Dbuf,
+    in_dim: usize,
+    out_dim: usize,
+}
+
+// Q4_1 resident weight: scale d + min m per block (value = d*nibble + m).
+struct ResQ41 {
+    scales: Dbuf,
+    mins: Dbuf,
     quants: Dbuf,
     in_dim: usize,
     out_dim: usize,
@@ -326,6 +336,7 @@ pub struct RocmWeightAccel {
     gpu: HipGpu,
     funcs: HashMap<&'static str, hipFunction_t>,
     q4: HashMap<String, ResQ4>,
+    q41: HashMap<String, ResQ41>,
     q6: HashMap<String, ResQ6>,
     q8: HashMap<String, ResQ8>,
     f32w: HashMap<String, Dbuf>,
@@ -455,9 +466,11 @@ impl RocmWeightAccel {
             "q4_gemv_dp",
             "q4_gemv_dp2",
             "q4_gemv_dp3",
+            "q4_1_gemv_dp",
             "xquant",
             "rmsnorm_xquant",
             "geglu_xquant",
+            "silu_xquant",
             "q6_gemv",
             "q8_0_gemv",
             "q8_moe_gemv",
@@ -580,6 +593,7 @@ impl RocmWeightAccel {
             gpu,
             funcs,
             q4: HashMap::new(),
+            q41: HashMap::new(),
             q6: HashMap::new(),
             q8: HashMap::new(),
             f32w: HashMap::new(),
@@ -2430,6 +2444,47 @@ impl WeightAccel for RocmWeightAccel {
         true
     }
 
+    fn upload_q4_1(&mut self, key: &str, bytes: &[u8], in_dim: usize, out_dim: usize) -> bool {
+        if in_dim % QK4_0 != 0 {
+            return false;
+        }
+        let nblocks = in_dim / QK4_0;
+        let total = nblocks * out_dim;
+        if bytes.len() != total * Q4_1_BYTES {
+            return false;
+        }
+        let mut scales = vec![0u16; total];
+        let mut mins = vec![0u16; total];
+        let mut quants = vec![0u32; total * 4];
+        for (b, blk) in bytes.chunks_exact(Q4_1_BYTES).enumerate() {
+            scales[b] = u16::from_le_bytes([blk[0], blk[1]]);
+            mins[b] = u16::from_le_bytes([blk[2], blk[3]]);
+            let qs = &blk[4..20];
+            for w in 0..4 {
+                quants[b * 4 + w] =
+                    u32::from_le_bytes([qs[w * 4], qs[w * 4 + 1], qs[w * 4 + 2], qs[w * 4 + 3]]);
+            }
+        }
+        let (Ok(sb), Ok(mb), Ok(qb)) = (
+            self.gpu.upload_new(&scales),
+            self.gpu.upload_new(&mins),
+            self.gpu.upload_new(&quants),
+        ) else {
+            return false;
+        };
+        self.q41.insert(
+            key.to_string(),
+            ResQ41 {
+                scales: sb,
+                mins: mb,
+                quants: qb,
+                in_dim,
+                out_dim,
+            },
+        );
+        true
+    }
+
     fn upload_q6_k(&mut self, key: &str, bytes: &[u8], in_dim: usize, out_dim: usize) -> bool {
         if in_dim % QK_K != 0 {
             return false;
@@ -3692,7 +3747,7 @@ impl WeightAccel for RocmWeightAccel {
     }
 
     fn resident_count(&self) -> usize {
-        self.q4.len() + self.q6.len() + self.q8.len()
+        self.q4.len() + self.q41.len() + self.q6.len() + self.q8.len()
     }
 
     fn name(&self) -> &str {
@@ -3872,6 +3927,23 @@ impl WeightAccel for RocmWeightAccel {
                     .i(n as i32),
             );
         };
+        // SwiGLU variant (llama-family) — same packed Q8 output as geglu_quantize.
+        let silu_quantize = |gate: *mut c_void, up: *mut c_void, n: usize| {
+            self.launch(
+                "silu_xquant",
+                (n / 32) as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(gate)
+                    .ptr(up)
+                    .ptr(s.xq_lo.ptr)
+                    .ptr(s.xq_hi.ptr)
+                    .ptr(s.xq_d.ptr)
+                    .ptr(s.xq_sum.ptr)
+                    .i(n as i32),
+            );
+        };
         // Q4 GEMV via dp4a, reading the pre-quantized xq buffers. ~85-88 GB/s vs
         // ~74 for the f32 dequant path (the dominant lever to beat llama.cpp).
         let q4dp = |w: &ResQ4, y: *mut c_void| {
@@ -3948,6 +4020,26 @@ impl WeightAccel for RocmWeightAccel {
                     .i(w0.in_dim as i32),
             );
         };
+        // Q4_1 GEMV (ffn_down on early layers): value = d*nibble + m.
+        let q41dp = |w: &ResQ41, y: *mut c_void| {
+            self.launch(
+                "q4_1_gemv_dp",
+                (w.out_dim.div_ceil(8)) as u32,
+                256,
+                0,
+                Args::new()
+                    .ptr(w.scales.ptr)
+                    .ptr(w.mins.ptr)
+                    .ptr(w.quants.ptr)
+                    .ptr(s.xq_lo.ptr)
+                    .ptr(s.xq_hi.ptr)
+                    .ptr(s.xq_d.ptr)
+                    .ptr(s.xq_sum.ptr)
+                    .ptr(y)
+                    .i(w.in_dim as i32)
+                    .i(w.out_dim as i32),
+            );
+        };
 
         for l in 0..n_layers {
             let lc = &cfg.layers[l];
@@ -3993,8 +4085,18 @@ impl WeightAccel for RocmWeightAccel {
                     .ptr(s.q.ptr)
                     .ptr(s.k.ptr)
                     .ptr(v_src)
-                    .ptr(ff(&pf("attn_q_norm.weight")))
-                    .ptr(ff(&pf("attn_k_norm.weight")))
+                    // qk_norm=false (smollm3): no q/k norm weights — pass `ones` as a
+                    // never-dereferenced dummy (the kernel ignores qw/kw when qk_norm=0).
+                    .ptr(if cfg.qk_norm {
+                        ff(&pf("attn_q_norm.weight"))
+                    } else {
+                        s.ones.ptr
+                    })
+                    .ptr(if cfg.qk_norm {
+                        ff(&pf("attn_k_norm.weight"))
+                    } else {
+                        s.ones.ptr
+                    })
                     .ptr(ropef)
                     .ptr(s.q2.ptr)
                     .ptr(kdst)
@@ -4006,7 +4108,9 @@ impl WeightAccel for RocmWeightAccel {
                     .f(lc.rope_theta)
                     .f(eps)
                     .i(if cfg.norm_v { 1 } else { 0 })
-                    .i(if self.kv_f16 { 1 } else { 0 }),
+                    .i(if self.kv_f16 { 1 } else { 0 })
+                    .i(if cfg.qk_norm { 1 } else { 0 })
+                    .i(if lc.no_rope { 0 } else { 1 }),
             );
             // sdpa. Local (sliding-window) layers attend only the last `n_swa`
             // keys: offset the K/V base to the window start and shorten `len`
@@ -4090,20 +4194,31 @@ impl WeightAccel for RocmWeightAccel {
             let o = q4(&pf("attn_output.weight"));
             quantize(s.attn.ptr, o.in_dim);
             q4dp(o, s.t_hidden.ptr);
-            // h = h + rmsnorm(t_hidden)*post_attn_w
-            self.launch(
-                "addnorm",
-                1,
-                256,
-                0,
-                Args::new()
-                    .ptr(s.h.ptr)
-                    .ptr(s.t_hidden.ptr)
-                    .ptr(ff(&pf("post_attention_norm.weight")))
-                    .i(hidden as i32)
-                    .f(eps)
-                    .f(1.0),
-            );
+            if cfg.post_norm {
+                // gemma sandwich: h = h + rmsnorm(t_hidden)*post_attn_w
+                self.launch(
+                    "addnorm",
+                    1,
+                    256,
+                    0,
+                    Args::new()
+                        .ptr(s.h.ptr)
+                        .ptr(s.t_hidden.ptr)
+                        .ptr(ff(&pf("post_attention_norm.weight")))
+                        .i(hidden as i32)
+                        .f(eps)
+                        .f(1.0),
+                );
+            } else {
+                // llama: plain residual h += t_hidden
+                self.launch(
+                    "vec_add",
+                    hidden.div_ceil(256) as u32,
+                    256,
+                    0,
+                    Args::new().ptr(s.h.ptr).ptr(s.t_hidden.ptr).i(hidden as i32),
+                );
+            }
             // ffn rmsnorm h->xn, then grid-parallel Q8 quantize (gate/up read xn)
             rmsnorm_quantize(s.h.ptr, ff(&pf("ffn_norm.weight")), hidden);
             q4dp2(
@@ -4112,24 +4227,51 @@ impl WeightAccel for RocmWeightAccel {
                 q4(&pf("ffn_up.weight")),
                 s.up.ptr,
             );
-            // GeGLU directly to Q8 for the down projection.
-            let down = q4(&pf("ffn_down.weight"));
-            geglu_quantize(s.gate.ptr, s.up.ptr, down.in_dim);
-            q4dp(down, s.t_hidden.ptr);
-            // h = (h + rmsnorm(t_hidden)*post_ffw_w) * output_scale
-            self.launch(
-                "addnorm",
-                1,
-                256,
-                0,
-                Args::new()
-                    .ptr(s.h.ptr)
-                    .ptr(s.t_hidden.ptr)
-                    .ptr(ff(&pf("post_ffw_norm.weight")))
-                    .i(hidden as i32)
-                    .f(eps)
-                    .f(lc.output_scale),
-            );
+            // gate activation × up, directly to Q8 for the down projection.
+            // ffn_down may be Q4_0 or Q4_1 (llama.cpp quantizes early layers' down
+            // as Q4_1) — dispatch to the matching GEMV.
+            let dn_name = pf("ffn_down.weight");
+            let down = self.q4.get(&dn_name);
+            let down1 = self.q41.get(&dn_name);
+            let down_in = down
+                .map(|w| w.in_dim)
+                .or_else(|| down1.map(|w| w.in_dim))
+                .unwrap_or_else(|| panic!("rocm: missing ffn_down {l}"));
+            if cfg.act_gelu {
+                geglu_quantize(s.gate.ptr, s.up.ptr, down_in);
+            } else {
+                silu_quantize(s.gate.ptr, s.up.ptr, down_in);
+            }
+            if let Some(w) = down {
+                q4dp(w, s.t_hidden.ptr);
+            } else {
+                q41dp(down1.unwrap(), s.t_hidden.ptr);
+            }
+            if cfg.post_norm {
+                // h = (h + rmsnorm(t_hidden)*post_ffw_w) * output_scale
+                self.launch(
+                    "addnorm",
+                    1,
+                    256,
+                    0,
+                    Args::new()
+                        .ptr(s.h.ptr)
+                        .ptr(s.t_hidden.ptr)
+                        .ptr(ff(&pf("post_ffw_norm.weight")))
+                        .i(hidden as i32)
+                        .f(eps)
+                        .f(lc.output_scale),
+                );
+            } else {
+                // llama: plain residual h += t_hidden
+                self.launch(
+                    "vec_add",
+                    hidden.div_ceil(256) as u32,
+                    256,
+                    0,
+                    Args::new().ptr(s.h.ptr).ptr(s.t_hidden.ptr).i(hidden as i32),
+                );
+            }
         }
 
         // final norm + lm_head (Q6_K target / Q4_0 draft) + softcap

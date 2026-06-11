@@ -8,7 +8,7 @@
 //! gpt2-BPE tokenizer → drive with raw token IDs via STRIX_QWEN_IDS.
 
 use rayon::prelude::*;
-use strix_core::accel::WeightAccel;
+use strix_core::accel::{GpuDecodeConfig, GpuLayerCfg, WeightAccel};
 use strix_core::backend::Decoder;
 use strix_core::error::{Result, StrixError};
 use strix_core::sampler::Logits;
@@ -165,6 +165,8 @@ pub struct Qwen3Model {
     pos: usize,
     max_seq: usize,
     accel: Option<Box<dyn WeightAccel>>,
+    /// True when the accelerator runs the whole forward on-device (Stage C).
+    gpu_decode: bool,
     #[cfg(feature = "npu")]
     npu: Option<crate::mellum_npu::Qwen3Npu>,
 }
@@ -215,6 +217,7 @@ impl Qwen3Model {
             pos: 0,
             max_seq,
             accel: None,
+            gpu_decode: false,
             #[cfg(feature = "npu")]
             npu: None,
         })
@@ -530,6 +533,7 @@ impl Qwen3Model {
             };
             let ok = match ty {
                 GgmlType::Q4_0 => accel.upload_q4_0(name, bytes, in_dim, out_dim),
+                GgmlType::Q4_1 => accel.upload_q4_1(name, bytes, in_dim, out_dim),
                 GgmlType::Q6K => accel.upload_q6_k(name, bytes, in_dim, out_dim),
                 GgmlType::Q8_0 => accel.upload_q8_0(name, bytes, in_dim, out_dim),
                 _ => false,
@@ -538,8 +542,74 @@ impl Qwen3Model {
                 n += 1;
             }
         }
+        // Stage C: upload the small f32 tensors (norms + per-head QK-norm) and
+        // describe the architecture so the accelerator runs the whole forward.
+        for (l, nrm) in self.norms.iter().enumerate() {
+            accel.upload_f32(&format!("blk.{l}.attn_norm.weight"), &nrm.attn_norm);
+            accel.upload_f32(&format!("blk.{l}.ffn_norm.weight"), &nrm.ffn_norm);
+            accel.upload_f32(&format!("blk.{l}.attn_q_norm.weight"), &nrm.q_norm);
+            accel.upload_f32(&format!("blk.{l}.attn_k_norm.weight"), &nrm.k_norm);
+        }
+        accel.upload_f32("output_norm.weight", &self.output_norm);
+        let layers = (0..self.cfg.n_layers)
+            .map(|_| GpuLayerCfg {
+                head_dim: self.cfg.head_dim,
+                n_kv: self.cfg.n_kv,
+                k_eq_v: false,
+                rope_theta: self.cfg.rope_base,
+                is_local: false,
+                output_scale: 1.0,
+                no_rope: false,
+            })
+            .collect();
+        let gpu_cfg = GpuDecodeConfig {
+            hidden: self.cfg.hidden,
+            n_heads: self.cfg.n_heads,
+            ffn: self.cfg.ffn,
+            vocab: self.cfg.vocab,
+            n_layers: self.cfg.n_layers,
+            eps: self.cfg.eps,
+            final_softcap: 0.0,
+            attn_rsqrt: true,
+            norm_v: false,
+            qk_norm: true,
+            post_norm: false,
+            act_gelu: false,
+            n_swa: 0,
+            max_seq: self.max_seq,
+            layers,
+        };
+        self.gpu_decode =
+            std::env::var("STRIX_GPU_HYBRID").is_err() && accel.configure_decode(gpu_cfg);
         self.accel = Some(accel);
         n
+    }
+
+    /// Embedding row for `token` (no scaling for qwen3).
+    fn embed(&self, token: u32) -> Result<Vec<f32>> {
+        let (eb, ety, ein, _) = self.w("token_embd.weight")?;
+        let bpr = (ein / ety.block_elems()) * ety.block_bytes();
+        let mut h = vec![0.0f32; self.cfg.hidden];
+        dequantize_into(ety, &eb[token as usize * bpr..token as usize * bpr + bpr], &mut h)
+            .map_err(|e| StrixError::invalid(format!("qwen3 embd: {e}")))?;
+        Ok(h)
+    }
+
+    /// On-device decode of one token: embed on CPU, run the whole forward + lm_head
+    /// on the accelerator (~1 submit). Appends to the device KV cache at `self.pos`.
+    fn gpu_decode_step(&mut self, token: u32) -> Result<Vec<f32>> {
+        if token as usize >= self.cfg.vocab {
+            return Err(StrixError::invalid("qwen3 gpu decode: token out of range"));
+        }
+        let h = self.embed(token)?;
+        let pos = self.pos;
+        let logits = self
+            .accel
+            .as_mut()
+            .and_then(|a| a.decode_step(&h, pos))
+            .ok_or_else(|| StrixError::invalid("qwen3 gpu decode_step failed"))?;
+        self.pos += 1;
+        Ok(logits)
     }
 
     fn w<'a>(&'a self, name: &str) -> Result<(&'a [u8], GgmlType, usize, usize)> {
@@ -682,6 +752,15 @@ impl Decoder for Qwen3Model {
         if self.npu.is_some() {
             return Ok(Logits::new(self.prefill_batch(input_tokens)?));
         }
+        // Stage C: run the prompt through the on-device forward token-by-token,
+        // populating the GPU KV cache. Last token's logits sample the first output.
+        if self.gpu_decode {
+            let mut last = Vec::new();
+            for &t in input_tokens {
+                last = self.gpu_decode_step(t)?;
+            }
+            return Ok(Logits::new(last));
+        }
         let mut last = Vec::new();
         for &t in input_tokens {
             last = self.forward(t)?;
@@ -689,6 +768,9 @@ impl Decoder for Qwen3Model {
         Ok(Logits::new(last))
     }
     fn decode_one(&mut self, token: u32) -> Result<Logits> {
+        if self.gpu_decode {
+            return Ok(Logits::new(self.gpu_decode_step(token)?));
+        }
         Ok(Logits::new(self.forward(token)?))
     }
     fn reset(&mut self) {
