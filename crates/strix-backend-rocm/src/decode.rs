@@ -3885,9 +3885,15 @@ impl WeightAccel for RocmWeightAccel {
             k_cache,
             v_cache,
         });
+        let gpu_prefill = cfg.gpu_prefill;
         self.cfg = Some(cfg);
+        // Only open the backend's own NPU-hybrid when it will run GPU prefill
+        // (gemma). Decode-only models (smollm3/qwen3) prefill on CPU/NPU externally
+        // and own the NPU themselves — opening a second NPU context here collides.
         #[cfg(feature = "npu")]
-        self.npu_init();
+        if gpu_prefill {
+            self.npu_init();
+        }
         true
     }
 

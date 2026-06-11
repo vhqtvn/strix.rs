@@ -55,6 +55,11 @@ pub struct GpuDecodeConfig {
     pub post_norm: bool,
     /// FFN activation: true = GeGLU (gemma), false = SwiGLU/SiLU (llama-family).
     pub act_gelu: bool,
+    /// True if this backend will also run PREFILL on the GPU (gemma's batched
+    /// `prefill`, incl. its own NPU-hybrid). False = decode-only: the model
+    /// prefills on CPU/NPU and seeds the device KV (smollm3, qwen3) — the backend
+    /// must NOT open its own NPU context (it would collide with the model's NPU).
+    pub gpu_prefill: bool,
     /// Sliding-window size for local layers (0 = no windowing). Local-layer
     /// queries attend only the last `n_swa` keys.
     pub n_swa: usize,

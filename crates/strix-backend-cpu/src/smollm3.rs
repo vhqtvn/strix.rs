@@ -315,6 +315,7 @@ impl SmolLm3Model {
             qk_norm: false,
             post_norm: false,
             act_gelu: false,
+            gpu_prefill: false,
             n_swa: 0,
             max_seq: self.max_seq,
             layers,

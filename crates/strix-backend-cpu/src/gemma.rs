@@ -506,6 +506,7 @@ impl GemmaModel {
             qk_norm: true,
             post_norm: true,
             act_gelu: true,
+            gpu_prefill: true,
             n_swa: self.cfg.n_swa,
             max_seq: self.max_seq(),
             layers,
