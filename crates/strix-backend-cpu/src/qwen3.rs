@@ -8,6 +8,7 @@
 //! gpt2-BPE tokenizer → drive with raw token IDs via STRIX_QWEN_IDS.
 
 use rayon::prelude::*;
+use strix_core::accel::WeightAccel;
 use strix_core::backend::Decoder;
 use strix_core::error::{Result, StrixError};
 use strix_core::sampler::Logits;
@@ -163,6 +164,7 @@ pub struct Qwen3Model {
     vc: Vec<Vec<f32>>,
     pos: usize,
     max_seq: usize,
+    accel: Option<Box<dyn WeightAccel>>,
 }
 
 impl Qwen3Model {
@@ -198,6 +200,7 @@ impl Qwen3Model {
             vc,
             pos: 0,
             max_seq,
+            accel: None,
         })
     }
 
@@ -205,17 +208,66 @@ impl Qwen3Model {
         self.max_seq
     }
 
-    fn w<'a>(&'a self, name: &str) -> Result<(&'a [u8], GgmlType, usize)> {
+    /// Upload the big projection weights (q/k/v/o, ffn gate/up/down, tied lm_head)
+    /// to the GPU accelerator. Per-token matmuls then run via `gemv`; norms, rope,
+    /// QK-norm and attention stay on the CPU. Returns the number of weights staged.
+    pub fn attach_accel(&mut self, mut accel: Box<dyn WeightAccel>) -> usize {
+        let mut names: Vec<String> = Vec::new();
+        for l in 0..self.cfg.n_layers {
+            for t in [
+                "attn_q",
+                "attn_k",
+                "attn_v",
+                "attn_output",
+                "ffn_gate",
+                "ffn_up",
+                "ffn_down",
+            ] {
+                names.push(format!("blk.{l}.{t}.weight"));
+            }
+        }
+        names.push("token_embd.weight".to_string());
+        let mut n = 0;
+        for name in &names {
+            let Ok((bytes, ty, in_dim, out_dim)) = self.w(name) else {
+                continue;
+            };
+            let ok = match ty {
+                GgmlType::Q4_0 => accel.upload_q4_0(name, bytes, in_dim, out_dim),
+                GgmlType::Q6K => accel.upload_q6_k(name, bytes, in_dim, out_dim),
+                GgmlType::Q8_0 => accel.upload_q8_0(name, bytes, in_dim, out_dim),
+                _ => false,
+            };
+            if ok {
+                n += 1;
+            }
+        }
+        self.accel = Some(accel);
+        n
+    }
+
+    fn w<'a>(&'a self, name: &str) -> Result<(&'a [u8], GgmlType, usize, usize)> {
         let t = self
             .gguf
             .tensors()
             .get(name)
             .ok_or_else(|| StrixError::invalid(format!("qwen3: missing tensor {name}")))?;
-        Ok((
-            self.gguf.tensor_bytes(name)?,
-            t.ggml_type,
-            t.dims[0] as usize,
-        ))
+        let in_dim = t.dims[0] as usize;
+        let out_dim = t.dims.get(1).copied().unwrap_or(1) as usize;
+        Ok((self.gguf.tensor_bytes(name)?, t.ggml_type, in_dim, out_dim))
+    }
+
+    /// Matmul by tensor name: GPU `gemv` if the weight is resident, else CPU dequant.
+    fn mm(&self, name: &str, x: &[f32]) -> Result<Vec<f32>> {
+        if let Some(a) = &self.accel {
+            if let Some(y) = a.gemv(name, x) {
+                return Ok(y);
+            }
+        }
+        let (bytes, ty, in_dim, out_dim) = self.w(name)?;
+        let mut y = vec![0.0f32; out_dim];
+        qmatmul(&mut y, x, bytes, ty, in_dim);
+        Ok(y)
     }
 
     fn forward(&mut self, token: u32) -> Result<Vec<f32>> {
@@ -227,7 +279,7 @@ impl Qwen3Model {
         let scale = 1.0 / (hd as f32).sqrt();
         let pos = self.pos;
 
-        let (eb, ety, ein) = self.w("token_embd.weight")?;
+        let (eb, ety, ein, _) = self.w("token_embd.weight")?;
         let bpr = (ein / ety.block_elems()) * ety.block_bytes();
         let mut h = vec![0.0f32; hidden];
         dequantize_into(
@@ -249,12 +301,9 @@ impl Qwen3Model {
         for il in 0..cfg.n_layers {
             let b = |s: &str| format!("blk.{il}.{s}");
             rmsnorm(&mut n, &h, &self.norms[il].attn_norm, cfg.eps);
-            let (wq, tq, inq) = self.w(&b("attn_q.weight"))?;
-            qmatmul(&mut q, &n, wq, tq, inq);
-            let (wk, tk, ink) = self.w(&b("attn_k.weight"))?;
-            qmatmul(&mut k, &n, wk, tk, ink);
-            let (wv, tv, inv) = self.w(&b("attn_v.weight"))?;
-            qmatmul(&mut v, &n, wv, tv, inv);
+            q = self.mm(&b("attn_q.weight"), &n)?;
+            k = self.mm(&b("attn_k.weight"), &n)?;
+            v = self.mm(&b("attn_v.weight"), &n)?;
 
             // per-head QK-norm (over head_dim) THEN rope
             for hh in 0..nh {
@@ -298,23 +347,19 @@ impl Qwen3Model {
                 }
             });
 
-            let (wo, to, ino) = self.w(&b("attn_output.weight"))?;
-            qmatmul(&mut o, &attn, wo, to, ino);
+            o = self.mm(&b("attn_output.weight"), &attn)?;
             for i in 0..hidden {
                 h[i] += o[i];
             }
 
             rmsnorm(&mut n, &h, &self.norms[il].ffn_norm, cfg.eps);
-            let (wg, tg, ing) = self.w(&b("ffn_gate.weight"))?;
-            qmatmul(&mut gate, &n, wg, tg, ing);
-            let (wu, tu, inu) = self.w(&b("ffn_up.weight"))?;
-            qmatmul(&mut up, &n, wu, tu, inu);
+            gate = self.mm(&b("ffn_gate.weight"), &n)?;
+            up = self.mm(&b("ffn_up.weight"), &n)?;
             for i in 0..cfg.ffn {
                 let g = gate[i];
                 gate[i] = (g / (1.0 + (-g).exp())) * up[i];
             }
-            let (wd, td, ind) = self.w(&b("ffn_down.weight"))?;
-            qmatmul(&mut o, &gate, wd, td, ind);
+            o = self.mm(&b("ffn_down.weight"), &gate)?;
             for i in 0..hidden {
                 h[i] += o[i];
             }
@@ -326,9 +371,7 @@ impl Qwen3Model {
         } else {
             "token_embd.weight"
         };
-        let (hw, ht, hin) = self.w(head_name)?;
-        let mut logits = vec![0.0f32; cfg.vocab];
-        qmatmul(&mut logits, &n, hw, ht, hin);
+        let logits = self.mm(head_name, &n)?;
         self.pos += 1;
         Ok(logits)
     }

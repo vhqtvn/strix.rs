@@ -355,8 +355,9 @@ fn run_gemma3n(gguf: GgufFile, prompt: &str, max_tokens: usize) -> Result<()> {
     Ok(())
 }
 
-/// Qwen3-4B dense (qwen3): CPU-only greedy. gpt2-BPE → raw IDs via STRIX_QWEN_IDS.
-fn run_qwen3(gguf: GgufFile, prompt: &str, max_tokens: usize) -> Result<()> {
+/// Qwen3-4B dense (qwen3): greedy. gpt2-BPE → raw IDs via STRIX_QWEN_IDS.
+/// --gpu offloads the big projection matmuls to the ROCm accelerator (STRIX_ROCM=1).
+fn run_qwen3(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Result<()> {
     use strix_backend_cpu::qwen3::{Qwen3Cfg, Qwen3Model};
     use strix_core::backend::Decoder;
 
@@ -380,6 +381,20 @@ fn run_qwen3(gguf: GgufFile, prompt: &str, max_tokens: usize) -> Result<()> {
         load.elapsed().as_secs_f64(),
         prompt_ids.len()
     );
+    if gpu {
+        match build_weight_accel() {
+            Some(accel) => {
+                let name = accel.name().to_string();
+                let t = Instant::now();
+                let n = model.attach_accel(accel);
+                eprintln!(
+                    "[qwen3] {n} weights resident on {name} ({:.1}s)",
+                    t.elapsed().as_secs_f64()
+                );
+            }
+            None => eprintln!("[qwen3] --gpu: no accel (build --features rocm + STRIX_ROCM=1)"),
+        }
+    }
     let sampler = GreedySampler;
     let pf = Instant::now();
     let logits = model.prefill(&prompt_ids).context("qwen3 prefill")?;
@@ -607,7 +622,7 @@ fn run_gguf(path: &Path, prompt: &str, max_tokens: usize, chat: bool, gpu: bool)
         return run_smollm3(gguf, prompt, max_tokens);
     }
     if arch == "qwen3" {
-        return run_qwen3(gguf, prompt, max_tokens);
+        return run_qwen3(gguf, prompt, max_tokens, gpu);
     }
     if arch == "gemma3n" {
         return run_gemma3n(gguf, prompt, max_tokens);
