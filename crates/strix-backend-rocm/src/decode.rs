@@ -119,6 +119,66 @@ struct ResMoe {
     eff: usize,
 }
 
+/// Like pack_q4 but applies a per-128-chunk normalized Walsh-Hadamard along the
+/// in-dim of each output row BEFORE int4 quant (incoherence: spreads outliers).
+/// `nb` blocks per row (in_dim = nb*32, must be multiple of 4 → 128/chunk).
+fn pack_q4_had(scales: &[f32], quants: &[i8], nb: usize) -> (Vec<f32>, Vec<u8>) {
+    assert!(nb % 4 == 0);
+    let nrow = scales.len() / nb;
+    let mut s4 = vec![0.0f32; scales.len()];
+    let mut q4 = vec![0u8; scales.len() * 16];
+    let inv_sqrt = 1.0f32 / (128.0f32).sqrt();
+    let mut buf = vec![0.0f32; 128];
+    for r in 0..nrow {
+        for ch in 0..(nb / 4) {
+            // dequant 128 vals of this chunk
+            for j in 0..128 {
+                let b = r * nb + ch * 4 + j / 32;
+                buf[j] = scales[b] * quants[b * 32 + (j % 32)] as f32;
+            }
+            // in-place H128 (Walsh, hierarchical), normalized
+            let mut step = 1;
+            while step < 128 {
+                let mut i = 0;
+                while i < 128 {
+                    for k in 0..step {
+                        let a = buf[i + k];
+                        let bb = buf[i + k + step];
+                        buf[i + k] = a + bb;
+                        buf[i + k + step] = a - bb;
+                    }
+                    i += step * 2;
+                }
+                step <<= 1;
+            }
+            for v in buf.iter_mut() {
+                *v *= inv_sqrt;
+            }
+            // requant the 4 int4 blocks of this chunk
+            for blk in 0..4 {
+                let b = r * nb + ch * 4 + blk;
+                let seg = &buf[blk * 32..blk * 32 + 32];
+                let amax = seg.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                if amax == 0.0 {
+                    s4[b] = 0.0;
+                    for j in 0..16 {
+                        q4[b * 16 + j] = 0x88;
+                    }
+                    continue;
+                }
+                s4[b] = amax / 7.0;
+                let qinv = 7.0 / amax;
+                for j in 0..16 {
+                    let lo = ((seg[2 * j] * qinv).round() as i32).clamp(-7, 7) + 8;
+                    let hi = ((seg[2 * j + 1] * qinv).round() as i32).clamp(-7, 7) + 8;
+                    q4[b * 16 + j] = (lo as u8 & 0xF) | ((hi as u8 & 0xF) << 4);
+                }
+            }
+        }
+    }
+    (s4, q4)
+}
+
 /// Repack a whole 3D Q8_0 expert tensor into planar scales f32 + quants i8.
 /// Repack planar i8+f32scale to nibble-packed int4 (probe): 16 B/32-block + new scale.
 fn pack_q4(scales: &[f32], quants: &[i8]) -> (Vec<f32>, Vec<u8>) {
@@ -307,6 +367,7 @@ pub struct RocmWeightAccel {
     mlm_int8: bool,
     use_wmma: bool,
     use_q4: bool,
+    use_had: bool,
     mlm_graph: Option<*mut std::os::raw::c_void>,
     mlm_seq: usize,
     batch_x: Vec<Dbuf>,
@@ -410,6 +471,7 @@ impl RocmWeightAccel {
             "q8i_moe_down",
             "q4i_moe_gu",
             "q4i_moe_down",
+            "fht128",
             "q6_moe_gemv",
             "q8_gemm_rows",
             "q8_gemm_rows32",
@@ -550,7 +612,8 @@ impl RocmWeightAccel {
             mlm_xd,
             mlm_int8: std::env::var("STRIX_NO_INT8").is_err(),
             use_wmma: std::env::var("STRIX_NO_WMMA").is_err(),
-            use_q4: std::env::var("STRIX_Q4PROBE").is_ok(),
+            use_q4: std::env::var("STRIX_Q4PROBE").is_ok() || std::env::var("STRIX_HAD").is_ok(),
+            use_had: std::env::var("STRIX_HAD").is_ok(),
             mlm_graph: None,
             mlm_seq: 0,
             batch_x,
@@ -1653,6 +1716,27 @@ impl RocmWeightAccel {
     /// No-sync fused-MoE launches for layer `layer` over k routed experts
     /// (ids/wexp already uploaded): x → moe_out. Caller syncs.
     fn moe_launches(&self, m: &ResMoe, k: usize, x: *mut c_void) {
+        if self.use_had {
+            // rotate gu input (hidden) per-128 then re-quantize into mlm_xq/mlm_xd
+            self.launch(
+                "fht128",
+                (m.hidden / 128) as u32,
+                128,
+                0,
+                Args::new().ptr(x).ptr(self.pf_x.ptr).i(m.hidden as i32),
+            );
+            self.launch(
+                "xquant8",
+                (m.hidden / 32) as u32,
+                32,
+                0,
+                Args::new()
+                    .ptr(self.pf_x.ptr)
+                    .ptr(self.mlm_xq.ptr)
+                    .ptr(self.mlm_xd.ptr)
+                    .i((m.hidden / 32) as i32),
+            );
+        }
         if self.use_q4 {
             self.launch3(
                 "q4i_moe_gu",
@@ -1718,20 +1802,50 @@ impl RocmWeightAccel {
         }
         if self.mlm_int8 {
             let nb_act = k * m.eff / 32;
+            let n_act = k * m.eff;
             let xqm = unsafe { (self.mlm_xq.ptr as *mut u8).add(12288) as *mut c_void };
             let xdm = unsafe { (self.mlm_xd.ptr as *mut f32).add(768) as *mut c_void };
-            self.launch(
-                "silu_quant",
-                nb_act as u32,
-                32,
-                0,
-                Args::new()
-                    .ptr(self.moe_g.ptr)
-                    .ptr(self.moe_u.ptr)
-                    .ptr(xqm)
-                    .ptr(xdm)
-                    .i(nb_act as i32),
-            );
+            if self.use_had {
+                // silu·up → f32 act → per-128 rotate (within each expert's eff) → quant
+                self.launch(
+                    "moe_silu_mul",
+                    n_act.div_ceil(256) as u32,
+                    256,
+                    0,
+                    Args::new()
+                        .ptr(self.moe_g.ptr)
+                        .ptr(self.moe_u.ptr)
+                        .ptr(self.moe_act.ptr)
+                        .i(n_act as i32),
+                );
+                self.launch(
+                    "fht128",
+                    (n_act / 128) as u32,
+                    128,
+                    0,
+                    Args::new().ptr(self.moe_act.ptr).ptr(self.pf_a.ptr).i(n_act as i32),
+                );
+                self.launch(
+                    "xquant8",
+                    nb_act as u32,
+                    32,
+                    0,
+                    Args::new().ptr(self.pf_a.ptr).ptr(xqm).ptr(xdm).i(nb_act as i32),
+                );
+            } else {
+                self.launch(
+                    "silu_quant",
+                    nb_act as u32,
+                    32,
+                    0,
+                    Args::new()
+                        .ptr(self.moe_g.ptr)
+                        .ptr(self.moe_u.ptr)
+                        .ptr(xqm)
+                        .ptr(xdm)
+                        .i(nb_act as i32),
+                );
+            }
             if self.use_q4 {
                 self.launch2(
                     "q4i_moe_down",
@@ -2379,16 +2493,20 @@ impl WeightAccel for RocmWeightAccel {
             return false;
         };
         // int4 probe buffers (packed nibbles); 1-elem dummy if disabled.
-        let mk4 = |me: &Self, sc: &[f32], q: &[i8]| -> Option<(Dbuf, Dbuf)> {
+        let mk4 = |me: &Self, sc: &[f32], q: &[i8], inb: usize| -> Option<(Dbuf, Dbuf)> {
             if me.use_q4 {
-                let (s4, q4) = pack_q4(sc, q);
+                let (s4, q4) = if me.use_had {
+                    pack_q4_had(sc, q, inb)
+                } else {
+                    pack_q4(sc, q)
+                };
                 Some((me.gpu.upload_new(&s4).ok()?, me.gpu.upload_new(&q4).ok()?))
             } else {
                 Some((me.gpu.upload_new(&[0.0f32]).ok()?, me.gpu.upload_new(&[0u8]).ok()?))
             }
         };
         let (Some((gs4, gq4)), Some((us4, uq4)), Some((ds4, dq4))) =
-            (mk4(self, &gs, &gq), mk4(self, &us, &uq), mk4(self, &ds, &dq))
+            (mk4(self, &gs, &gq, hidden / 32), mk4(self, &us, &uq, hidden / 32), mk4(self, &ds, &dq, eff / 32))
         else {
             return false;
         };

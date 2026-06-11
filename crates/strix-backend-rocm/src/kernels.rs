@@ -1438,6 +1438,26 @@ extern "C" __global__ void q4i_moe_down(const float* __restrict__ ds, const unsi
     if (l == 0) y[(long long)kk * out_dim + row] = acc;
 }
 
+
+// In-place per-128-chunk normalized Walsh-Hadamard on f32. grid=(n/128), block=128.
+extern "C" __global__ void fht128(const float* __restrict__ x, float* __restrict__ y, int n) {
+    int chunk = blockIdx.x, t = threadIdx.x;
+    long long base = (long long)chunk * 128;
+    if (base + t >= n) return;
+    __shared__ float v[128];
+    v[t] = x[base + t];
+    __syncthreads();
+    for (int s = 1; s < 128; s <<= 1) {
+        float a = v[t];
+        float b = (t & s) ? v[t - s] : v[t + s];
+        float r = (t & s) ? (b - a) : (a + b);
+        __syncthreads();
+        v[t] = r;
+        __syncthreads();
+    }
+    y[base + t] = v[t] * 0.08838834764831845f;  // 1/sqrt(128)
+}
+
 // ===== Native-Q6_K MoE GEMV (NO repack: 210 B/superblock as in the GGUF) =====
 // w = full 3D expert tensor (native bytes), expert stride ebytes. Per superblock:
 // ql[128] qh[64] sc[16xi8] d[f16]. 8 waves/block, 32 lanes on the SAME superblock
