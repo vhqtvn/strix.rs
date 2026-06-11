@@ -6,16 +6,14 @@ use strix_backend_npu::{load_instr_bin, load_instr_txt, NpuGemm};
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let (xclbin, insts_path, k, n): (&str, &str, usize, usize) = (
-        &a[1],
-        &a[2],
-        a[3].parse().unwrap(),
-        a[4].parse().unwrap(),
-    );
+    let (xclbin, insts_path, k, n): (&str, &str, usize, usize) =
+        (&a[1], &a[2], a[3].parse().unwrap(), a[4].parse().unwrap());
     const M: usize = 256;
     let raw = std::fs::read(insts_path).expect("read insts");
     let insts = match std::str::from_utf8(&raw) {
-        Ok(t) => load_instr_txt(t).or_else(|_| load_instr_bin(&raw)).expect("insts"),
+        Ok(t) => load_instr_txt(t)
+            .or_else(|_| load_instr_bin(&raw))
+            .expect("insts"),
         Err(_) => load_instr_bin(&raw).expect("insts"),
     };
     println!("insts words: {}", insts.len());
@@ -43,8 +41,20 @@ fn main() {
             acc += av[mm * k + kk] as i64 * bv[kk * n + nn] as i64;
         }
         let got = out[mm * n + nn] as i64;
-        let m = if got == acc { "OK" } else { ok = false; "MISMATCH" };
+        let m = if got == acc {
+            "OK"
+        } else {
+            ok = false;
+            "MISMATCH"
+        };
         println!("C[{mm}][{nn}] npu={got} cpu={acc} {m}");
     }
-    println!("{}", if ok { "RESULT: PASS — NPU computes correctly" } else { "RESULT: FAIL" });
+    println!(
+        "{}",
+        if ok {
+            "RESULT: PASS — NPU computes correctly"
+        } else {
+            "RESULT: FAIL"
+        }
+    );
 }

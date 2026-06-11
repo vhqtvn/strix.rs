@@ -282,6 +282,26 @@ fn run_smollm3(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Re
         load.elapsed().as_secs_f64(),
         prompt_ids.len()
     );
+    #[cfg(feature = "npu-cpu")]
+    if std::env::var("STRIX_NPU").is_ok() {
+        let dir = std::env::var("STRIX_NPU_DIR").unwrap_or_else(|_| {
+            "external/mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/build"
+                .into()
+        });
+        match strix_backend_cpu::mellum_npu::SmolLm3Npu::open(&dir) {
+            Ok(npu) => {
+                let t = Instant::now();
+                match model.attach_npu(npu) {
+                    Ok(n) => eprintln!(
+                        "[smollm3] {n} projections staged on NPU ({:.1}s)",
+                        t.elapsed().as_secs_f64()
+                    ),
+                    Err(e) => eprintln!("[smollm3] NPU staging failed: {e}"),
+                }
+            }
+            Err(e) => eprintln!("[smollm3] NPU open failed ({dir}): {e}"),
+        }
+    }
     if gpu {
         match build_weight_accel() {
             Some(accel) => {

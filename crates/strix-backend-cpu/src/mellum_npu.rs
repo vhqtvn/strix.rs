@@ -214,3 +214,65 @@ impl QwenNpu {
         })
     }
 }
+
+/// SmolLM3-3B dense prefill shapes (Q4_0 weights, requantized to int8 at stage).
+/// q/o share 2048x2048; k/v share 2048x512; gate/up share 2048x11008; down 11008x2048.
+pub struct SmolLm3Npu {
+    pub qo: NpuShape,
+    pub kv: NpuShape,
+    pub gu: NpuShape,
+    pub down: NpuShape,
+}
+
+impl SmolLm3Npu {
+    pub fn open(dir: &str) -> Result<SmolLm3Npu> {
+        Ok(SmolLm3Npu {
+            qo: NpuShape::open(dir, 2048, 2048, 8)?,
+            kv: NpuShape::open(dir, 2048, 512, 8)?,
+            gu: NpuShape::open(dir, 2048, 11008, 4)?,
+            down: NpuShape::open(dir, 11008, 2048, 8)?,
+        })
+    }
+}
+
+/// Qwen3-4B dense prefill shapes.
+pub struct Qwen3Npu {
+    pub q: NpuShape,    // 2560 -> 4096
+    pub kv: NpuShape,   // 2560 -> 1024
+    pub o: NpuShape,    // 4096 -> 2560
+    pub gu: NpuShape,   // 2560 -> 9728
+    pub down: NpuShape, // 9728 -> 2560
+}
+
+impl Qwen3Npu {
+    pub fn open(dir: &str) -> Result<Qwen3Npu> {
+        Ok(Qwen3Npu {
+            q: NpuShape::open(dir, 2560, 4096, 8)?,
+            kv: NpuShape::open(dir, 2560, 1024, 8)?,
+            o: NpuShape::open(dir, 4096, 2560, 8)?,
+            gu: NpuShape::open(dir, 2560, 9728, 8)?,
+            down: NpuShape::open(dir, 9728, 2560, 8)?,
+        })
+    }
+}
+
+/// Gemma-3n-E4B dense prefill shapes (q/o + k/v reuse SmolLM3's 2048x2048 / 2048x512).
+pub struct Gemma3nNpu {
+    pub qo: NpuShape,     // 2048 -> 2048
+    pub kv: NpuShape,     // 2048 -> 512
+    pub gu: NpuShape,     // 2048 -> 16384
+    pub down: NpuShape,   // 16384 -> 2048
+    pub plproj: NpuShape, // 2048 -> 8960 (per_layer_model_proj)
+}
+
+impl Gemma3nNpu {
+    pub fn open(dir: &str) -> Result<Gemma3nNpu> {
+        Ok(Gemma3nNpu {
+            qo: NpuShape::open(dir, 2048, 2048, 8)?,
+            kv: NpuShape::open(dir, 2048, 512, 8)?,
+            gu: NpuShape::open(dir, 2048, 16384, 8)?,
+            down: NpuShape::open(dir, 16384, 2048, 8)?,
+            plproj: NpuShape::open(dir, 2048, 8960, 4)?,
+        })
+    }
+}

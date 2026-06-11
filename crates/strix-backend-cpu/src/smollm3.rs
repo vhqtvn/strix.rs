@@ -161,6 +161,8 @@ pub struct SmolLm3Model {
     pos: usize,
     max_seq: usize,
     accel: Option<Box<dyn WeightAccel>>,
+    #[cfg(feature = "npu")]
+    npu: Option<crate::mellum_npu::SmolLm3Npu>,
 }
 
 impl SmolLm3Model {
@@ -195,7 +197,36 @@ impl SmolLm3Model {
             pos: 0,
             max_seq,
             accel: None,
+            #[cfg(feature = "npu")]
+            npu: None,
         })
+    }
+
+    /// Stage the per-layer projection weights onto the NPU (int8, requantized from
+    /// Q4_0). Prefill GEMMs then run on the XDNA2 NPU (~2 W) via fixed M=256 xclbins.
+    #[cfg(feature = "npu")]
+    pub fn attach_npu(&mut self, mut npu: crate::mellum_npu::SmolLm3Npu) -> Result<usize> {
+        let mut n = 0;
+        for l in 0..self.cfg.n_layers {
+            let b = |s: &str| format!("blk.{l}.{s}");
+            let mut st =
+                |sh: &mut crate::mellum_npu::NpuShape, slot: u64, name: &str| -> Result<()> {
+                    let (bytes, ty, _, _) = self.w(name)?;
+                    sh.stage_q8(slot, bytes, ty)?;
+                    n += 1;
+                    Ok(())
+                };
+            let l = l as u64;
+            st(&mut npu.qo, 2 * l, &b("attn_q.weight"))?;
+            st(&mut npu.qo, 2 * l + 1, &b("attn_output.weight"))?;
+            st(&mut npu.kv, 2 * l, &b("attn_k.weight"))?;
+            st(&mut npu.kv, 2 * l + 1, &b("attn_v.weight"))?;
+            st(&mut npu.gu, 2 * l, &b("ffn_gate.weight"))?;
+            st(&mut npu.gu, 2 * l + 1, &b("ffn_up.weight"))?;
+            st(&mut npu.down, l, &b("ffn_down.weight"))?;
+        }
+        self.npu = Some(npu);
+        Ok(n)
     }
 
     pub fn max_seq(&self) -> usize {
@@ -377,12 +408,298 @@ impl SmolLm3Model {
         self.pos += 1;
         Ok(logits)
     }
+
+    /// Batched matmul out[m*n] = W·xs[m*k] by tensor name. Routes to the NPU shape
+    /// (chunked to M=256) when staged, else CPU dequant (weight read once per chunk).
+    #[allow(clippy::too_many_arguments)]
+    fn bmm(
+        &self,
+        name: &str,
+        which: NpuW,
+        xs: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        out: &mut [f32],
+    ) -> Result<()> {
+        #[cfg(feature = "npu")]
+        if let Some(npu) = &self.npu {
+            let (sh, slot) = match which {
+                NpuW::Q => (&npu.qo, 0),
+                NpuW::O => (&npu.qo, 1),
+                NpuW::K => (&npu.kv, 0),
+                NpuW::V => (&npu.kv, 1),
+                NpuW::Gate => (&npu.gu, 0),
+                NpuW::Up => (&npu.gu, 1),
+                NpuW::Down => (&npu.down, 2),
+            };
+            // slot encodes (layer, which): caller passes layer via `name`'s blk index.
+            let il: u64 = name
+                .split('.')
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let s = match which {
+                NpuW::Down => il,
+                _ => 2 * il + slot,
+            };
+            if sh.k == k && sh.n == n && sh.has(s) {
+                let mut okall = true;
+                for c in (0..m).step_by(crate::mellum_npu::M_NPU) {
+                    let mc = (m - c).min(crate::mellum_npu::M_NPU);
+                    if sh
+                        .gemm(
+                            s,
+                            &xs[c * k..(c + mc) * k],
+                            mc,
+                            &mut out[c * n..(c + mc) * n],
+                        )
+                        .is_err()
+                    {
+                        okall = false;
+                        break;
+                    }
+                }
+                if okall {
+                    return Ok(());
+                }
+            }
+        }
+        let _ = which;
+        // CPU fallback: dequant each weight row once, dot against all m activations.
+        let (bytes, ty, _, _) = self.w(name)?;
+        let bpr = (k / ty.block_elems()) * ty.block_bytes();
+        let mut rt = vec![0.0f32; n * m];
+        rt.par_chunks_mut(m).enumerate().for_each_init(
+            || vec![0.0f32; k],
+            |scratch, (o, orow)| {
+                dequantize_into(ty, &bytes[o * bpr..o * bpr + bpr], scratch).unwrap();
+                for t in 0..m {
+                    orow[t] = dot_f32(scratch, &xs[t * k..(t + 1) * k]);
+                }
+            },
+        );
+        for t in 0..m {
+            for o in 0..n {
+                out[t * n + o] = rt[o * m + t];
+            }
+        }
+        Ok(())
+    }
+
+    /// Batched prefill over all `m` prompt tokens: the 7 projection GEMMs/layer run
+    /// on the NPU (low power); norms/QK/RoPE/attention stay on the CPU. Populates the
+    /// KV cache and returns the last token's logits. Bit-compatible with `forward`'s
+    /// math (same dot order via dot_f32; attention identical).
+    fn prefill_batch(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let cfg = &self.cfg;
+        let (hidden, hd, nh, nkv) = (cfg.hidden, cfg.head_dim, cfg.n_heads, cfg.n_kv);
+        let (q_dim, kv_dim, groups, ffn) = (nh * hd, nkv * hd, nh / nkv, cfg.ffn);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let m = tokens.len();
+
+        // embeddings
+        let (eb, ety, ein, _) = self.w("token_embd.weight")?;
+        let bpr = (ein / ety.block_elems()) * ety.block_bytes();
+        let mut h = vec![0.0f32; m * hidden];
+        for (t, &tok) in tokens.iter().enumerate() {
+            dequantize_into(
+                ety,
+                &eb[tok as usize * bpr..tok as usize * bpr + bpr],
+                &mut h[t * hidden..(t + 1) * hidden],
+            )
+            .map_err(|e| StrixError::invalid(format!("smollm3 embd: {e}")))?;
+        }
+
+        let mut nrm = vec![0.0f32; m * hidden];
+        for il in 0..cfg.n_layers {
+            let bnm = |s: &str| format!("blk.{il}.{s}");
+            for t in 0..m {
+                rmsnorm(
+                    &mut nrm[t * hidden..(t + 1) * hidden],
+                    &h[t * hidden..(t + 1) * hidden],
+                    &self.norms[il].attn_norm,
+                    cfg.eps,
+                );
+            }
+            let mut q = vec![0.0f32; m * q_dim];
+            let mut k = vec![0.0f32; m * kv_dim];
+            let mut v = vec![0.0f32; m * kv_dim];
+            self.bmm(
+                &bnm("attn_q.weight"),
+                NpuW::Q,
+                &nrm,
+                m,
+                hidden,
+                q_dim,
+                &mut q,
+            )?;
+            self.bmm(
+                &bnm("attn_k.weight"),
+                NpuW::K,
+                &nrm,
+                m,
+                hidden,
+                kv_dim,
+                &mut k,
+            )?;
+            self.bmm(
+                &bnm("attn_v.weight"),
+                NpuW::V,
+                &nrm,
+                m,
+                hidden,
+                kv_dim,
+                &mut v,
+            )?;
+            let use_rope = (il + 1) % cfg.nope_step != 0;
+            for t in 0..m {
+                if use_rope {
+                    for hh in 0..nh {
+                        rope_neox(
+                            &mut q[t * q_dim + hh * hd..t * q_dim + hh * hd + hd],
+                            t,
+                            hd,
+                            cfg.rope_base,
+                        );
+                    }
+                    for kh in 0..nkv {
+                        rope_neox(
+                            &mut k[t * kv_dim + kh * hd..t * kv_dim + kh * hd + hd],
+                            t,
+                            hd,
+                            cfg.rope_base,
+                        );
+                    }
+                }
+            }
+            self.kc[il].extend_from_slice(&k);
+            self.vc[il].extend_from_slice(&v);
+            let kc = &self.kc[il];
+            let vc = &self.vc[il];
+            let mut attn = vec![0.0f32; m * q_dim];
+            attn.par_chunks_mut(q_dim)
+                .enumerate()
+                .for_each(|(t, arow)| {
+                    let len = t + 1; // causal: token t attends keys 0..=t
+                    for hh in 0..nh {
+                        let kvh = hh / groups;
+                        let qh = &q[t * q_dim + hh * hd..t * q_dim + hh * hd + hd];
+                        let mut sc = vec![0.0f32; len];
+                        for j in 0..len {
+                            let kk = &kc[(j * nkv + kvh) * hd..(j * nkv + kvh) * hd + hd];
+                            sc[j] = dot_f32(qh, kk) * scale;
+                        }
+                        let mx = sc.iter().cloned().fold(f32::MIN, f32::max);
+                        let mut sum = 0.0f32;
+                        for s in sc.iter_mut() {
+                            *s = (*s - mx).exp();
+                            sum += *s;
+                        }
+                        let inv = 1.0 / sum;
+                        let oh = &mut arow[hh * hd..hh * hd + hd];
+                        for d in 0..hd {
+                            let mut acc = 0.0f32;
+                            for j in 0..len {
+                                acc += sc[j] * vc[(j * nkv + kvh) * hd + d];
+                            }
+                            oh[d] = acc * inv;
+                        }
+                    }
+                });
+            let mut o = vec![0.0f32; m * hidden];
+            self.bmm(
+                &bnm("attn_output.weight"),
+                NpuW::O,
+                &attn,
+                m,
+                q_dim,
+                hidden,
+                &mut o,
+            )?;
+            for i in 0..m * hidden {
+                h[i] += o[i];
+            }
+            for t in 0..m {
+                rmsnorm(
+                    &mut nrm[t * hidden..(t + 1) * hidden],
+                    &h[t * hidden..(t + 1) * hidden],
+                    &self.norms[il].ffn_norm,
+                    cfg.eps,
+                );
+            }
+            let mut gate = vec![0.0f32; m * ffn];
+            let mut up = vec![0.0f32; m * ffn];
+            self.bmm(
+                &bnm("ffn_gate.weight"),
+                NpuW::Gate,
+                &nrm,
+                m,
+                hidden,
+                ffn,
+                &mut gate,
+            )?;
+            self.bmm(
+                &bnm("ffn_up.weight"),
+                NpuW::Up,
+                &nrm,
+                m,
+                hidden,
+                ffn,
+                &mut up,
+            )?;
+            for i in 0..m * ffn {
+                let g = gate[i];
+                gate[i] = (g / (1.0 + (-g).exp())) * up[i];
+            }
+            self.bmm(
+                &bnm("ffn_down.weight"),
+                NpuW::Down,
+                &gate,
+                m,
+                ffn,
+                hidden,
+                &mut o,
+            )?;
+            for i in 0..m * hidden {
+                h[i] += o[i];
+            }
+        }
+        self.pos = m;
+        // last token → logits
+        let last = &h[(m - 1) * hidden..m * hidden];
+        let mut nf = vec![0.0f32; hidden];
+        rmsnorm(&mut nf, last, &self.output_norm, cfg.eps);
+        let head_name = if self.gguf.tensors().contains_key("output.weight") {
+            "output.weight"
+        } else {
+            "token_embd.weight"
+        };
+        self.mm(head_name, &nf)
+    }
+}
+
+/// Selector for which projection a batched matmul targets (picks NPU shape+slot).
+#[derive(Clone, Copy)]
+enum NpuW {
+    Q,
+    O,
+    K,
+    V,
+    Gate,
+    Up,
+    Down,
 }
 
 impl Decoder for SmolLm3Model {
     fn prefill(&mut self, input_tokens: &[u32]) -> Result<Logits> {
         if input_tokens.is_empty() {
             return Err(StrixError::invalid("smollm3: empty prompt"));
+        }
+        // Batched prefill (NPU-routed when attached); else token-by-token.
+        #[cfg(feature = "npu")]
+        if self.npu.is_some() {
+            return Ok(Logits::new(self.prefill_batch(input_tokens)?));
         }
         let mut last = Vec::new();
         for &t in input_tokens {
