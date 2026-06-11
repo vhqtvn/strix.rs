@@ -4054,8 +4054,9 @@ impl WeightAccel for RocmWeightAccel {
         s.x0.upload(x0).ok()?;
         s.pe.upload(pe).ok()?;
         self.gpu.upload_at(&s.h, 0, x0).ok()?; // h[stream0] = x0
-        // per_layer_model_proj·x0 → proj ; rmsnorm per ea-slice (scale-invariant, skip 1/sqrt(hidden))
-        mmdev("per_layer_model_proj.weight", s.x0.ptr, hidden, s.proj.ptr);
+        // per_layer_model_proj·x0 → proj (F16 weight uploaded as f32) ; rmsnorm per
+        // ea-slice (scale-invariant, so the 1/sqrt(hidden) scale is skipped)
+        f32g("per_layer_model_proj.weight", s.x0.ptr, s.proj.ptr, hidden, ea * nl);
         self.launch(
             "rmsnorm",
             nl as u32,
@@ -4216,22 +4217,12 @@ impl WeightAccel for RocmWeightAccel {
             f32g(&format!("altup_unembd_proj.{i}"), hp(i + 1), s.u.ptr, hidden, hidden);
             self.launch("g3n_l2add", 1, 256, 0, Args::new().ptr(s.merged.ptr).ptr(s.u.ptr).ptr(s.tgt.ptr).i(hidden as i32));
         }
+        // Final norm only. lm_head stays on the CPU: gemma3n's token_embd is Q4_K
+        // (no GPU GEMV) and it's a one-shot 262k-vocab projection — the caller does
+        // it. So return the final normed hidden `[hidden]`, not logits.
         rms(s.merged.ptr, ff("output_norm.weight"), s.xn.ptr, hidden, 1);
-        self.lm_head(s.xn.ptr, s.logits.ptr);
-        if self.want_argmax {
-            self.launch(
-                "argmax_f32",
-                1,
-                1024,
-                0,
-                Args::new().ptr(s.logits.ptr).i(cfg.vocab as i32).ptr(s.argmax_out.ptr).ptr(unsafe { (s.argmax_out.ptr as *mut f32).add(1) as *mut c_void }),
-            );
-            self.gpu.sync().ok()?;
-            let idx = s.argmax_out.download::<i32>(1).ok()?;
-            return Some(vec![idx[0] as f32]);
-        }
         self.gpu.sync().ok()?;
-        s.logits.download::<f32>(cfg.vocab).ok()
+        s.xn.download::<f32>(hidden).ok()
     }
 
     fn configure_decode(&mut self, cfg: GpuDecodeConfig) -> bool {

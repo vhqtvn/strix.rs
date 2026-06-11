@@ -21,7 +21,7 @@
 //! SentencePiece here but driven by raw IDs (STRIX_QWEN_IDS) for bring-up.
 
 use rayon::prelude::*;
-use strix_core::accel::WeightAccel;
+use strix_core::accel::{G3nConfig, WeightAccel};
 use strix_core::backend::Decoder;
 use strix_core::error::{Result, StrixError};
 use strix_core::sampler::Logits;
@@ -254,6 +254,8 @@ pub struct Gemma3nModel {
     pos: usize,
     max_seq: usize,
     accel: Option<Box<dyn WeightAccel>>,
+    /// True when the accelerator runs the whole MatFormer forward on-device.
+    gpu_decode: bool,
     #[cfg(feature = "npu")]
     npu: Option<crate::mellum_npu::Gemma3nNpu>,
 }
@@ -333,6 +335,7 @@ impl Gemma3nModel {
             pos: 0,
             max_seq,
             accel: None,
+            gpu_decode: false,
             #[cfg(feature = "npu")]
             npu: None,
         })
@@ -450,6 +453,7 @@ impl Gemma3nModel {
             };
             let ok = match ty {
                 GgmlType::Q4_0 => accel.upload_q4_0(name, bytes, in_dim, out_dim),
+                GgmlType::Q4_1 => accel.upload_q4_1(name, bytes, in_dim, out_dim),
                 GgmlType::Q6K => accel.upload_q6_k(name, bytes, in_dim, out_dim),
                 GgmlType::Q8_0 => accel.upload_q8_0(name, bytes, in_dim, out_dim),
                 _ => false,
@@ -458,8 +462,116 @@ impl Gemma3nModel {
                 n += 1;
             }
         }
+        // Stage C (MatFormer resident decode): upload all the f32 AltUp/Laurel/PLE
+        // tensors + describe the arch so decode runs the whole forward on-device.
+        for (l, lay) in self.layers.iter().enumerate() {
+            let b = |s: &str| format!("blk.{l}.{s}");
+            accel.upload_f32(&b("attn_norm.weight"), &lay.attn_norm);
+            accel.upload_f32(&b("post_attention_norm.weight"), &lay.post_attn_norm);
+            accel.upload_f32(&b("ffn_norm.weight"), &lay.ffn_norm);
+            accel.upload_f32(&b("post_ffw_norm.weight"), &lay.post_ffw_norm);
+            accel.upload_f32(&b("attn_q_norm.weight"), &lay.q_norm);
+            accel.upload_f32(&b("attn_k_norm.weight"), &lay.k_norm);
+            accel.upload_f32(&b("laurel_l.weight"), &lay.laurel_l);
+            accel.upload_f32(&b("laurel_r.weight"), &lay.laurel_r);
+            accel.upload_f32(&b("laurel_post_norm.weight"), &lay.laurel_post_norm);
+            accel.upload_f32(&b("altup_correct_coef.weight"), &lay.altup_correct_coef);
+            accel.upload_f32(&b("altup_correct_scale.weight"), &lay.altup_correct_scale);
+            accel.upload_f32(&b("altup_predict_coef.weight"), &lay.altup_predict_coef);
+            accel.upload_f32(&b("altup_router.weight"), &lay.altup_router);
+            accel.upload_f32(&b("altup_router_norm.weight"), &lay.altup_router_norm);
+            accel.upload_f32(&b("per_layer_inp_gate.weight"), &lay.per_layer_inp_gate);
+            accel.upload_f32(&b("per_layer_proj.weight"), &lay.per_layer_proj);
+            accel.upload_f32(&b("per_layer_post_norm.weight"), &lay.per_layer_post_norm);
+        }
+        accel.upload_f32("output_norm.weight", &self.output_norm);
+        accel.upload_f32("per_layer_proj_norm.weight", &self.per_layer_proj_norm);
+        // per_layer_model_proj is F16 (not a Q-GEMM) — dequant to f32 for f32_gemv.
+        if let Ok(w) = self.gguf.dequant_tensor("per_layer_model_proj.weight") {
+            accel.upload_f32("per_layer_model_proj.weight", &w);
+        }
+        for (i, w) in self.altup_proj.iter().enumerate() {
+            accel.upload_f32(&format!("altup_proj.{i}"), w);
+        }
+        for (i, w) in self.altup_unembd_proj.iter().enumerate() {
+            accel.upload_f32(&format!("altup_unembd_proj.{i}"), w);
+        }
+        let cfg = &self.cfg;
+        let gcfg = G3nConfig {
+            hidden: cfg.hidden,
+            embd_altup: cfg.embd_altup,
+            n_heads: cfg.n_heads,
+            n_kv: cfg.n_kv,
+            head_dim: cfg.head_dim,
+            n_layers: cfg.n_layers,
+            vocab: cfg.vocab,
+            eps: cfg.eps,
+            rope_global: cfg.rope_global,
+            rope_local: cfg.rope_local,
+            n_swa: cfg.n_swa,
+            kv_from_start: cfg.kv_from_start,
+            n_sparsity: cfg.n_sparsity,
+            sparsity_mul: cfg.sparsity_mul,
+            laurel_rank: LAUREL_RANK,
+            max_seq: self.max_seq,
+            ffn: cfg.ffn.clone(),
+        };
+        self.gpu_decode =
+            std::env::var("STRIX_GPU_HYBRID").is_err() && accel.configure_decode_g3n(gcfg);
         self.accel = Some(accel);
         n
+    }
+
+    /// On-device MatFormer decode of one token: compute the two scaled embeddings
+    /// (base + per-layer) on the CPU, run the whole forward on the accelerator.
+    fn gpu_decode_step(&mut self, token: u32) -> Result<Vec<f32>> {
+        let (hidden, ea, nl) = (self.cfg.hidden, self.cfg.embd_altup, self.cfg.n_layers);
+        let mut x0 = vec![0.0f32; hidden];
+        self.embd_row("token_embd.weight", token as usize, hidden, &mut x0)?;
+        let es = (hidden as f32).sqrt();
+        for v in x0.iter_mut() {
+            *v *= es;
+        }
+        let mut pe = vec![0.0f32; ea * nl];
+        self.embd_row("per_layer_token_embd.weight", token as usize, ea * nl, &mut pe)?;
+        let ps = (ea as f32).sqrt();
+        for v in pe.iter_mut() {
+            *v *= ps;
+        }
+        let pos = self.pos;
+        // GPU forward returns the final normed hidden; lm_head (Q4_K token_embd) on CPU.
+        let nfinal = self
+            .accel
+            .as_mut()
+            .and_then(|a| a.decode_step_g3n(&x0, &pe, pos))
+            .ok_or_else(|| StrixError::invalid("gemma3n gpu decode_step_g3n failed"))?;
+        self.pos += 1;
+        let head_name = if self.gguf.tensors().contains_key("output.weight") {
+            "output.weight"
+        } else {
+            "token_embd.weight"
+        };
+        self.mm(head_name, &nfinal)
+    }
+
+    /// Seed the device KV (own layers 0..kv_from_start) from the CPU/NPU prefill.
+    fn seed_device_kv(&mut self) -> Result<()> {
+        let Some(mut accel) = self.accel.take() else {
+            return Ok(());
+        };
+        let mut ok = true;
+        for il in 0..self.cfg.kv_from_start.min(self.kc.len()) {
+            if !accel.seed_decode_kv_g3n(il, &self.kc[il], &self.vc[il]) {
+                ok = false;
+                break;
+            }
+        }
+        self.accel = Some(accel);
+        if ok {
+            Ok(())
+        } else {
+            Err(StrixError::invalid("gemma3n: device KV seed failed"))
+        }
     }
 
     fn w<'a>(&'a self, name: &str) -> Result<(&'a [u8], GgmlType, usize)> {
@@ -1191,6 +1303,14 @@ impl Decoder for Gemma3nModel {
         if input_tokens.is_empty() {
             return Err(StrixError::invalid("gemma3n: empty prompt"));
         }
+        // Stage C: prefill stays OFF the iGPU (sustained GPU load crashes this box —
+        // see never-gpu-prefill). prefill_batch's GEMMs run on CPU/NPU; then seed the
+        // device KV (own layers) so the on-device MatFormer decode can attend the prompt.
+        if self.gpu_decode {
+            let last = self.prefill_batch(input_tokens)?;
+            self.seed_device_kv()?;
+            return Ok(Logits::new(last));
+        }
         #[cfg(feature = "npu")]
         if self.npu.is_some() {
             return Ok(Logits::new(self.prefill_batch(input_tokens)?));
@@ -1202,6 +1322,9 @@ impl Decoder for Gemma3nModel {
         Ok(Logits::new(last))
     }
     fn decode_one(&mut self, token: u32) -> Result<Logits> {
+        if self.gpu_decode {
+            return Ok(Logits::new(self.gpu_decode_step(token)?));
+        }
         Ok(Logits::new(self.forward(token)?))
     }
     fn reset(&mut self) {
