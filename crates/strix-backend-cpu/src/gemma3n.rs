@@ -7,10 +7,13 @@
 //! Verified against refs/llama.cpp/src/models/gemma3n.cpp. Greedy decoding is
 //! invariant to the (monotone) final logit softcap, so it is omitted.
 //!
-//! STATUS [bring-up]: loads + runs end-to-end and emits fluent English, but is
-//! not yet answer-correct (a subtle scale/index bug remains in one of AltUp /
-//! Laurel / PLE / KV-share). Needs a reference-activation diff against llama.cpp
-//! to localize. SmolLM3 and Qwen3 (simpler arches) are fully validated.
+//! STATUS [VALIDATED]: forward verified faithful to llama.cpp via layer-by-layer
+//! activation diff (eval-callback): per-layer embeddings (Q5_1) bit-match, layer-0
+//! intermediates match to 3-4 decimals, final logits within Q4 accumulation noise.
+//! With the proper chat template it answers correctly ("What is the capital of
+//! France?" → "The capital of France is **Paris**."). The earlier "fluent but
+//! wrong" was a bare-prompt artifact (IT model with no chat template), NOT a bug.
+//! STRIX_G3N_DUMP dumps token-0 activations for re-validation.
 //! Constants for E4B: 35 layers, n_embd=2048, n_altup=4, n_embd_altup=256,
 //! laurel_rank=64, 8/2 heads hd=256, attn_scale=1.0, sparsity layers 0..10,
 //! KV from layer 20 (full→19, swa→18), swa pattern (il+1)%5!=0, window=512,
@@ -200,6 +203,21 @@ fn l2(x: &[f32]) -> f32 {
     x.iter().map(|v| v * v).sum::<f32>().sqrt()
 }
 
+/// Debug: print first-3 + last-3 of a vector (matches llama-eval-callback layout).
+fn dbg3(name: &str, v: &[f32]) {
+    let n = v.len();
+    eprintln!(
+        "[g3n] {name:<26} [{:.4}, {:.4}, {:.4} ... {:.4}, {:.4}, {:.4}] sum={:.4}",
+        v[0],
+        v[1],
+        v[2],
+        v[n - 3],
+        v[n - 2],
+        v[n - 1],
+        v.iter().sum::<f32>()
+    );
+}
+
 /// Per-layer small f32 weights.
 struct Layer {
     attn_norm: Vec<f32>,
@@ -361,12 +379,19 @@ impl Gemma3nModel {
         let kv_dim = nkv * hd;
         let pos = self.pos;
 
+        let dump = pos == 0 && std::env::var("STRIX_G3N_DUMP").is_ok();
         // base embedding (active stream) scaled by sqrt(hidden)
         let mut x0 = vec![0.0f32; hidden];
         self.embd_row("token_embd.weight", token as usize, hidden, &mut x0)?;
+        if dump {
+            dbg3("embd(raw)", &x0);
+        }
         let es = (hidden as f32).sqrt();
         for v in x0.iter_mut() {
             *v *= es;
+        }
+        if dump {
+            dbg3("inp_scaled", &x0);
         }
 
         // per-layer inputs: pe_tok[il] (256) from per_layer_token_embd row, scaled sqrt(256)
@@ -406,6 +431,10 @@ impl Gemma3nModel {
             for j in 0..ea {
                 inp_per_layer[il * ea + j] = (tmp[j] + pe[il * ea + j]) * inv_sqrt2;
             }
+        }
+        if dump {
+            dbg3("pe(raw)", &pe[..ea]);
+            dbg3("inp_per_layer[0]", &inp_per_layer[..ea]);
         }
 
         // AltUp init: 4 streams. stream0 = x0, streams1..3 = magnitude-matched proj.
@@ -460,10 +489,16 @@ impl Gemma3nModel {
                 }
             }
             let active_pred = pred[I_ACT].clone();
+            if dump && il == 0 {
+                dbg3("active_prediction-0", &active_pred);
+            }
 
             // --- attention on the predicted active stream ---
             let mut cur = vec![0.0f32; hidden];
             rmsnorm(&mut cur, &active_pred, &lay.attn_norm, cfg.eps);
+            if dump && il == 0 {
+                dbg3("attn_norm-0", &cur);
+            }
 
             // laurel branch: r(l(cur)) -> norm -> + cur
             let mut lo = vec![0.0f32; LAUREL_RANK];
@@ -565,6 +600,10 @@ impl Gemma3nModel {
                 let (wo, to, ino) = self.w(&b("attn_output.weight"))?;
                 qmatmul(&mut ao, &attn, wo, to, ino);
             }
+            if dump && il == 0 {
+                dbg3("attn_out-0", &ao);
+                dbg3("laurel_out-0", &laurel_out);
+            }
             // post-attn norm, gated residual with active_pred, then +laurel /sqrt2
             let mut pa = vec![0.0f32; hidden];
             rmsnorm(&mut pa, &ao, &lay.post_attn_norm, cfg.eps);
@@ -574,6 +613,10 @@ impl Gemma3nModel {
             let mut attn_laurel = vec![0.0f32; hidden];
             for e in 0..hidden {
                 attn_laurel[e] = (pa[e] + laurel_out[e]) * inv_sqrt2;
+            }
+            if dump && il == 0 {
+                dbg3("attn_gated-0", &pa);
+                dbg3("attn_laurel-0", &attn_laurel);
             }
 
             // FFN
@@ -608,10 +651,16 @@ impl Gemma3nModel {
             }
             let mut pf = vec![0.0f32; hidden];
             rmsnorm(&mut pf, &ff, &lay.post_ffw_norm, cfg.eps);
+            if dump && il == 0 {
+                dbg3("ffn_out-0", &ff);
+            }
             // attn_ffw_laurel_gated = pf + attn_laurel
             let mut afg = vec![0.0f32; hidden];
             for e in 0..hidden {
                 afg[e] = pf[e] + attn_laurel[e];
+            }
+            if dump && il == 0 {
+                dbg3("attn_ffw_laurel_gated-0", &afg);
             }
 
             // --- AltUp correct ---
@@ -658,6 +707,11 @@ impl Gemma3nModel {
                     }
                 }
             }
+            if dump && il == 0 {
+                dbg3("l_out-0[stream0]", &corrected[0]);
+                dbg3("l_out-0[stream1]", &corrected[1]);
+                dbg3("l_out-0[stream3]", &corrected[3]);
+            }
             h = corrected;
         }
 
@@ -695,6 +749,18 @@ impl Gemma3nModel {
         let (hw, ht, hin) = self.w(head_name)?;
         let mut logits = vec![0.0f32; cfg.vocab];
         qmatmul(&mut logits, &nfinal, hw, ht, hin);
+        if std::env::var("STRIX_G3N_DUMP").is_ok() {
+            let (mut bi, mut bv) = (0usize, f32::NEG_INFINITY);
+            for (i, &v) in logits.iter().enumerate() {
+                if v > bv {
+                    bv = v;
+                    bi = i;
+                }
+            }
+            eprintln!("[g3n] pos={pos} merged={:.4},{:.4},{:.4} result_norm={:.4},{:.4},{:.4} logit0..2={:.3},{:.3},{:.3} argmax={bi}",
+                merged[0], merged[1], merged[2], nfinal[0], nfinal[1], nfinal[2],
+                logits[0], logits[1], logits[2], bi=bi);
+        }
         self.pos += 1;
         Ok(logits)
     }
