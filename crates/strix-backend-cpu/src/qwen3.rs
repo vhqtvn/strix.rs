@@ -211,6 +211,12 @@ impl Qwen3Model {
     /// Upload the big projection weights (q/k/v/o, ffn gate/up/down, tied lm_head)
     /// to the GPU accelerator. Per-token matmuls then run via `gemv`; norms, rope,
     /// QK-norm and attention stay on the CPU. Returns the number of weights staged.
+    ///
+    /// NOTE [measured 2026-06-11]: this is LOSSLESS but gives ~0 decode speedup
+    /// (CPU 2.32 == GPU 2.32 tok/s) — each `gemv` does upload+launch+full-sync+
+    /// download, and ~250 round-trips/token are sync-bound (the pre-hipGraph mellum
+    /// wall). Real acceleration needs a resident on-device forward (h stays on GPU,
+    /// all ops queued, hipGraph replay) — a dense analog of `mlm_token_graph`.
     pub fn attach_accel(&mut self, mut accel: Box<dyn WeightAccel>) -> usize {
         let mut names: Vec<String> = Vec::new();
         for l in 0..self.cfg.n_layers {
