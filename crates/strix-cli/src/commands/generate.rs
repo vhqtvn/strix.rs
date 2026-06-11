@@ -257,6 +257,55 @@ fn run_qwen35(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Res
 /// JetBrains Mellum2 (`mellum`) CPU-reference path. Sparse-MoE transformer with
 /// hybrid sliding/full attention + per-layer-type RoPE (YaRN on full layers). Takes
 /// raw token IDs via `STRIX_QWEN_IDS` (or the prompt) — same tokenizer caveat as Qwen.
+/// SmolLM3-3B (smollm3): CPU-only greedy. gpt2-BPE → raw IDs via STRIX_QWEN_IDS.
+fn run_smollm3(gguf: GgufFile, prompt: &str, max_tokens: usize) -> Result<()> {
+    use strix_backend_cpu::smollm3::{SmolLm3Cfg, SmolLm3Model};
+    use strix_core::backend::Decoder;
+
+    let cfg = SmolLm3Cfg::from_gguf(&gguf).context("parse smollm3 config")?;
+    eprintln!("[smollm3] {}", cfg.report());
+    let id_src = std::env::var("STRIX_QWEN_IDS").unwrap_or_else(|_| prompt.to_string());
+    let prompt_ids: Vec<u32> = id_src
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<u32>())
+        .collect::<std::result::Result<_, _>>()
+        .context("smollm3 needs raw token IDs (gpt2-BPE). Set STRIX_QWEN_IDS=\"1,2,3\".")?;
+    if prompt_ids.is_empty() {
+        anyhow::bail!("smollm3: no token IDs given (set STRIX_QWEN_IDS)");
+    }
+    let max_seq = prompt_ids.len() + max_tokens + 16;
+    let load = Instant::now();
+    let mut model = SmolLm3Model::from_gguf(gguf, max_seq).context("build smollm3")?;
+    eprintln!(
+        "[smollm3] built in {:.1}s, prompt = {} tokens",
+        load.elapsed().as_secs_f64(),
+        prompt_ids.len()
+    );
+    let sampler = GreedySampler;
+    let pf = Instant::now();
+    let logits = model.prefill(&prompt_ids).context("smollm3 prefill")?;
+    let pf_s = pf.elapsed().as_secs_f64();
+    let mut next = sampler.sample(&logits)?;
+    let mut generated = vec![next];
+    let dec = Instant::now();
+    for _ in 1..max_tokens {
+        let l = model.decode_one(next).context("smollm3 decode")?;
+        next = sampler.sample(&l)?;
+        generated.push(next);
+    }
+    let dec_s = dec.elapsed().as_secs_f64();
+    let ids: Vec<String> = generated.iter().map(|t| t.to_string()).collect();
+    println!("[smollm3] generated token IDs: {}", ids.join(","));
+    eprintln!(
+        "[smollm3] prefill {:.1} tok/s ({} tok in {pf_s:.2}s) | decode {:.2} tok/s",
+        prompt_ids.len() as f64 / pf_s,
+        prompt_ids.len(),
+        (max_tokens.saturating_sub(1)) as f64 / dec_s.max(1e-9),
+    );
+    Ok(())
+}
+
 fn run_mellum(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Result<()> {
     use strix_backend_cpu::mellum::{MellumCfg, MellumModel};
 
@@ -455,6 +504,9 @@ fn run_gguf(path: &Path, prompt: &str, max_tokens: usize, chat: bool, gpu: bool)
     }
     if arch == "mellum" {
         return run_mellum(gguf, prompt, max_tokens, gpu);
+    }
+    if arch == "smollm3" {
+        return run_smollm3(gguf, prompt, max_tokens);
     }
 
     let tokenizer = StrixTokenizer::from_gguf(&gguf).context("build tokenizer from gguf")?;

@@ -1324,7 +1324,10 @@ impl RocmWeightAccel {
         let kb = self.pf_a.ptr;
         let vb = self.pf_b.ptr;
         for (w, y, od) in [(&wq, qb, q_dim), (&wk, kb, kv_dim), (&wv, vb, kv_dim)] {
-            self.q8i_gemm(od as u32, m as u32, Args::new()
+            self.q8i_gemm(
+                od as u32,
+                m as u32,
+                Args::new()
                     .ptr(w.scales.ptr)
                     .ptr(w.quants.ptr)
                     .ptr(xq)
@@ -1342,7 +1345,13 @@ impl RocmWeightAccel {
                 m as u32,
                 256,
                 0,
-                Args::new().ptr(y).ptr(w).ptr(y).i(hd as i32).i((n * hd) as i32).i(m as i32),
+                Args::new()
+                    .ptr(y)
+                    .ptr(w)
+                    .ptr(y)
+                    .i(hd as i32)
+                    .i((n * hd) as i32)
+                    .i(m as i32),
             );
         }
         let half = hd / 2;
@@ -1369,7 +1378,12 @@ impl RocmWeightAccel {
                 m as u32,
                 256,
                 0,
-                Args::new().ptr(src).ptr(cache.ptr).i(base as i32).i(kv_dim as i32).i(m as i32),
+                Args::new()
+                    .ptr(src)
+                    .ptr(cache.ptr)
+                    .i(base as i32)
+                    .i(kv_dim as i32)
+                    .i(m as i32),
             );
         }
         let attn = self.pf_dy.ptr;
@@ -1396,7 +1410,10 @@ impl RocmWeightAccel {
         );
         let (aq, ad) = self.pf_quant(attn, m, q_dim);
         let outp = unsafe { (self.pf_y.ptr as *mut f32).add(m * q_dim) } as *mut c_void;
-        self.q8i_gemm(hidden as u32, m as u32, Args::new()
+        self.q8i_gemm(
+            hidden as u32,
+            m as u32,
+            Args::new()
                 .ptr(wo.scales.ptr)
                 .ptr(wo.quants.ptr)
                 .ptr(aq)
@@ -1413,14 +1430,19 @@ impl RocmWeightAccel {
                 (m * hidden).div_ceil(256) as u32,
                 256,
                 0,
-                Args::new().ptr(self.pf_h.ptr).ptr(outp).i((m * hidden) as i32),
+                Args::new()
+                    .ptr(self.pf_h.ptr)
+                    .ptr(outp)
+                    .i((m * hidden) as i32),
             );
         }
         self.gpu.sync().ok()?;
         let out = if resident {
             Vec::new()
         } else {
-            self.pf_y.download_at::<f32>(m * q_dim * 4, m * hidden).ok()?
+            self.pf_y
+                .download_at::<f32>(m * q_dim * 4, m * hidden)
+                .ok()?
         };
         let kk = self.pf_a.download::<f32>(m * kv_dim).ok()?;
         let vv = self.pf_b.download::<f32>(m * kv_dim).ok()?;
@@ -1479,7 +1501,10 @@ impl RocmWeightAccel {
                 let sp = unsafe { (sb.ptr as *mut f32).add(eoff) } as *mut c_void;
                 let qp = unsafe { (qb2.ptr as *mut i8).add(eoff * 32) } as *mut c_void;
                 let yp = unsafe { (y as *mut f32).add(off * eff) } as *mut c_void;
-                self.q8i_gemm(eff as u32, me as u32, Args::new()
+                self.q8i_gemm(
+                    eff as u32,
+                    me as u32,
+                    Args::new()
                         .ptr(sp)
                         .ptr(qp)
                         .ptr(sq)
@@ -1514,7 +1539,10 @@ impl RocmWeightAccel {
             let sq = unsafe { (aq as *mut u8).add(off * eff) } as *mut c_void;
             let sd = unsafe { (ad as *mut f32).add(off * enb) } as *mut c_void;
             let yp = unsafe { (self.pf_dy.ptr as *mut f32).add(off * hidden) } as *mut c_void;
-            self.q8i_gemm(hidden as u32, me as u32, Args::new()
+            self.q8i_gemm(
+                hidden as u32,
+                me as u32,
+                Args::new()
                     .ptr(sp)
                     .ptr(qp)
                     .ptr(sq)
@@ -1555,13 +1583,30 @@ impl RocmWeightAccel {
         Some(())
     }
 
-
     /// int8 GEMM launch: WMMA tile (default) or LDS2 fallback (STRIX_NO_WMMA).
     fn q8i_gemm(&self, out: u32, m: u32, args: Args) {
         if self.use_wmma {
-            if m >= 24 { self.launch2("q8w_gemm32", out.div_ceil(128), m.div_ceil(32), 256, 0, args); } else { self.launch2("q8w_gemm", out.div_ceil(128), m.div_ceil(16), 256, 0, args); }
+            if m >= 24 {
+                self.launch2(
+                    "q8w_gemm32",
+                    out.div_ceil(128),
+                    m.div_ceil(32),
+                    256,
+                    0,
+                    args,
+                );
+            } else {
+                self.launch2("q8w_gemm", out.div_ceil(128), m.div_ceil(16), 256, 0, args);
+            }
         } else {
-            self.launch2("q8i_gemm_lds2", out.div_ceil(16), m.div_ceil(32), 256, 0, args);
+            self.launch2(
+                "q8i_gemm_lds2",
+                out.div_ceil(16),
+                m.div_ceil(32),
+                256,
+                0,
+                args,
+            );
         }
     }
 
@@ -1828,14 +1873,21 @@ impl RocmWeightAccel {
                     (n_act / 128) as u32,
                     128,
                     0,
-                    Args::new().ptr(self.moe_act.ptr).ptr(self.pf_a.ptr).i(n_act as i32),
+                    Args::new()
+                        .ptr(self.moe_act.ptr)
+                        .ptr(self.pf_a.ptr)
+                        .i(n_act as i32),
                 );
                 self.launch(
                     "xquant8",
                     nb_act as u32,
                     32,
                     0,
-                    Args::new().ptr(self.pf_a.ptr).ptr(xqm).ptr(xdm).i(nb_act as i32),
+                    Args::new()
+                        .ptr(self.pf_a.ptr)
+                        .ptr(xqm)
+                        .ptr(xdm)
+                        .i(nb_act as i32),
                 );
             } else {
                 self.launch(
@@ -2507,12 +2559,17 @@ impl WeightAccel for RocmWeightAccel {
                 };
                 Some((me.gpu.upload_new(&s4).ok()?, me.gpu.upload_new(&q4).ok()?))
             } else {
-                Some((me.gpu.upload_new(&[0.0f32]).ok()?, me.gpu.upload_new(&[0u8]).ok()?))
+                Some((
+                    me.gpu.upload_new(&[0.0f32]).ok()?,
+                    me.gpu.upload_new(&[0u8]).ok()?,
+                ))
             }
         };
-        let (Some((gs4, gq4)), Some((us4, uq4)), Some((ds4, dq4))) =
-            (mk4(self, &gs, &gq, hidden / 32), mk4(self, &us, &uq, hidden / 32), mk4(self, &ds, &dq, eff / 32))
-        else {
+        let (Some((gs4, gq4)), Some((us4, uq4)), Some((ds4, dq4))) = (
+            mk4(self, &gs, &gq, hidden / 32),
+            mk4(self, &us, &uq, hidden / 32),
+            mk4(self, &ds, &dq, eff / 32),
+        ) else {
             return false;
         };
         self.moe.insert(
@@ -2999,7 +3056,10 @@ impl WeightAccel for RocmWeightAccel {
         self.pf_x.upload(xs).ok()?;
         if self.mlm_int8 {
             let (xq, xd) = self.pf_quant(self.pf_x.ptr, m, e.in_dim);
-            self.q8i_gemm(e.out_dim as u32, m as u32, Args::new()
+            self.q8i_gemm(
+                e.out_dim as u32,
+                m as u32,
+                Args::new()
                     .ptr(e.scales.ptr)
                     .ptr(e.quants.ptr)
                     .ptr(xq)
@@ -3198,7 +3258,10 @@ impl WeightAccel for RocmWeightAccel {
             let sp = unsafe { (sb.ptr as *mut f32).add(eoff) } as *mut c_void;
             let qp = unsafe { (qb2.ptr as *mut i8).add(eoff * 32) } as *mut c_void;
             if let Some((xq, xd)) = xqd {
-                self.q8i_gemm(mo.eff as u32, m as u32, Args::new()
+                self.q8i_gemm(
+                    mo.eff as u32,
+                    m as u32,
+                    Args::new()
                         .ptr(sp)
                         .ptr(qp)
                         .ptr(xq)
@@ -3245,7 +3308,10 @@ impl WeightAccel for RocmWeightAccel {
         let dyp = unsafe { (self.pf_dy.ptr as *mut f32).add(dy_off * mo.hidden) } as *mut c_void;
         if self.mlm_int8 {
             let (xq, xd) = self.pf_quant(self.pf_b.ptr, m, mo.eff);
-            self.q8i_gemm(mo.hidden as u32, m as u32, Args::new()
+            self.q8i_gemm(
+                mo.hidden as u32,
+                m as u32,
+                Args::new()
                     .ptr(ds)
                     .ptr(dq)
                     .ptr(xq)
@@ -3372,7 +3438,10 @@ impl WeightAccel for RocmWeightAccel {
             let qp = unsafe { (e.quants.ptr as *mut i8).add(base * nb * 32) } as *mut c_void;
             if self.mlm_int8 {
                 let (xq, xd) = self.pf_quant(self.pf_x.ptr, m, e.in_dim);
-                self.q8i_gemm(oc as u32, m as u32, Args::new()
+                self.q8i_gemm(
+                    oc as u32,
+                    m as u32,
+                    Args::new()
                         .ptr(sp)
                         .ptr(qp)
                         .ptr(xq)
@@ -3414,7 +3483,6 @@ impl WeightAccel for RocmWeightAccel {
         Some(best.into_iter().map(|(_, i)| i).collect())
     }
 
-
     fn mlm_attn_prefill(
         &mut self,
         layer: usize,
@@ -3431,13 +3499,19 @@ impl WeightAccel for RocmWeightAccel {
         Some((out, kk, vv))
     }
 
-
-
     fn pf_begin(&mut self, h: &[f32], m: usize) -> bool {
         m <= 512 && self.gpu.upload_at(&self.pf_h, 0, h).is_ok()
     }
 
-    fn pf_attn(&mut self, l: usize, m: usize, base: usize, win: usize, cs: &[f32], sn: &[f32]) -> Option<(Vec<f32>, Vec<f32>)> {
+    fn pf_attn(
+        &mut self,
+        l: usize,
+        m: usize,
+        base: usize,
+        win: usize,
+        cs: &[f32],
+        sn: &[f32],
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
         let an = self.f32w.get(&format!("blk.{l}.attn_norm.weight"))?;
         let hidden = an.bytes / 4;
         self.launch(
@@ -3445,7 +3519,13 @@ impl WeightAccel for RocmWeightAccel {
             m as u32,
             256,
             0,
-            Args::new().ptr(self.pf_h.ptr).ptr(an.ptr).ptr(self.pf_n.ptr).i(hidden as i32).i(1).f(1e-6),
+            Args::new()
+                .ptr(self.pf_h.ptr)
+                .ptr(an.ptr)
+                .ptr(self.pf_n.ptr)
+                .i(hidden as i32)
+                .i(1)
+                .f(1e-6),
         );
         // attention reads normed acts from pf_n via the resident path
         let (out, kk, vv) = self.attn_prefill_inner(l, m, base, win, cs, sn, self.pf_n.ptr)?;
@@ -3462,7 +3542,13 @@ impl WeightAccel for RocmWeightAccel {
             m as u32,
             256,
             0,
-            Args::new().ptr(self.pf_h.ptr).ptr(fnw.ptr).ptr(self.pf_n.ptr).i(hidden as i32).i(1).f(1e-6),
+            Args::new()
+                .ptr(self.pf_h.ptr)
+                .ptr(fnw.ptr)
+                .ptr(self.pf_n.ptr)
+                .i(hidden as i32)
+                .i(1)
+                .f(1e-6),
         );
         self.launch2(
             "f32_gemv_rows",
@@ -3470,14 +3556,28 @@ impl WeightAccel for RocmWeightAccel {
             m as u32,
             32,
             0,
-            Args::new().ptr(wgi.ptr).ptr(self.pf_n.ptr).ptr(self.pf_y.ptr).i(hidden as i32).i(ne as i32).i(m as i32),
+            Args::new()
+                .ptr(wgi.ptr)
+                .ptr(self.pf_n.ptr)
+                .ptr(self.pf_y.ptr)
+                .i(hidden as i32)
+                .i(ne as i32)
+                .i(m as i32),
         );
         self.gpu.sync().ok()?;
         self.pf_y.download::<f32>(m * ne).ok()
     }
 
-    fn pf_moe(&mut self, l: usize, m: usize, plan: &[(usize, usize, usize)], st: &[i32], w: &[f32]) -> bool {
-        self.moe_layer_dev_inner(l, m, plan, st, w, self.pf_n.ptr, self.pf_h.ptr).is_some()
+    fn pf_moe(
+        &mut self,
+        l: usize,
+        m: usize,
+        plan: &[(usize, usize, usize)],
+        st: &[i32],
+        w: &[f32],
+    ) -> bool {
+        self.moe_layer_dev_inner(l, m, plan, st, w, self.pf_n.ptr, self.pf_h.ptr)
+            .is_some()
     }
 
     fn pf_end(&mut self, m: usize) -> Option<Vec<f32>> {
@@ -3504,12 +3604,19 @@ impl WeightAccel for RocmWeightAccel {
             return None;
         }
         self.gpu.upload_at(&self.pf_x, 0, xs).ok()?;
-        self.moe_layer_dev_inner(layer, m, plan, slot_tok, wslot, self.pf_x.ptr, std::ptr::null_mut())?;
+        self.moe_layer_dev_inner(
+            layer,
+            m,
+            plan,
+            slot_tok,
+            wslot,
+            self.pf_x.ptr,
+            std::ptr::null_mut(),
+        )?;
         let hidden = self.moe.get(&layer)?.hidden;
         self.gpu.sync().ok()?;
         self.pf_y.download::<f32>(m * hidden).ok()
     }
-
 
     fn gemv(&self, key: &str, x: &[f32]) -> Option<Vec<f32>> {
         // Per-weight GEMV on a resident Q6_K / Q4_0 weight, reusing the exact kernels

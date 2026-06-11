@@ -14,6 +14,7 @@ pub mod mellum;
 pub mod mellum_npu;
 pub mod ops;
 pub mod qwen35;
+pub mod smollm3;
 
 pub use gemma::GemmaModel;
 pub use llama::LlamaModel;

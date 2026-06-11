@@ -949,7 +949,8 @@ impl MellumModel {
                         for t in 0..m {
                             let logits = &rl[t * ne..(t + 1) * ne];
                             let mx = logits.iter().cloned().fold(f32::MIN, f32::max);
-                            let mut probs: Vec<f32> = logits.iter().map(|&l| (l - mx).exp()).collect();
+                            let mut probs: Vec<f32> =
+                                logits.iter().map(|&l| (l - mx).exp()).collect();
                             let sum: f32 = probs.iter().sum();
                             for p in probs.iter_mut() {
                                 *p /= sum;
@@ -1020,7 +1021,8 @@ impl MellumModel {
                 let pos0 = self.pos;
                 let a = self.accel.as_mut().unwrap();
                 if a.mlm_prepare(cfg.n_layer, kv_dim, 2048) {
-                    if let Some((out, kk, vv)) = a.mlm_attn_prefill(il, &n, m, pos0, win, &cs, &sn) {
+                    if let Some((out, kk, vv)) = a.mlm_attn_prefill(il, &n, m, pos0, win, &cs, &sn)
+                    {
                         self.kc[il].extend_from_slice(&kk);
                         self.vc[il].extend_from_slice(&vv);
                         for i in 0..m * hidden {
@@ -1051,110 +1053,110 @@ impl MellumModel {
                 }
             }
             if !gpu_attn {
-            let is_swa = cfg.is_swa(il);
-            let (freq_scale, ext_factor, mscale) = if is_swa {
-                (1.0, 0.0, 1.0)
-            } else {
-                (1.0 / cfg.yarn_factor, 1.0, cfg.yarn_attn_factor)
-            };
-            let qn = self.vecw(&b("attn_q_norm.weight"))?;
-            let kn = self.vecw(&b("attn_k_norm.weight"))?;
-            for t in 0..m {
-                let pos = self.pos + t;
-                for hh in 0..nh {
-                    let qh = &mut q[t * q_dim + hh * hd..t * q_dim + hh * hd + hd];
-                    let mut tmp = vec![0.0f32; hd];
-                    rmsnorm(&mut tmp, qh, &qn, eps);
-                    qh.copy_from_slice(&tmp);
-                    rope_neox(
-                        qh,
-                        pos,
-                        cfg.n_rot,
-                        cfg.rope_freq_base,
-                        freq_scale,
-                        ext_factor,
-                        mscale,
-                        corr,
-                    );
-                }
-                for kh in 0..nkv {
-                    let khv = &mut k[t * kv_dim + kh * hd..t * kv_dim + kh * hd + hd];
-                    let mut tmp = vec![0.0f32; hd];
-                    rmsnorm(&mut tmp, khv, &kn, eps);
-                    khv.copy_from_slice(&tmp);
-                    rope_neox(
-                        khv,
-                        pos,
-                        cfg.n_rot,
-                        cfg.rope_freq_base,
-                        freq_scale,
-                        ext_factor,
-                        mscale,
-                        corr,
-                    );
-                }
-            }
-            self.kc[il].extend_from_slice(&k[..m * kv_dim]);
-            self.vc[il].extend_from_slice(&v[..m * kv_dim]);
-            // per-token causal SDPA over the cache (parallel: cache is read-only now)
-            let kc = &self.kc[il];
-            let vc = &self.vc[il];
-            let base = self.pos;
-            attn_out
-                .par_chunks_mut(q_dim)
-                .enumerate()
-                .for_each(|(t, ao)| {
-                    let pos = base + t;
-                    let len = pos + 1;
-                    let win_start = if is_swa && cfg.sliding_window > 0 && len > cfg.sliding_window
-                    {
-                        len - cfg.sliding_window
-                    } else {
-                        0
-                    };
-                    let wlen = len - win_start;
-                    let mut keys = vec![0.0f32; wlen * hd];
-                    let mut vals = vec![0.0f32; wlen * hd];
-                    let mut scratch = vec![0.0f32; wlen];
+                let is_swa = cfg.is_swa(il);
+                let (freq_scale, ext_factor, mscale) = if is_swa {
+                    (1.0, 0.0, 1.0)
+                } else {
+                    (1.0 / cfg.yarn_factor, 1.0, cfg.yarn_attn_factor)
+                };
+                let qn = self.vecw(&b("attn_q_norm.weight"))?;
+                let kn = self.vecw(&b("attn_k_norm.weight"))?;
+                for t in 0..m {
+                    let pos = self.pos + t;
                     for hh in 0..nh {
-                        let kvh = hh / groups;
-                        for (ti, tt) in (win_start..len).enumerate() {
-                            keys[ti * hd..ti * hd + hd].copy_from_slice(
-                                &kc[tt * kv_dim + kvh * hd..tt * kv_dim + kvh * hd + hd],
-                            );
-                            vals[ti * hd..ti * hd + hd].copy_from_slice(
-                                &vc[tt * kv_dim + kvh * hd..tt * kv_dim + kvh * hd + hd],
-                            );
-                        }
-                        let mut oh = vec![0.0f32; hd];
-                        crate::attention::sdpa_single(
-                            &mut oh,
-                            &q[t * q_dim + hh * hd..t * q_dim + hh * hd + hd],
-                            &keys,
-                            &vals,
-                            hd,
-                            wlen,
-                            scale,
-                            &mut scratch,
+                        let qh = &mut q[t * q_dim + hh * hd..t * q_dim + hh * hd + hd];
+                        let mut tmp = vec![0.0f32; hd];
+                        rmsnorm(&mut tmp, qh, &qn, eps);
+                        qh.copy_from_slice(&tmp);
+                        rope_neox(
+                            qh,
+                            pos,
+                            cfg.n_rot,
+                            cfg.rope_freq_base,
+                            freq_scale,
+                            ext_factor,
+                            mscale,
+                            corr,
                         );
-                        ao[hh * hd..hh * hd + hd].copy_from_slice(&oh);
                     }
-                });
-            if !self.gpu_gemm(
-                &b("attn_output.weight"),
-                &attn_out,
-                m,
-                q_dim,
-                hidden,
-                &mut o,
-            ) && !self.npu_mm(il, 1, &attn_out, m, q_dim, hidden, &mut o)
-            {
-                let wo = self.w(&b("attn_output.weight"))?;
-                qmatmul_batch(&mut o, &attn_out, m, wo.bytes, wo.ty, q_dim, hidden);
-            }
-            for i in 0..m * hidden {
-                h[i] += o[i];
-            }
+                    for kh in 0..nkv {
+                        let khv = &mut k[t * kv_dim + kh * hd..t * kv_dim + kh * hd + hd];
+                        let mut tmp = vec![0.0f32; hd];
+                        rmsnorm(&mut tmp, khv, &kn, eps);
+                        khv.copy_from_slice(&tmp);
+                        rope_neox(
+                            khv,
+                            pos,
+                            cfg.n_rot,
+                            cfg.rope_freq_base,
+                            freq_scale,
+                            ext_factor,
+                            mscale,
+                            corr,
+                        );
+                    }
+                }
+                self.kc[il].extend_from_slice(&k[..m * kv_dim]);
+                self.vc[il].extend_from_slice(&v[..m * kv_dim]);
+                // per-token causal SDPA over the cache (parallel: cache is read-only now)
+                let kc = &self.kc[il];
+                let vc = &self.vc[il];
+                let base = self.pos;
+                attn_out
+                    .par_chunks_mut(q_dim)
+                    .enumerate()
+                    .for_each(|(t, ao)| {
+                        let pos = base + t;
+                        let len = pos + 1;
+                        let win_start =
+                            if is_swa && cfg.sliding_window > 0 && len > cfg.sliding_window {
+                                len - cfg.sliding_window
+                            } else {
+                                0
+                            };
+                        let wlen = len - win_start;
+                        let mut keys = vec![0.0f32; wlen * hd];
+                        let mut vals = vec![0.0f32; wlen * hd];
+                        let mut scratch = vec![0.0f32; wlen];
+                        for hh in 0..nh {
+                            let kvh = hh / groups;
+                            for (ti, tt) in (win_start..len).enumerate() {
+                                keys[ti * hd..ti * hd + hd].copy_from_slice(
+                                    &kc[tt * kv_dim + kvh * hd..tt * kv_dim + kvh * hd + hd],
+                                );
+                                vals[ti * hd..ti * hd + hd].copy_from_slice(
+                                    &vc[tt * kv_dim + kvh * hd..tt * kv_dim + kvh * hd + hd],
+                                );
+                            }
+                            let mut oh = vec![0.0f32; hd];
+                            crate::attention::sdpa_single(
+                                &mut oh,
+                                &q[t * q_dim + hh * hd..t * q_dim + hh * hd + hd],
+                                &keys,
+                                &vals,
+                                hd,
+                                wlen,
+                                scale,
+                                &mut scratch,
+                            );
+                            ao[hh * hd..hh * hd + hd].copy_from_slice(&oh);
+                        }
+                    });
+                if !self.gpu_gemm(
+                    &b("attn_output.weight"),
+                    &attn_out,
+                    m,
+                    q_dim,
+                    hidden,
+                    &mut o,
+                ) && !self.npu_mm(il, 1, &attn_out, m, q_dim, hidden, &mut o)
+                {
+                    let wo = self.w(&b("attn_output.weight"))?;
+                    qmatmul_batch(&mut o, &attn_out, m, wo.bytes, wo.ty, q_dim, hidden);
+                }
+                for i in 0..m * hidden {
+                    h[i] += o[i];
+                }
             }
 
             // MoE: route per token, group tokens by expert, batch each expert's GEMMs.

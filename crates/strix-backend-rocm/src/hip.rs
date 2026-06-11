@@ -88,9 +88,16 @@ impl Dbuf {
             "memcpy h2d",
         )
     }
-    pub fn download_at<T: Copy + Default + Clone>(&self, byte_off: usize, n: usize) -> Result<Vec<T>> {
+    pub fn download_at<T: Copy + Default + Clone>(
+        &self,
+        byte_off: usize,
+        n: usize,
+    ) -> Result<Vec<T>> {
         let bytes = n * std::mem::size_of::<T>();
-        assert!(byte_off + bytes <= self.bytes, "rocm: download_at overruns buffer");
+        assert!(
+            byte_off + bytes <= self.bytes,
+            "rocm: download_at overruns buffer"
+        );
         let mut out = vec![T::default(); n];
         ck(
             unsafe {
