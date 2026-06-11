@@ -788,18 +788,20 @@ impl Decoder for SmolLm3Model {
         if input_tokens.is_empty() {
             return Err(StrixError::invalid("smollm3: empty prompt"));
         }
-        // Batched prefill (NPU-routed when attached); else token-by-token.
-        #[cfg(feature = "npu")]
-        if self.npu.is_some() {
-            return Ok(Logits::new(self.prefill_batch(input_tokens)?));
-        }
         // Stage C: prefill stays OFF the iGPU (sustained GPU load crashes this box —
-        // see never-gpu-prefill). Run the batched CPU/NPU prefill to fill self.kc/vc,
-        // then seed the device KV cache so on-device decode can attend the prompt.
+        // see never-gpu-prefill). Batched CPU/NPU prefill fills self.kc/vc
+        // (prefill_batch uses the model's NPU when attached, else CPU), then seed the
+        // device KV cache so on-device decode can attend the prompt. Must take
+        // precedence over the NPU-only branch so the seed actually runs.
         if self.gpu_decode {
             let last = self.prefill_batch(input_tokens)?;
             self.seed_device_kv()?;
             return Ok(Logits::new(last));
+        }
+        // Batched prefill (NPU-routed when attached); else token-by-token.
+        #[cfg(feature = "npu")]
+        if self.npu.is_some() {
+            return Ok(Logits::new(self.prefill_batch(input_tokens)?));
         }
         let mut last = Vec::new();
         for &t in input_tokens {
