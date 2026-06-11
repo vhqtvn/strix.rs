@@ -1370,6 +1370,76 @@ extern "C" __global__ void q8w_gemm32(const float* __restrict__ scales,
     }
 }
 
+
+// ===== INT4-weight probe GEMVs (bandwidth test): nibble-packed q4, unpack->i8->sudot4 =====
+// q4: per-32-block, 16 bytes packed (2 signed 4-bit /byte, bias +8) + f32 scale.
+// gate+up z-grid int4 variant
+extern "C" __global__ void q4i_moe_gu(const float* __restrict__ gs, const unsigned char* __restrict__ gq,
+                                      const float* __restrict__ us, const unsigned char* __restrict__ uq,
+                                      const int* __restrict__ ids,
+                                      const float* __restrict__ xd, const signed char* __restrict__ xq,
+                                      float* __restrict__ yg, float* __restrict__ yu,
+                                      int in_dim, int out_dim) {
+    int l = threadIdx.x & 31;
+    int row = blockIdx.x, k = blockIdx.y;
+    if (row >= out_dim) return;
+    const float* sc = blockIdx.z ? us : gs;
+    const unsigned char* qs = blockIdx.z ? uq : gq;
+    float* y = blockIdx.z ? yu : yg;
+    int nb = in_dim / 32;
+    long long eoff = (long long)ids[k] * out_dim * nb;
+    sc += eoff + (long long)row * nb;
+    const unsigned char* qr = qs + (eoff + (long long)row * nb) * 16;  // 16 B/block
+    int e = (l & 7) * 4;            // which 4 of 32 lane covers
+    float acc = 0.f;
+    for (int b4 = 0; b4 < nb; b4 += 4) {
+        int bi = b4 + (l >> 3);
+        float d = sc[bi];
+        // load 2 packed bytes -> 4 signed int4 -> int (4x i8)
+        const unsigned char* pb = qr + (long long)bi * 16 + (e >> 1);
+        unsigned char b0 = pb[0], b1 = pb[1];
+        int w = ((int)((b0 & 0xF) - 8) & 0xFF)
+              | (((int)((b0 >> 4) - 8) & 0xFF) << 8)
+              | (((int)((b1 & 0xF) - 8) & 0xFF) << 16)
+              | (((int)((b1 >> 4) - 8) & 0xFF) << 24);
+        const int x4 = *(const int*)(xq + bi * 32 + e);
+        acc += d * (float)__builtin_amdgcn_sudot4(true, w, true, x4, 0, false);
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
+    if (l == 0) y[(long long)k * out_dim + row] = acc;
+}
+
+// down int4: per-(row,expert) partials, silu*up act already quantized i8
+extern "C" __global__ void q4i_moe_down(const float* __restrict__ ds, const unsigned char* __restrict__ dq,
+                                        const int* __restrict__ ids,
+                                        const float* __restrict__ xd, const signed char* __restrict__ xq,
+                                        float* __restrict__ y, int in_dim, int out_dim) {
+    int l = threadIdx.x & 31;
+    int row = blockIdx.x, kk = blockIdx.y;
+    if (row >= out_dim) return;
+    int nb = in_dim / 32;
+    long long eoff = (long long)ids[kk] * out_dim * nb;
+    const float* sc = ds + eoff + (long long)row * nb;
+    const unsigned char* qr = dq + (eoff + (long long)row * nb) * 16;
+    const signed char* xk = xq + (long long)kk * in_dim;
+    int e = (l & 7) * 4;
+    float acc = 0.f;
+    for (int b4 = 0; b4 < nb; b4 += 4) {
+        int bi = b4 + (l >> 3);
+        float d = sc[bi];
+        const unsigned char* pb = qr + (long long)bi * 16 + (e >> 1);
+        unsigned char b0 = pb[0], b1 = pb[1];
+        int w = ((int)((b0 & 0xF) - 8) & 0xFF)
+              | (((int)((b0 >> 4) - 8) & 0xFF) << 8)
+              | (((int)((b1 & 0xF) - 8) & 0xFF) << 16)
+              | (((int)((b1 >> 4) - 8) & 0xFF) << 24);
+        const int x4 = *(const int*)(xk + bi * 32 + e);
+        acc += d * (float)__builtin_amdgcn_sudot4(true, w, true, x4, 0, false);
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
+    if (l == 0) y[(long long)kk * out_dim + row] = acc;
+}
+
 // ===== Native-Q6_K MoE GEMV (NO repack: 210 B/superblock as in the GGUF) =====
 // w = full 3D expert tensor (native bytes), expert stride ebytes. Per superblock:
 // ql[128] qh[64] sc[16xi8] d[f16]. 8 waves/block, 32 lanes on the SAME superblock

@@ -109,11 +109,43 @@ struct ResMoe {
     up_q: Dbuf,
     down_s: Dbuf,
     down_q: Dbuf,
+    gate_s4: Dbuf,
+    gate_q4: Dbuf,
+    up_s4: Dbuf,
+    up_q4: Dbuf,
+    down_s4: Dbuf,
+    down_q4: Dbuf,
     hidden: usize,
     eff: usize,
 }
 
 /// Repack a whole 3D Q8_0 expert tensor into planar scales f32 + quants i8.
+/// Repack planar i8+f32scale to nibble-packed int4 (probe): 16 B/32-block + new scale.
+fn pack_q4(scales: &[f32], quants: &[i8]) -> (Vec<f32>, Vec<u8>) {
+    let nb = scales.len();
+    let mut s4 = vec![0.0f32; nb];
+    let mut q4 = vec![0u8; nb * 16];
+    for b in 0..nb {
+        let blk = &quants[b * 32..b * 32 + 32];
+        let qmax = blk.iter().map(|&q| (q as i32).abs()).max().unwrap_or(0);
+        if qmax == 0 {
+            s4[b] = 0.0;
+            for j in 0..16 {
+                q4[b * 16 + j] = 0x88;
+            }
+            continue;
+        }
+        s4[b] = scales[b] * qmax as f32 / 7.0;
+        let inv = 7.0 / qmax as f32;
+        for j in 0..16 {
+            let lo = ((blk[2 * j] as f32 * inv).round() as i32).clamp(-7, 7) + 8;
+            let hi = ((blk[2 * j + 1] as f32 * inv).round() as i32).clamp(-7, 7) + 8;
+            q4[b * 16 + j] = (lo as u8 & 0xF) | ((hi as u8 & 0xF) << 4);
+        }
+    }
+    (s4, q4)
+}
+
 fn planar_q8(bytes: &[u8]) -> (Vec<f32>, Vec<i8>) {
     let nb_total = bytes.len() / 34;
     let mut scales = vec![0.0f32; nb_total];
@@ -274,6 +306,7 @@ pub struct RocmWeightAccel {
     mlm_xd: Dbuf,
     mlm_int8: bool,
     use_wmma: bool,
+    use_q4: bool,
     mlm_graph: Option<*mut std::os::raw::c_void>,
     mlm_seq: usize,
     batch_x: Vec<Dbuf>,
@@ -375,6 +408,8 @@ impl RocmWeightAccel {
             "q8i_qkv_gemv",
             "q8i_moe_gu",
             "q8i_moe_down",
+            "q4i_moe_gu",
+            "q4i_moe_down",
             "q6_moe_gemv",
             "q8_gemm_rows",
             "q8_gemm_rows32",
@@ -515,6 +550,7 @@ impl RocmWeightAccel {
             mlm_xd,
             mlm_int8: std::env::var("STRIX_NO_INT8").is_err(),
             use_wmma: std::env::var("STRIX_NO_WMMA").is_err(),
+            use_q4: std::env::var("STRIX_Q4PROBE").is_ok(),
             mlm_graph: None,
             mlm_seq: 0,
             batch_x,
@@ -1617,7 +1653,28 @@ impl RocmWeightAccel {
     /// No-sync fused-MoE launches for layer `layer` over k routed experts
     /// (ids/wexp already uploaded): x → moe_out. Caller syncs.
     fn moe_launches(&self, m: &ResMoe, k: usize, x: *mut c_void) {
-        if self.mlm_int8 {
+        if self.use_q4 {
+            self.launch3(
+                "q4i_moe_gu",
+                m.eff as u32,
+                k as u32,
+                2,
+                32,
+                0,
+                Args::new()
+                    .ptr(m.gate_s4.ptr)
+                    .ptr(m.gate_q4.ptr)
+                    .ptr(m.up_s4.ptr)
+                    .ptr(m.up_q4.ptr)
+                    .ptr(self.moe_ids.ptr)
+                    .ptr(self.mlm_xd.ptr)
+                    .ptr(self.mlm_xq.ptr)
+                    .ptr(self.moe_g.ptr)
+                    .ptr(self.moe_u.ptr)
+                    .i(m.hidden as i32)
+                    .i(m.eff as i32),
+            );
+        } else if self.mlm_int8 {
             self.launch3(
                 "q8i_moe_gu",
                 m.eff as u32,
@@ -1675,22 +1732,41 @@ impl RocmWeightAccel {
                     .ptr(xdm)
                     .i(nb_act as i32),
             );
-            self.launch2(
-                "q8i_moe_down",
-                m.hidden as u32,
-                k as u32,
-                32,
-                0,
-                Args::new()
-                    .ptr(m.down_s.ptr)
-                    .ptr(m.down_q.ptr)
-                    .ptr(self.moe_ids.ptr)
-                    .ptr(xdm)
-                    .ptr(xqm)
-                    .ptr(self.moe_dy.ptr)
-                    .i(m.eff as i32)
-                    .i(m.hidden as i32),
-            );
+            if self.use_q4 {
+                self.launch2(
+                    "q4i_moe_down",
+                    m.hidden as u32,
+                    k as u32,
+                    32,
+                    0,
+                    Args::new()
+                        .ptr(m.down_s4.ptr)
+                        .ptr(m.down_q4.ptr)
+                        .ptr(self.moe_ids.ptr)
+                        .ptr(xdm)
+                        .ptr(xqm)
+                        .ptr(self.moe_dy.ptr)
+                        .i(m.eff as i32)
+                        .i(m.hidden as i32),
+                );
+            } else {
+                self.launch2(
+                    "q8i_moe_down",
+                    m.hidden as u32,
+                    k as u32,
+                    32,
+                    0,
+                    Args::new()
+                        .ptr(m.down_s.ptr)
+                        .ptr(m.down_q.ptr)
+                        .ptr(self.moe_ids.ptr)
+                        .ptr(xdm)
+                        .ptr(xqm)
+                        .ptr(self.moe_dy.ptr)
+                        .i(m.eff as i32)
+                        .i(m.hidden as i32),
+                );
+            }
         } else {
             self.launch2(
                 "q8_moe_down",
@@ -2302,6 +2378,20 @@ impl WeightAccel for RocmWeightAccel {
         ) else {
             return false;
         };
+        // int4 probe buffers (packed nibbles); 1-elem dummy if disabled.
+        let mk4 = |me: &Self, sc: &[f32], q: &[i8]| -> Option<(Dbuf, Dbuf)> {
+            if me.use_q4 {
+                let (s4, q4) = pack_q4(sc, q);
+                Some((me.gpu.upload_new(&s4).ok()?, me.gpu.upload_new(&q4).ok()?))
+            } else {
+                Some((me.gpu.upload_new(&[0.0f32]).ok()?, me.gpu.upload_new(&[0u8]).ok()?))
+            }
+        };
+        let (Some((gs4, gq4)), Some((us4, uq4)), Some((ds4, dq4))) =
+            (mk4(self, &gs, &gq), mk4(self, &us, &uq), mk4(self, &ds, &dq))
+        else {
+            return false;
+        };
         self.moe.insert(
             layer,
             ResMoe {
@@ -2311,6 +2401,12 @@ impl WeightAccel for RocmWeightAccel {
                 up_q: uqb,
                 down_s: dsb,
                 down_q: dqb,
+                gate_s4: gs4,
+                gate_q4: gq4,
+                up_s4: us4,
+                up_q4: uq4,
+                down_s4: ds4,
+                down_q4: dq4,
                 hidden,
                 eff,
             },
