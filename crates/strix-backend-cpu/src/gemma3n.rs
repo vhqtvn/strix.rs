@@ -21,6 +21,7 @@
 //! SentencePiece here but driven by raw IDs (STRIX_QWEN_IDS) for bring-up.
 
 use rayon::prelude::*;
+use strix_core::accel::WeightAccel;
 use strix_core::backend::Decoder;
 use strix_core::error::{Result, StrixError};
 use strix_core::sampler::Logits;
@@ -252,6 +253,7 @@ pub struct Gemma3nModel {
     vc: Vec<Vec<f32>>,
     pos: usize,
     max_seq: usize,
+    accel: Option<Box<dyn WeightAccel>>,
 }
 
 impl Gemma3nModel {
@@ -315,11 +317,51 @@ impl Gemma3nModel {
             vc,
             pos: 0,
             max_seq,
+            accel: None,
         })
     }
 
     pub fn max_seq(&self) -> usize {
         self.max_seq
+    }
+
+    /// Upload the quantized projection weights (q/k/v/o, ffn gate/up/down, tied
+    /// lm_head, per_layer_model_proj) to the GPU; matmuls run via `gemv` with CPU
+    /// fallback. AltUp/Laurel/PLE f32 mixing + norms/rope/attention stay CPU.
+    pub fn attach_accel(&mut self, mut accel: Box<dyn WeightAccel>) -> usize {
+        let mut names: Vec<String> = Vec::new();
+        for l in 0..self.cfg.n_layers {
+            for t in [
+                "attn_q",
+                "attn_k",
+                "attn_v",
+                "attn_output",
+                "ffn_gate",
+                "ffn_up",
+                "ffn_down",
+            ] {
+                names.push(format!("blk.{l}.{t}.weight"));
+            }
+        }
+        names.push("token_embd.weight".to_string());
+        names.push("per_layer_model_proj.weight".to_string());
+        let mut n = 0;
+        for name in &names {
+            let Ok((bytes, ty, in_dim, out_dim)) = self.wd(name) else {
+                continue;
+            };
+            let ok = match ty {
+                GgmlType::Q4_0 => accel.upload_q4_0(name, bytes, in_dim, out_dim),
+                GgmlType::Q6K => accel.upload_q6_k(name, bytes, in_dim, out_dim),
+                GgmlType::Q8_0 => accel.upload_q8_0(name, bytes, in_dim, out_dim),
+                _ => false,
+            };
+            if ok {
+                n += 1;
+            }
+        }
+        self.accel = Some(accel);
+        n
     }
 
     fn w<'a>(&'a self, name: &str) -> Result<(&'a [u8], GgmlType, usize)> {
@@ -333,6 +375,31 @@ impl Gemma3nModel {
             t.ggml_type,
             t.dims[0] as usize,
         ))
+    }
+
+    /// Like `w` but also returns out_dim (dims[1]).
+    fn wd<'a>(&'a self, name: &str) -> Result<(&'a [u8], GgmlType, usize, usize)> {
+        let t = self
+            .gguf
+            .tensors()
+            .get(name)
+            .ok_or_else(|| StrixError::invalid(format!("gemma3n: missing tensor {name}")))?;
+        let in_dim = t.dims[0] as usize;
+        let out_dim = t.dims.get(1).copied().unwrap_or(1) as usize;
+        Ok((self.gguf.tensor_bytes(name)?, t.ggml_type, in_dim, out_dim))
+    }
+
+    /// Matmul by tensor name: GPU `gemv` if resident, else CPU dequant.
+    fn mm(&self, name: &str, x: &[f32]) -> Result<Vec<f32>> {
+        if let Some(a) = &self.accel {
+            if let Some(y) = a.gemv(name, x) {
+                return Ok(y);
+            }
+        }
+        let (bytes, ty, in_dim, out_dim) = self.wd(name)?;
+        let mut y = vec![0.0f32; out_dim];
+        qmatmul(&mut y, x, bytes, ty, in_dim);
+        Ok(y)
     }
 
     /// dequant a single row `idx` of a quantized [in_dim, *] tensor.
@@ -408,11 +475,7 @@ impl Gemma3nModel {
         for v in pe.iter_mut() {
             *v *= pscale;
         }
-        let mut proj = vec![0.0f32; ea * nl];
-        {
-            let (wb, wt, win) = self.w("per_layer_model_proj.weight")?;
-            qmatmul(&mut proj, &x0, wb, wt, win);
-        }
+        let mut proj = self.mm("per_layer_model_proj.weight", &x0)?;
         let pjs = 1.0 / (hidden as f32).sqrt();
         for v in proj.iter_mut() {
             *v *= pjs;
@@ -518,10 +581,7 @@ impl Gemma3nModel {
             }
 
             // Q always computed
-            {
-                let (wq, tq, inq) = self.w(&b("attn_q.weight"))?;
-                qmatmul(&mut q, &cur, wq, tq, inq);
-            }
+            q = self.mm(&b("attn_q.weight"), &cur)?;
             // per-head q-norm then rope
             for hh in 0..nh {
                 let qh = &mut q[hh * hd..hh * hd + hd];
@@ -534,10 +594,8 @@ impl Gemma3nModel {
             // KV: own (il<kv_from_start) or reuse source layer's cache
             let own_kv = il < cfg.kv_from_start;
             if own_kv {
-                let (wk, tk, ink) = self.w(&b("attn_k.weight"))?;
-                qmatmul(&mut kbuf, &cur, wk, tk, ink);
-                let (wv, tv, inv) = self.w(&b("attn_v.weight"))?;
-                qmatmul(&mut vbuf, &cur, wv, tv, inv);
+                kbuf = self.mm(&b("attn_k.weight"), &cur)?;
+                vbuf = self.mm(&b("attn_v.weight"), &cur)?;
                 for kh in 0..nkv {
                     let kk = &mut kbuf[kh * hd..kh * hd + hd];
                     let mut t = vec![0.0f32; hd];
@@ -595,11 +653,7 @@ impl Gemma3nModel {
                 }
             });
             // output proj
-            let mut ao = vec![0.0f32; hidden];
-            {
-                let (wo, to, ino) = self.w(&b("attn_output.weight"))?;
-                qmatmul(&mut ao, &attn, wo, to, ino);
-            }
+            let ao = self.mm(&b("attn_output.weight"), &attn)?;
             if dump && il == 0 {
                 dbg3("attn_out-0", &ao);
                 dbg3("laurel_out-0", &laurel_out);
@@ -623,14 +677,8 @@ impl Gemma3nModel {
             let nff = cfg.ffn[il];
             let mut fn_in = vec![0.0f32; hidden];
             rmsnorm(&mut fn_in, &attn_laurel, &lay.ffn_norm, cfg.eps);
-            let mut gate = vec![0.0f32; nff];
-            let mut up = vec![0.0f32; nff];
-            {
-                let (wg, tg, ing) = self.w(&b("ffn_gate.weight"))?;
-                qmatmul(&mut gate, &fn_in, wg, tg, ing);
-                let (wu, tu, inu) = self.w(&b("ffn_up.weight"))?;
-                qmatmul(&mut up, &fn_in, wu, tu, inu);
-            }
+            let mut gate = self.mm(&b("ffn_gate.weight"), &fn_in)?;
+            let up = self.mm(&b("ffn_up.weight"), &fn_in)?;
             if il < cfg.n_sparsity && std::env::var("STRIX_G3N_NOSPARSE").is_err() {
                 // gaussian_topk: cutoff = mean + mul*std(ddof=1); relu(x-cutoff)
                 let mean = gate.iter().sum::<f32>() / nff as f32;
@@ -644,11 +692,7 @@ impl Gemma3nModel {
             for i in 0..nff {
                 gate[i] = gelu_tanh(gate[i]) * up[i];
             }
-            let mut ff = vec![0.0f32; hidden];
-            {
-                let (wd, td, ind) = self.w(&b("ffn_down.weight"))?;
-                qmatmul(&mut ff, &gate, wd, td, ind);
-            }
+            let ff = self.mm(&b("ffn_down.weight"), &gate)?;
             let mut pf = vec![0.0f32; hidden];
             rmsnorm(&mut pf, &ff, &lay.post_ffw_norm, cfg.eps);
             if dump && il == 0 {
@@ -746,9 +790,7 @@ impl Gemma3nModel {
         } else {
             "token_embd.weight"
         };
-        let (hw, ht, hin) = self.w(head_name)?;
-        let mut logits = vec![0.0f32; cfg.vocab];
-        qmatmul(&mut logits, &nfinal, hw, ht, hin);
+        let logits = self.mm(head_name, &nfinal)?;
         if std::env::var("STRIX_G3N_DUMP").is_ok() {
             let (mut bi, mut bv) = (0usize, f32::NEG_INFINITY);
             for (i, &v) in logits.iter().enumerate() {

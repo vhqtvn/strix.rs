@@ -321,7 +321,7 @@ fn run_smollm3(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Re
 }
 
 /// Gemma-3n-E4B (gemma3n): CPU-only greedy. Raw IDs via STRIX_QWEN_IDS.
-fn run_gemma3n(gguf: GgufFile, prompt: &str, max_tokens: usize) -> Result<()> {
+fn run_gemma3n(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Result<()> {
     use strix_backend_cpu::gemma3n::{Gemma3nCfg, Gemma3nModel};
     use strix_core::backend::Decoder;
 
@@ -345,6 +345,20 @@ fn run_gemma3n(gguf: GgufFile, prompt: &str, max_tokens: usize) -> Result<()> {
         load.elapsed().as_secs_f64(),
         prompt_ids.len()
     );
+    if gpu {
+        match build_weight_accel() {
+            Some(accel) => {
+                let name = accel.name().to_string();
+                let t = Instant::now();
+                let n = model.attach_accel(accel);
+                eprintln!(
+                    "[gemma3n] {n} weights resident on {name} ({:.1}s)",
+                    t.elapsed().as_secs_f64()
+                );
+            }
+            None => eprintln!("[gemma3n] --gpu: no accel (build --features rocm + STRIX_ROCM=1)"),
+        }
+    }
     let sampler = GreedySampler;
     let pf = Instant::now();
     let logits = model.prefill(&prompt_ids).context("gemma3n prefill")?;
@@ -639,7 +653,7 @@ fn run_gguf(path: &Path, prompt: &str, max_tokens: usize, chat: bool, gpu: bool)
         return run_qwen3(gguf, prompt, max_tokens, gpu);
     }
     if arch == "gemma3n" {
-        return run_gemma3n(gguf, prompt, max_tokens);
+        return run_gemma3n(gguf, prompt, max_tokens, gpu);
     }
 
     let tokenizer = StrixTokenizer::from_gguf(&gguf).context("build tokenizer from gguf")?;
