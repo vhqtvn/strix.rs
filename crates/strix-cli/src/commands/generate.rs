@@ -306,6 +306,55 @@ fn run_smollm3(gguf: GgufFile, prompt: &str, max_tokens: usize) -> Result<()> {
     Ok(())
 }
 
+/// Gemma-3n-E4B (gemma3n): CPU-only greedy. Raw IDs via STRIX_QWEN_IDS.
+fn run_gemma3n(gguf: GgufFile, prompt: &str, max_tokens: usize) -> Result<()> {
+    use strix_backend_cpu::gemma3n::{Gemma3nCfg, Gemma3nModel};
+    use strix_core::backend::Decoder;
+
+    let cfg = Gemma3nCfg::from_gguf(&gguf).context("parse gemma3n config")?;
+    eprintln!("[gemma3n] {}", cfg.report());
+    let id_src = std::env::var("STRIX_QWEN_IDS").unwrap_or_else(|_| prompt.to_string());
+    let prompt_ids: Vec<u32> = id_src
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<u32>())
+        .collect::<std::result::Result<_, _>>()
+        .context("gemma3n needs raw token IDs. Set STRIX_QWEN_IDS=\"1,2,3\".")?;
+    if prompt_ids.is_empty() {
+        anyhow::bail!("gemma3n: no token IDs given (set STRIX_QWEN_IDS)");
+    }
+    let max_seq = prompt_ids.len() + max_tokens + 16;
+    let load = Instant::now();
+    let mut model = Gemma3nModel::from_gguf(gguf, max_seq).context("build gemma3n")?;
+    eprintln!(
+        "[gemma3n] built in {:.1}s, prompt = {} tokens",
+        load.elapsed().as_secs_f64(),
+        prompt_ids.len()
+    );
+    let sampler = GreedySampler;
+    let pf = Instant::now();
+    let logits = model.prefill(&prompt_ids).context("gemma3n prefill")?;
+    let pf_s = pf.elapsed().as_secs_f64();
+    let mut next = sampler.sample(&logits)?;
+    let mut generated = vec![next];
+    let dec = Instant::now();
+    for _ in 1..max_tokens {
+        let l = model.decode_one(next).context("gemma3n decode")?;
+        next = sampler.sample(&l)?;
+        generated.push(next);
+    }
+    let dec_s = dec.elapsed().as_secs_f64();
+    let ids: Vec<String> = generated.iter().map(|t| t.to_string()).collect();
+    println!("[gemma3n] generated token IDs: {}", ids.join(","));
+    eprintln!(
+        "[gemma3n] prefill {:.1} tok/s ({} tok in {pf_s:.2}s) | decode {:.2} tok/s",
+        prompt_ids.len() as f64 / pf_s,
+        prompt_ids.len(),
+        (max_tokens.saturating_sub(1)) as f64 / dec_s.max(1e-9),
+    );
+    Ok(())
+}
+
 /// Qwen3-4B dense (qwen3): CPU-only greedy. gpt2-BPE → raw IDs via STRIX_QWEN_IDS.
 fn run_qwen3(gguf: GgufFile, prompt: &str, max_tokens: usize) -> Result<()> {
     use strix_backend_cpu::qwen3::{Qwen3Cfg, Qwen3Model};
@@ -559,6 +608,9 @@ fn run_gguf(path: &Path, prompt: &str, max_tokens: usize, chat: bool, gpu: bool)
     }
     if arch == "qwen3" {
         return run_qwen3(gguf, prompt, max_tokens);
+    }
+    if arch == "gemma3n" {
+        return run_gemma3n(gguf, prompt, max_tokens);
     }
 
     let tokenizer = StrixTokenizer::from_gguf(&gguf).context("build tokenizer from gguf")?;

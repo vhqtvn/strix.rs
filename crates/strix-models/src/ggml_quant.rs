@@ -167,6 +167,8 @@ pub fn dequantize_into(ty: GgmlType, bytes: &[u8], out: &mut [f32]) -> Result<()
         GgmlType::Q8_0 => dequant_q8_0(bytes, out),
         GgmlType::Q4_0 => dequant_q4_0(bytes, out),
         GgmlType::Q4_1 => dequant_q4_1(bytes, out),
+        GgmlType::Q5_0 => dequant_q5_0(bytes, out),
+        GgmlType::Q5_1 => dequant_q5_1(bytes, out),
         GgmlType::Q4K => dequant_q4_k(bytes, out),
         GgmlType::Q6K => dequant_q6_k(bytes, out),
         other => {
@@ -248,6 +250,41 @@ fn dequant_q4_1(bytes: &[u8], out: &mut [f32]) {
         for j in 0..16 {
             ob[j] = d * (qs[j] & 0x0F) as f32 + m;
             ob[j + 16] = d * (qs[j] >> 4) as f32 + m;
+        }
+    }
+}
+
+/// Q5_0: [f16 d][u32 qh][16 nibbles]; 5th bit per value from qh; y = d*(q-16).
+fn dequant_q5_0(bytes: &[u8], out: &mut [f32]) {
+    for (blk, ob) in bytes.chunks_exact(22).zip(out.chunks_mut(32)) {
+        let d = read_f16(&blk[0..2]);
+        let qh = u32::from_le_bytes([blk[2], blk[3], blk[4], blk[5]]);
+        let qs = &blk[6..22];
+        for j in 0..16 {
+            let xh0 = (((qh >> j) << 4) & 0x10) as u8;
+            let xh1 = ((qh >> (j + 12)) & 0x10) as u8;
+            let x0 = ((qs[j] & 0x0F) | xh0) as i32 - 16;
+            let x1 = ((qs[j] >> 4) | xh1) as i32 - 16;
+            ob[j] = x0 as f32 * d;
+            ob[j + 16] = x1 as f32 * d;
+        }
+    }
+}
+
+/// Q5_1: [f16 d][f16 m][u32 qh][16 nibbles]; y = d*q + m, q 5-bit (0..31).
+fn dequant_q5_1(bytes: &[u8], out: &mut [f32]) {
+    for (blk, ob) in bytes.chunks_exact(24).zip(out.chunks_mut(32)) {
+        let d = read_f16(&blk[0..2]);
+        let m = read_f16(&blk[2..4]);
+        let qh = u32::from_le_bytes([blk[4], blk[5], blk[6], blk[7]]);
+        let qs = &blk[8..24];
+        for j in 0..16 {
+            let xh0 = (((qh >> j) << 4) & 0x10) as u8;
+            let xh1 = ((qh >> (j + 12)) & 0x10) as u8;
+            let x0 = ((qs[j] & 0x0F) | xh0) as f32;
+            let x1 = ((qs[j] >> 4) | xh1) as f32;
+            ob[j] = x0 * d + m;
+            ob[j + 16] = x1 * d + m;
         }
     }
 }

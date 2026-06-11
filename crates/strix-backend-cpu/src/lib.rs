@@ -7,6 +7,7 @@
 
 pub mod attention;
 pub mod gemma;
+pub mod gemma3n;
 pub mod kv_cache;
 pub mod llama;
 pub mod mellum;
