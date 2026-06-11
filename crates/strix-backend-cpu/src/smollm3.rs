@@ -9,6 +9,7 @@
 //! token IDs via STRIX_QWEN_IDS, like mellum.
 
 use rayon::prelude::*;
+use strix_core::accel::WeightAccel;
 use strix_core::backend::Decoder;
 use strix_core::error::{Result, StrixError};
 use strix_core::sampler::Logits;
@@ -159,6 +160,7 @@ pub struct SmolLm3Model {
     vc: Vec<Vec<f32>>,
     pos: usize,
     max_seq: usize,
+    accel: Option<Box<dyn WeightAccel>>,
 }
 
 impl SmolLm3Model {
@@ -192,6 +194,7 @@ impl SmolLm3Model {
             vc,
             pos: 0,
             max_seq,
+            accel: None,
         })
     }
 
@@ -212,6 +215,56 @@ impl SmolLm3Model {
     }
 
     /// One-token forward. Returns logits.
+    /// Upload big projection weights to the GPU accelerator; matmuls then run via
+    /// `gemv`. Norms/rope/attention stay CPU. Returns weights staged.
+    pub fn attach_accel(&mut self, mut accel: Box<dyn WeightAccel>) -> usize {
+        let mut names: Vec<String> = Vec::new();
+        for l in 0..self.cfg.n_layers {
+            for t in [
+                "attn_q",
+                "attn_k",
+                "attn_v",
+                "attn_output",
+                "ffn_gate",
+                "ffn_up",
+                "ffn_down",
+            ] {
+                names.push(format!("blk.{l}.{t}.weight"));
+            }
+        }
+        names.push("token_embd.weight".to_string());
+        let mut n = 0;
+        for name in &names {
+            let Ok((bytes, ty, in_dim, out_dim)) = self.w(name) else {
+                continue;
+            };
+            let ok = match ty {
+                GgmlType::Q4_0 => accel.upload_q4_0(name, bytes, in_dim, out_dim),
+                GgmlType::Q6K => accel.upload_q6_k(name, bytes, in_dim, out_dim),
+                GgmlType::Q8_0 => accel.upload_q8_0(name, bytes, in_dim, out_dim),
+                _ => false,
+            };
+            if ok {
+                n += 1;
+            }
+        }
+        self.accel = Some(accel);
+        n
+    }
+
+    /// Matmul by tensor name: GPU `gemv` if resident, else CPU dequant.
+    fn mm(&self, name: &str, x: &[f32]) -> Result<Vec<f32>> {
+        if let Some(a) = &self.accel {
+            if let Some(y) = a.gemv(name, x) {
+                return Ok(y);
+            }
+        }
+        let (bytes, ty, in_dim, out_dim) = self.w(name)?;
+        let mut y = vec![0.0f32; out_dim];
+        qmatmul(&mut y, x, bytes, ty, in_dim);
+        Ok(y)
+    }
+
     fn forward(&mut self, token: u32) -> Result<Vec<f32>> {
         let cfg = &self.cfg;
         let (hidden, hd, nh, nkv) = (cfg.hidden, cfg.head_dim, cfg.n_heads, cfg.n_kv);
@@ -246,12 +299,9 @@ impl SmolLm3Model {
             // attn norm
             rmsnorm(&mut n, &h, &self.norms[il].attn_norm, cfg.eps);
             // q/k/v
-            let (wq, tq, inq, _) = self.w(&b("attn_q.weight"))?;
-            qmatmul(&mut q, &n, wq, tq, inq);
-            let (wk, tk, ink, _) = self.w(&b("attn_k.weight"))?;
-            qmatmul(&mut k, &n, wk, tk, ink);
-            let (wv, tv, inv, _) = self.w(&b("attn_v.weight"))?;
-            qmatmul(&mut v, &n, wv, tv, inv);
+            q = self.mm(&b("attn_q.weight"), &n)?;
+            k = self.mm(&b("attn_k.weight"), &n)?;
+            v = self.mm(&b("attn_v.weight"), &n)?;
 
             // NoPE: skip rope on layers where (il+1) % step == 0
             let use_rope = (il + 1) % cfg.nope_step != 0;
@@ -297,24 +347,20 @@ impl SmolLm3Model {
             });
 
             // output proj + residual
-            let (wo, to, ino, _) = self.w(&b("attn_output.weight"))?;
-            qmatmul(&mut o, &attn, wo, to, ino);
+            o = self.mm(&b("attn_output.weight"), &attn)?;
             for i in 0..hidden {
                 h[i] += o[i];
             }
 
             // ffn norm + SwiGLU
             rmsnorm(&mut n, &h, &self.norms[il].ffn_norm, cfg.eps);
-            let (wg, tg, ing, _) = self.w(&b("ffn_gate.weight"))?;
-            qmatmul(&mut gate, &n, wg, tg, ing);
-            let (wu, tu, inu, _) = self.w(&b("ffn_up.weight"))?;
-            qmatmul(&mut up, &n, wu, tu, inu);
+            gate = self.mm(&b("ffn_gate.weight"), &n)?;
+            up = self.mm(&b("ffn_up.weight"), &n)?;
             for i in 0..cfg.ffn {
                 let g = gate[i];
                 gate[i] = (g / (1.0 + (-g).exp())) * up[i];
             }
-            let (wd, td, ind, _) = self.w(&b("ffn_down.weight"))?;
-            qmatmul(&mut o, &gate, wd, td, ind);
+            o = self.mm(&b("ffn_down.weight"), &gate)?;
             for i in 0..hidden {
                 h[i] += o[i];
             }
@@ -327,9 +373,7 @@ impl SmolLm3Model {
         } else {
             "token_embd.weight"
         };
-        let (hw, ht, hin, _) = self.w(head_name)?;
-        let mut logits = vec![0.0f32; cfg.vocab];
-        qmatmul(&mut logits, &n, hw, ht, hin);
+        let logits = self.mm(head_name, &n)?;
         self.pos += 1;
         Ok(logits)
     }

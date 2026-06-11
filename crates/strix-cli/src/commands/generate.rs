@@ -258,7 +258,7 @@ fn run_qwen35(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Res
 /// hybrid sliding/full attention + per-layer-type RoPE (YaRN on full layers). Takes
 /// raw token IDs via `STRIX_QWEN_IDS` (or the prompt) — same tokenizer caveat as Qwen.
 /// SmolLM3-3B (smollm3): CPU-only greedy. gpt2-BPE → raw IDs via STRIX_QWEN_IDS.
-fn run_smollm3(gguf: GgufFile, prompt: &str, max_tokens: usize) -> Result<()> {
+fn run_smollm3(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Result<()> {
     use strix_backend_cpu::smollm3::{SmolLm3Cfg, SmolLm3Model};
     use strix_core::backend::Decoder;
 
@@ -282,6 +282,20 @@ fn run_smollm3(gguf: GgufFile, prompt: &str, max_tokens: usize) -> Result<()> {
         load.elapsed().as_secs_f64(),
         prompt_ids.len()
     );
+    if gpu {
+        match build_weight_accel() {
+            Some(accel) => {
+                let name = accel.name().to_string();
+                let t = Instant::now();
+                let n = model.attach_accel(accel);
+                eprintln!(
+                    "[smollm3] {n} weights resident on {name} ({:.1}s)",
+                    t.elapsed().as_secs_f64()
+                );
+            }
+            None => eprintln!("[smollm3] --gpu: no accel (build --features rocm + STRIX_ROCM=1)"),
+        }
+    }
     let sampler = GreedySampler;
     let pf = Instant::now();
     let logits = model.prefill(&prompt_ids).context("smollm3 prefill")?;
@@ -619,7 +633,7 @@ fn run_gguf(path: &Path, prompt: &str, max_tokens: usize, chat: bool, gpu: bool)
         return run_mellum(gguf, prompt, max_tokens, gpu);
     }
     if arch == "smollm3" {
-        return run_smollm3(gguf, prompt, max_tokens);
+        return run_smollm3(gguf, prompt, max_tokens, gpu);
     }
     if arch == "qwen3" {
         return run_qwen3(gguf, prompt, max_tokens, gpu);
