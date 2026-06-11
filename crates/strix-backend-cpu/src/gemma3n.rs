@@ -254,6 +254,21 @@ pub struct Gemma3nModel {
     pos: usize,
     max_seq: usize,
     accel: Option<Box<dyn WeightAccel>>,
+    #[cfg(feature = "npu")]
+    npu: Option<crate::mellum_npu::Gemma3nNpu>,
+}
+
+/// Which projection a batched matmul targets (NPU shape+slot selector).
+#[derive(Clone, Copy)]
+enum NpuW {
+    Q,
+    O,
+    K,
+    V,
+    Gate,
+    Up,
+    Down,
+    PlProj,
 }
 
 impl Gemma3nModel {
@@ -318,7 +333,90 @@ impl Gemma3nModel {
             pos: 0,
             max_seq,
             accel: None,
+            #[cfg(feature = "npu")]
+            npu: None,
         })
+    }
+
+    /// Stage projections (q/o/k/v/gate/up/down per layer + per_layer_model_proj once)
+    /// onto the NPU as int8. Prefill GEMMs run on the XDNA2 NPU (~2 W).
+    #[cfg(feature = "npu")]
+    pub fn attach_npu(&mut self, mut npu: crate::mellum_npu::Gemma3nNpu) -> Result<usize> {
+        let mut n = 0;
+        let mut st = |sh: &mut crate::mellum_npu::NpuShape, slot: u64, name: &str| -> Result<()> {
+            let (bytes, ty, _, _) = self.wd(name)?;
+            sh.stage_q8(slot, bytes, ty)?;
+            n += 1;
+            Ok(())
+        };
+        st(&mut npu.plproj, 0, "per_layer_model_proj.weight")?;
+        for l in 0..self.cfg.n_layers {
+            let b = |s: &str| format!("blk.{l}.{s}");
+            let l = l as u64;
+            st(&mut npu.qo, 2 * l, &b("attn_q.weight"))?;
+            st(&mut npu.qo, 2 * l + 1, &b("attn_output.weight"))?;
+            if (l as usize) < self.cfg.kv_from_start {
+                st(&mut npu.kv, 2 * l, &b("attn_k.weight"))?;
+                st(&mut npu.kv, 2 * l + 1, &b("attn_v.weight"))?;
+            }
+            st(&mut npu.gu, 2 * l, &b("ffn_gate.weight"))?;
+            st(&mut npu.gu, 2 * l + 1, &b("ffn_up.weight"))?;
+            st(&mut npu.down, l, &b("ffn_down.weight"))?;
+        }
+        self.npu = Some(npu);
+        Ok(n)
+    }
+
+    /// Batched matmul out[m*n] = W·xs[m*k] by name; NPU shape (chunked M=256) if
+    /// staged, else CPU dequant. `il` selects the layer slot (ignored for PlProj).
+    #[allow(clippy::too_many_arguments)]
+    fn bmm(&self, name: &str, which: NpuW, il: usize, xs: &[f32], m: usize, k: usize, n: usize, out: &mut [f32]) -> Result<()> {
+        #[cfg(feature = "npu")]
+        if let Some(npu) = &self.npu {
+            let il = il as u64;
+            let (sh, s) = match which {
+                NpuW::Q => (&npu.qo, 2 * il),
+                NpuW::O => (&npu.qo, 2 * il + 1),
+                NpuW::K => (&npu.kv, 2 * il),
+                NpuW::V => (&npu.kv, 2 * il + 1),
+                NpuW::Gate => (&npu.gu, 2 * il),
+                NpuW::Up => (&npu.gu, 2 * il + 1),
+                NpuW::Down => (&npu.down, il),
+                NpuW::PlProj => (&npu.plproj, 0),
+            };
+            if sh.k == k && sh.n == n && sh.has(s) {
+                let mut okall = true;
+                for c in (0..m).step_by(crate::mellum_npu::M_NPU) {
+                    let mc = (m - c).min(crate::mellum_npu::M_NPU);
+                    if sh.gemm(s, &xs[c * k..(c + mc) * k], mc, &mut out[c * n..(c + mc) * n]).is_err() {
+                        okall = false;
+                        break;
+                    }
+                }
+                if okall {
+                    return Ok(());
+                }
+            }
+        }
+        let _ = (which, il);
+        let (bytes, ty, _, _) = self.wd(name)?;
+        let bpr = (k / ty.block_elems()) * ty.block_bytes();
+        let mut rt = vec![0.0f32; n * m];
+        rt.par_chunks_mut(m).enumerate().for_each_init(
+            || vec![0.0f32; k],
+            |scratch, (o, orow)| {
+                dequantize_into(ty, &bytes[o * bpr..o * bpr + bpr], scratch).unwrap();
+                for t in 0..m {
+                    orow[t] = dot_f32(scratch, &xs[t * k..(t + 1) * k]);
+                }
+            },
+        );
+        for t in 0..m {
+            for o in 0..n {
+                out[t * n + o] = rt[o * m + t];
+            }
+        }
+        Ok(())
     }
 
     pub fn max_seq(&self) -> usize {
@@ -806,12 +904,296 @@ impl Gemma3nModel {
         self.pos += 1;
         Ok(logits)
     }
+
+    /// Batched prefill over `m` tokens. The 7 GEMMs/layer + per_layer_model_proj run
+    /// on the NPU (~2 W); AltUp(4-stream)/Laurel/PLE/QK-norm/RoPE/attention stay CPU.
+    /// Carries all m tokens' 4 AltUp streams through the layers; returns last logits.
+    fn prefill_batch(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let cfg = &self.cfg;
+        let (hidden, hd, nh, nkv, ea) = (cfg.hidden, cfg.head_dim, cfg.n_heads, cfg.n_kv, cfg.embd_altup);
+        let (groups, kv_dim, nl) = (nh / nkv, nkv * hd, cfg.n_layers);
+        let q_dim = nh * hd;
+        let es = (hidden as f32).sqrt();
+        let inv_sqrt2 = 1.0 / 2.0f32.sqrt();
+        let m = tokens.len();
+
+        // 4 AltUp streams, each [m][hidden].
+        let mut h: Vec<Vec<f32>> = (0..N_ALTUP).map(|_| vec![0.0f32; m * hidden]).collect();
+        let mut pe = vec![0.0f32; m * ea * nl];
+        for (t, &tok) in tokens.iter().enumerate() {
+            self.embd_row("token_embd.weight", tok as usize, hidden, &mut h[0][t * hidden..(t + 1) * hidden])?;
+            for v in &mut h[0][t * hidden..(t + 1) * hidden] {
+                *v *= es;
+            }
+            self.embd_row("per_layer_token_embd.weight", tok as usize, ea * nl, &mut pe[t * ea * nl..(t + 1) * ea * nl])?;
+            let ps = (ea as f32).sqrt();
+            for v in &mut pe[t * ea * nl..(t + 1) * ea * nl] {
+                *v *= ps;
+            }
+        }
+        // per-layer inputs: proj = per_layer_model_proj·x0 (batched NPU), then per token/layer.
+        let mut proj = vec![0.0f32; m * ea * nl];
+        self.bmm("per_layer_model_proj.weight", NpuW::PlProj, 0, &h[0], m, hidden, ea * nl, &mut proj)?;
+        let pjs = 1.0 / (hidden as f32).sqrt();
+        let mut inp_per_layer = vec![0.0f32; m * ea * nl];
+        for t in 0..m {
+            for il in 0..nl {
+                let off = t * ea * nl + il * ea;
+                let mut tmp = vec![0.0f32; ea];
+                let mut sl = proj[off..off + ea].to_vec();
+                for v in &mut sl {
+                    *v *= pjs;
+                }
+                rmsnorm(&mut tmp, &sl, &self.per_layer_proj_norm, cfg.eps);
+                for j in 0..ea {
+                    inp_per_layer[off + j] = (tmp[j] + pe[off + j]) * inv_sqrt2;
+                }
+            }
+        }
+        // AltUp init: streams 1..3 = magnitude-matched altup_proj·x0 (per token).
+        for t in 0..m {
+            let x0 = h[0][t * hidden..(t + 1) * hidden].to_vec();
+            let tgt = l2(&x0);
+            for i in 0..N_ALTUP - 1 {
+                let mut s = vec![0.0f32; hidden];
+                f32matmul(&mut s, &x0, &self.altup_proj[i], hidden, hidden);
+                let r = tgt / l2(&s).max(1e-12);
+                for (e, sv) in s.iter().enumerate() {
+                    h[i + 1][t * hidden + e] = sv * r;
+                }
+            }
+        }
+
+        for il in 0..nl {
+            let bnm = |s: &str| format!("blk.{il}.{s}");
+            let lay = &self.layers[il];
+            let swa = cfg.is_swa(il);
+            let rope_base = if swa { cfg.rope_local } else { cfg.rope_global };
+            let own_kv = il < cfg.kv_from_start;
+
+            // AltUp predict (per token) + attn-norm + laurel; collect normed cur into N.
+            let mut pred: Vec<Vec<f32>> = (0..N_ALTUP).map(|b2| h[b2].clone()).collect();
+            let mut active = vec![0.0f32; m * hidden];
+            let mut cur_n = vec![0.0f32; m * hidden];
+            let mut laurel_out = vec![0.0f32; m * hidden];
+            for t in 0..m {
+                let hr = |b: usize| &h[b][t * hidden..(t + 1) * hidden];
+                let modal = self.modalities(hr(I_ACT), il);
+                let mut coefs = vec![0.0f32; N_ALTUP * N_ALTUP];
+                f32matmul(&mut coefs, &modal, &lay.altup_predict_coef, N_ALTUP, N_ALTUP * N_ALTUP);
+                for b2 in 0..N_ALTUP {
+                    for a in 0..N_ALTUP {
+                        let c = coefs[a + N_ALTUP * b2];
+                        if c != 0.0 {
+                            for e in 0..hidden {
+                                pred[b2][t * hidden + e] += c * h[a][t * hidden + e];
+                            }
+                        }
+                    }
+                }
+                let ap = &pred[I_ACT][t * hidden..(t + 1) * hidden];
+                active[t * hidden..(t + 1) * hidden].copy_from_slice(ap);
+                let cn = &mut cur_n[t * hidden..(t + 1) * hidden];
+                rmsnorm(cn, ap, &lay.attn_norm, cfg.eps);
+                // laurel
+                let mut lo = vec![0.0f32; LAUREL_RANK];
+                f32matmul(&mut lo, cn, &lay.laurel_l, hidden, LAUREL_RANK);
+                let mut lr = vec![0.0f32; hidden];
+                f32matmul(&mut lr, &lo, &lay.laurel_r, LAUREL_RANK, hidden);
+                let mut ln = vec![0.0f32; hidden];
+                rmsnorm(&mut ln, &lr, &lay.laurel_post_norm, cfg.eps);
+                for e in 0..hidden {
+                    laurel_out[t * hidden + e] = ln[e] + cn[e];
+                }
+            }
+
+            let mut q = vec![0.0f32; m * q_dim];
+            self.bmm(&bnm("attn_q.weight"), NpuW::Q, il, &cur_n, m, hidden, q_dim, &mut q)?;
+            if own_kv {
+                let mut k = vec![0.0f32; m * kv_dim];
+                let mut v = vec![0.0f32; m * kv_dim];
+                self.bmm(&bnm("attn_k.weight"), NpuW::K, il, &cur_n, m, hidden, kv_dim, &mut k)?;
+                self.bmm(&bnm("attn_v.weight"), NpuW::V, il, &cur_n, m, hidden, kv_dim, &mut v)?;
+                for t in 0..m {
+                    for kh in 0..nkv {
+                        let kk = &mut k[t * kv_dim + kh * hd..t * kv_dim + kh * hd + hd];
+                        let mut tt = vec![0.0f32; hd];
+                        rmsnorm(&mut tt, kk, &lay.k_norm, cfg.eps);
+                        kk.copy_from_slice(&tt);
+                        rope_neox(kk, t, hd, rope_base);
+                        let vv = &mut v[t * kv_dim + kh * hd..t * kv_dim + kh * hd + hd];
+                        let mut tv = vec![0.0f32; hd];
+                        rmsnorm_nw(&mut tv, vv, cfg.eps);
+                        vv.copy_from_slice(&tv);
+                    }
+                }
+                self.kc[il].extend_from_slice(&k);
+                self.vc[il].extend_from_slice(&v);
+            }
+            for t in 0..m {
+                for hh in 0..nh {
+                    let qh = &mut q[t * q_dim + hh * hd..t * q_dim + hh * hd + hd];
+                    let mut tt = vec![0.0f32; hd];
+                    rmsnorm(&mut tt, qh, &lay.q_norm, cfg.eps);
+                    qh.copy_from_slice(&tt);
+                    rope_neox(qh, t, hd, rope_base);
+                }
+            }
+            let src = if own_kv {
+                il
+            } else if swa {
+                cfg.kv_from_start - 2
+            } else {
+                cfg.kv_from_start - 1
+            };
+            let kc = &self.kc[src];
+            let vc = &self.vc[src];
+            let mut attn = vec![0.0f32; m * q_dim];
+            attn.par_chunks_mut(q_dim).enumerate().for_each(|(t, arow)| {
+                let len = t + 1; // causal
+                let ws = if swa && cfg.n_swa > 0 && len > cfg.n_swa { len - cfg.n_swa } else { 0 };
+                for hh in 0..nh {
+                    let kvh = hh / groups;
+                    let qh = &q[t * q_dim + hh * hd..t * q_dim + hh * hd + hd];
+                    let mut sc = vec![0.0f32; len - ws];
+                    for (i, j) in (ws..len).enumerate() {
+                        let kk = &kc[(j * nkv + kvh) * hd..(j * nkv + kvh) * hd + hd];
+                        sc[i] = dot_f32(qh, kk); // scale = 1.0
+                    }
+                    let mx = sc.iter().cloned().fold(f32::MIN, f32::max);
+                    let mut sum = 0.0f32;
+                    for s in sc.iter_mut() {
+                        *s = (*s - mx).exp();
+                        sum += *s;
+                    }
+                    let inv = 1.0 / sum;
+                    let oh = &mut arow[hh * hd..hh * hd + hd];
+                    for d in 0..hd {
+                        let mut acc = 0.0f32;
+                        for (i, j) in (ws..len).enumerate() {
+                            acc += sc[i] * vc[(j * nkv + kvh) * hd + d];
+                        }
+                        oh[d] = acc * inv;
+                    }
+                }
+            });
+            let mut o = vec![0.0f32; m * hidden];
+            self.bmm(&bnm("attn_output.weight"), NpuW::O, il, &attn, m, q_dim, hidden, &mut o)?;
+
+            // post-attn norm + gated residual + laurel, then ffn norm → FN
+            let mut attn_laurel = vec![0.0f32; m * hidden];
+            let mut fn_in = vec![0.0f32; m * hidden];
+            for t in 0..m {
+                let mut pa = vec![0.0f32; hidden];
+                rmsnorm(&mut pa, &o[t * hidden..(t + 1) * hidden], &lay.post_attn_norm, cfg.eps);
+                for e in 0..hidden {
+                    pa[e] += active[t * hidden + e];
+                    attn_laurel[t * hidden + e] = (pa[e] + laurel_out[t * hidden + e]) * inv_sqrt2;
+                }
+                rmsnorm(&mut fn_in[t * hidden..(t + 1) * hidden], &attn_laurel[t * hidden..(t + 1) * hidden], &lay.ffn_norm, cfg.eps);
+            }
+            let nff = cfg.ffn[il];
+            let mut gate = vec![0.0f32; m * nff];
+            let mut up = vec![0.0f32; m * nff];
+            self.bmm(&bnm("ffn_gate.weight"), NpuW::Gate, il, &fn_in, m, hidden, nff, &mut gate)?;
+            self.bmm(&bnm("ffn_up.weight"), NpuW::Up, il, &fn_in, m, hidden, nff, &mut up)?;
+            for t in 0..m {
+                let g = &mut gate[t * nff..(t + 1) * nff];
+                if il < cfg.n_sparsity {
+                    let mean = g.iter().sum::<f32>() / nff as f32;
+                    let var = g.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / (nff as f32 - 1.0);
+                    let cutoff = mean + cfg.sparsity_mul * var.sqrt();
+                    for v in g.iter_mut() {
+                        *v = (*v - cutoff).max(0.0);
+                    }
+                }
+                for i in 0..nff {
+                    g[i] = gelu_tanh(g[i]) * up[t * nff + i];
+                }
+            }
+            let mut ff = vec![0.0f32; m * hidden];
+            self.bmm(&bnm("ffn_down.weight"), NpuW::Down, il, &gate, m, nff, hidden, &mut ff)?;
+
+            // AltUp correct + first_prediction → next streams
+            for t in 0..m {
+                let mut pf = vec![0.0f32; hidden];
+                rmsnorm(&mut pf, &ff[t * hidden..(t + 1) * hidden], &lay.post_ffw_norm, cfg.eps);
+                let mut afg = vec![0.0f32; hidden];
+                for e in 0..hidden {
+                    afg[e] = pf[e] + attn_laurel[t * hidden + e];
+                }
+                let modal2 = self.modalities(&afg, il);
+                let mut cc = [0.0f32; N_ALTUP];
+                f32matmul(&mut cc, &modal2, &lay.altup_correct_coef, N_ALTUP, N_ALTUP);
+                for v in cc.iter_mut() {
+                    *v += 1.0;
+                }
+                let mut corr: Vec<Vec<f32>> = (0..N_ALTUP).map(|b2| pred[b2][t * hidden..(t + 1) * hidden].to_vec()).collect();
+                for e in 0..hidden {
+                    let innov = afg[e] - pred[I_ACT][t * hidden + e];
+                    for b2 in 0..N_ALTUP {
+                        corr[b2][e] += innov * cc[b2];
+                    }
+                }
+                // first_prediction → streams 1..3
+                let mut fp = vec![0.0f32; hidden];
+                for e in 0..hidden {
+                    fp[e] = corr[I_ACT][e] * lay.altup_correct_scale[e];
+                }
+                let mut g = vec![0.0f32; ea];
+                f32matmul(&mut g, &fp, &lay.per_layer_inp_gate, hidden, ea);
+                let off = t * ea * nl + il * ea;
+                for j in 0..ea {
+                    g[j] = gelu_tanh(g[j]) * inp_per_layer[off + j];
+                }
+                let mut pj = vec![0.0f32; hidden];
+                f32matmul(&mut pj, &g, &lay.per_layer_proj, ea, hidden);
+                let mut pn = vec![0.0f32; hidden];
+                rmsnorm(&mut pn, &pj, &lay.per_layer_post_norm, cfg.eps);
+                for b2 in 0..N_ALTUP {
+                    for e in 0..hidden {
+                        h[b2][t * hidden + e] = corr[b2][e] + if b2 >= 1 { pn[e] } else { 0.0 };
+                    }
+                }
+            }
+        }
+        self.pos = m;
+        // merge streams for the last token only → logits
+        let t = m - 1;
+        let act = h[I_ACT][t * hidden..(t + 1) * hidden].to_vec();
+        let tgt = l2(&act);
+        let mut merged = act;
+        for i in 0..N_ALTUP - 1 {
+            let mut u = vec![0.0f32; hidden];
+            f32matmul(&mut u, &h[i + 1][t * hidden..(t + 1) * hidden], &self.altup_unembd_proj[i], hidden, hidden);
+            let r = tgt / l2(&u).max(1e-12);
+            for e in 0..hidden {
+                merged[e] += u[e] * r;
+            }
+        }
+        let inv_na = 1.0 / N_ALTUP as f32;
+        for v in merged.iter_mut() {
+            *v *= inv_na;
+        }
+        let mut nfinal = vec![0.0f32; hidden];
+        rmsnorm(&mut nfinal, &merged, &self.output_norm, cfg.eps);
+        let head_name = if self.gguf.tensors().contains_key("output.weight") {
+            "output.weight"
+        } else {
+            "token_embd.weight"
+        };
+        self.mm(head_name, &nfinal)
+    }
 }
 
 impl Decoder for Gemma3nModel {
     fn prefill(&mut self, input_tokens: &[u32]) -> Result<Logits> {
         if input_tokens.is_empty() {
             return Err(StrixError::invalid("gemma3n: empty prompt"));
+        }
+        #[cfg(feature = "npu")]
+        if self.npu.is_some() {
+            return Ok(Logits::new(self.prefill_batch(input_tokens)?));
         }
         let mut last = Vec::new();
         for &t in input_tokens {
