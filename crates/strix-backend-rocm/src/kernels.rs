@@ -1396,12 +1396,11 @@ extern "C" __global__ void q4i_moe_gu(const float* __restrict__ gs, const unsign
         int bi = b4 + (l >> 3);
         float d = sc[bi];
         // load 2 packed bytes -> 4 signed int4 -> int (4x i8)
-        const unsigned char* pb = qr + (long long)bi * 16 + (e >> 1);
-        unsigned char b0 = pb[0], b1 = pb[1];
-        int w = ((int)((b0 & 0xF) - 8) & 0xFF)
-              | (((int)((b0 >> 4) - 8) & 0xFF) << 8)
-              | (((int)((b1 & 0xF) - 8) & 0xFF) << 16)
-              | (((int)((b1 >> 4) - 8) & 0xFF) << 24);
+        unsigned short pk = *(const unsigned short*)(qr + (long long)bi * 16 + (e >> 1));
+        int w = ((int)((pk & 0xF) - 8) & 0xFF)
+              | (((int)(((pk >> 4) & 0xF) - 8) & 0xFF) << 8)
+              | (((int)(((pk >> 8) & 0xF) - 8) & 0xFF) << 16)
+              | (((int)(((pk >> 12) & 0xF) - 8) & 0xFF) << 24);
         const int x4 = *(const int*)(xq + bi * 32 + e);
         acc += d * (float)__builtin_amdgcn_sudot4(true, w, true, x4, 0, false);
     }
@@ -1427,12 +1426,11 @@ extern "C" __global__ void q4i_moe_down(const float* __restrict__ ds, const unsi
     for (int b4 = 0; b4 < nb; b4 += 4) {
         int bi = b4 + (l >> 3);
         float d = sc[bi];
-        const unsigned char* pb = qr + (long long)bi * 16 + (e >> 1);
-        unsigned char b0 = pb[0], b1 = pb[1];
-        int w = ((int)((b0 & 0xF) - 8) & 0xFF)
-              | (((int)((b0 >> 4) - 8) & 0xFF) << 8)
-              | (((int)((b1 & 0xF) - 8) & 0xFF) << 16)
-              | (((int)((b1 >> 4) - 8) & 0xFF) << 24);
+        unsigned short pk = *(const unsigned short*)(qr + (long long)bi * 16 + (e >> 1));
+        int w = ((int)((pk & 0xF) - 8) & 0xFF)
+              | (((int)(((pk >> 4) & 0xF) - 8) & 0xFF) << 8)
+              | (((int)(((pk >> 8) & 0xF) - 8) & 0xFF) << 16)
+              | (((int)(((pk >> 12) & 0xF) - 8) & 0xFF) << 24);
         const int x4 = *(const int*)(xk + bi * 32 + e);
         acc += d * (float)__builtin_amdgcn_sudot4(true, w, true, x4, 0, false);
     }
