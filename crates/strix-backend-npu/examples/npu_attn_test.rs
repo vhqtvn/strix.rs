@@ -24,19 +24,22 @@ fn main() {
         Err(_) => load_instr_bin(&raw).expect("insts"),
     };
 
-    // deterministic small inputs
-    let q: Vec<f32> = (0..m * d).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+    // GQA: nh query heads (m positions each) share ONE kv head (l keys).
+    let lb = parse(6, 32);
+    let mt = parse(7, m);
+    let nh = parse(9, 1);
+    // deterministic inputs: q is nh*m*d (head-major), k/v are one shared kv head.
+    let q: Vec<f32> = (0..nh * m * d).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
     let k: Vec<f32> = (0..l * d).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
     let v: Vec<f32> = (0..l * d).map(|i| ((i % 11) as f32 - 5.0) * 0.1).collect();
 
-    // pack bf16 LE in the STREAMING + QUERY-TILED layout:
-    //   [ Q (m*d) | KV blocks replicated per query tile ]
-    // mt = query-tile size (default = m → NQT=1, no tiling). Each tile re-reads
-    // all KV blocks, so the host replicates them NQT times (no stride-0 DMA).
-    let lb = parse(6, 32);
-    let mt = parse(7, m);
-    let nqt = m / mt;
-    let mut inb: Vec<u8> = Vec::with_capacity((m * d + nqt * 2 * l * d) * 2);
+    // pack bf16 LE in the GQA + STREAMING + QUERY-TILED layout:
+    //   [ Q (nh*m*d, head-major) | KV blocks replicated per query tile ]
+    // nqt = nh * (m/mt) query tiles; each re-reads all KV blocks (host replicates
+    // the shared kv head's blocks nqt times — no stride-0 DMA).
+    let tph = m / mt;
+    let nqt = nh * tph;
+    let mut inb: Vec<u8> = Vec::with_capacity((nh * m * d + nqt * 2 * l * d) * 2);
     let push = |buf: &mut Vec<u8>, x: f32| buf.extend_from_slice(&f2bf(x).to_le_bytes());
     for &x in q.iter() {
         push(&mut inb, x);
@@ -56,7 +59,7 @@ fn main() {
         }
     }
 
-    let out = run_attn(xclbin, "MLIR_AIE", &insts, &inb, m * d * 2).expect("run_attn FAILED");
+    let out = run_attn(xclbin, "MLIR_AIE", &insts, &inb, nh * m * d * 2).expect("run_attn FAILED");
     let raw_bf: Vec<u16> = out.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
     let npu: Vec<f32> = raw_bf.iter().map(|&b| bf2f(b)).collect();
     // raw byte diagnostics: 0xFFFF / 0x7FC0 patterns ⇒ kernel never wrote the BO.
@@ -73,16 +76,19 @@ fn main() {
     let r = |x: &f32| bf2f(f2bf(*x));
     let (qb, kb, vb): (Vec<f32>, Vec<f32>, Vec<f32>) =
         (q.iter().map(r).collect(), k.iter().map(r).collect(), v.iter().map(r).collect());
-    // causal (arg 8): query i (global) attends keys 0..=i only.
+    // causal (arg 8): query position i attends keys 0..=i only.
     let causal = parse(8, 0) == 1;
-    let mut cpu = vec![0f32; m * d];
-    for i in 0..m {
+    // per head h, per position i: attention over the SHARED kv head (GQA).
+    let mut cpu = vec![0f32; nh * m * d];
+    for hi in 0..nh * m {
+        let i = hi % m; // position within the head (causal uses this, not the head)
+        let qoff = hi * d;
         let jhi = if causal { (i + 1).min(l) } else { l };
         let mut sc = vec![0f32; jhi];
         for j in 0..jhi {
             let mut s = 0.0;
             for dd in 0..d {
-                s += qb[i * d + dd] * kb[j * d + dd];
+                s += qb[qoff + dd] * kb[j * d + dd];
             }
             sc[j] = s;
         }
@@ -98,7 +104,7 @@ fn main() {
             for j in 0..jhi {
                 o += sc[j] * vb[j * d + dd];
             }
-            cpu[i * d + dd] = o * inv;
+            cpu[qoff + dd] = o * inv;
         }
     }
 
@@ -142,19 +148,19 @@ fn main() {
         }
         dot / (na.sqrt() * nb.sqrt())
     };
-    // if the NPU matches first-block-only, streaming/carry is broken.
+    // diagnostics compare head-0 only (attn_range covers one head); full uses all.
     let b0 = attn_range(0, lb);
     let bl = attn_range(l - lb, l);
     println!(
-        "diag cosine: vs full {:.4} | vs first-block-only {:.4} | vs last-block-only {:.4}",
+        "diag cosine: vs full {:.4} | vs first-block-only(h0) {:.4} | vs last-block-only(h0) {:.4}",
         cos(&npu, &cpu),
-        cos(&npu, &b0),
-        cos(&npu, &bl)
+        cos(&npu[..m * d], &b0),
+        cos(&npu[..m * d], &bl)
     );
 
     let (mut maxabs, mut err2, mut ref2, mut dot, mut na, mut nb) = (0f32, 0f32, 0f32, 0f32, 0f32, 0f32);
     let mut bad = false;
-    for i in 0..m * d {
+    for i in 0..nh * m * d {
         let e = npu[i] - cpu[i];
         if !e.is_finite() {
             bad = true;

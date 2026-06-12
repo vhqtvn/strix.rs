@@ -16,20 +16,23 @@ from aie.iron.controlflow import range_
 from aie.helpers.taplib import TensorAccessPattern
 
 
-def attention(MT, MQ, L, D, LB, KVDEPTH=2):
+def attention(MT, MQ, L, D, LB, KVDEPTH=2, NH=1):
     assert L % LB == 0, "block size LB must divide L"
-    assert MQ % MT == 0, "Mtile must divide total queries"
+    assert MQ % MT == 0, "Mtile must divide queries-per-head"
     NBLK = L // LB
-    NQT = MQ // MT
-    # Host input layout: [ Q (MQ*D) | KV blocks REPLICATED per query tile ].
-    # Each query tile attends to all L keys, so K/V must be re-streamed per tile.
-    # The AIE shim DMA has no stride-0 broadcast read, so instead of re-reading
-    # one KV copy we replicate it NQT times in the host buffer → a plain
-    # contiguous tap. (A memtile broadcast would avoid the DDR replication; TODO.)
-    T = MQ * D + NQT * NBLK * 2 * LB * D
+    TPH = MQ // MT       # position-tiles per query head
+    NQT = NH * TPH       # total query tiles across all NH query heads (GQA group)
+    # GQA: NH query heads share ONE streamed KV head. Query tiles are laid out
+    # head-major (head0's TPH tiles, head1's, ...); each re-streams the shared KV.
+    # The causal index passed per tile is the POSITION-tile within the head
+    # (qti % TPH), so masking is per-position and head-independent.
+    # Host input layout: [ Q (NH*MQ*D) | KV blocks REPLICATED per query tile ].
+    # (AIE shim DMA has no stride-0 broadcast read → replicate KV NQT× in DDR;
+    # a memtile broadcast would avoid the replication — perf TODO.)
+    T = NH * MQ * D + NQT * NBLK * 2 * LB * D
 
     in_ty = np.ndarray[(T,), np.dtype[bfloat16]]
-    o_all_ty = np.ndarray[(MQ * D,), np.dtype[bfloat16]]
+    o_all_ty = np.ndarray[(NH * MQ * D,), np.dtype[bfloat16]]
     q_ty = np.ndarray[(MT * D,), np.dtype[bfloat16]]
     o_ty = np.ndarray[(MT * D,), np.dtype[bfloat16]]
     kv_ty = np.ndarray[(2 * LB * D,), np.dtype[bfloat16]]
@@ -53,11 +56,12 @@ def attention(MT, MQ, L, D, LB, KVDEPTH=2):
         # kernel can take as scalar args (an scf.for index is MLIR `index`, not
         # i32). Fine at these sizes (NQT*NBLK calls); very long seqs would want an
         # index_cast in a range_ loop (scalability TODO).
-        for qt in range(NQT):  # query tiles
+        for qti in range(NQT):  # query tiles (head-major across the GQA group)
+            pt = qti % TPH       # position-tile within this head → causal index
             eq = q_in.acquire(1)
             for kb in range(NBLK):  # KV blocks
                 ek = kv_in.acquire(1)
-                kblk(eq, ek, mb, lb, ob, qt, kb)  # loop indices → causal mask
+                kblk(eq, ek, mb, lb, ob, pt, kb)  # pt,kb → causal mask
                 kv_in.release(1)
             eo = o_out.acquire(1)
             kfin(ob, lb, mb, eo)  # normalize + re-arm (m,l) for the next tile
@@ -79,10 +83,10 @@ def attention(MT, MQ, L, D, LB, KVDEPTH=2):
         rt.fill(
             of_kv.prod(),
             IN,
-            tap=TensorAccessPattern((T,), MQ * D, [NQT * NBLK, 2 * LB, D], [2 * LB * D, D, 1]),
+            tap=TensorAccessPattern((T,), NH * MQ * D, [NQT * NBLK, 2 * LB, D], [2 * LB * D, D, 1]),
         )
-        # O: NQT output tiles.
-        rt.drain(of_o.cons(), O, tap=TensorAccessPattern((MQ * D,), 0, [NQT, MT, D], [MT * D, D, 1]), wait=True)
+        # O: NQT output tiles (head-major).
+        rt.drain(of_o.cons(), O, tap=TensorAccessPattern((NH * MQ * D,), 0, [NQT, MT, D], [MT * D, D, 1]), wait=True)
 
     return Program(NPU2(), rt).resolve_program()
 
@@ -94,6 +98,7 @@ if __name__ == "__main__":
     ap.add_argument("-K", type=int, default=64)          # L
     ap.add_argument("-N", type=int, default=64)          # D
     ap.add_argument("--lb", type=int, default=32)
+    ap.add_argument("--nh", type=int, default=1)  # query heads sharing one KV head (GQA)
     ap.add_argument("--kvdepth", type=int, default=2)
     ap.add_argument("--dev", type=str, default="npu2")
     ap.add_argument("--dtype_in", type=str, default="bf16")
@@ -104,4 +109,4 @@ if __name__ == "__main__":
     ap.add_argument("--generate-taps", action="store_true")
     a = ap.parse_args()
     mq = a.mq if a.mq > 0 else a.M
-    print(attention(a.M, mq, a.K, a.N, a.lb, a.kvdepth))
+    print(attention(a.M, mq, a.K, a.N, a.lb, a.kvdepth, a.nh))

@@ -11,12 +11,14 @@ N?=64
 LB?=32
 KVDEPTH?=2
 CAUSAL?=0
+NH?=1
 kernels=attention
-aieargs+=-M $M --mq ${MQ} -K $K -N $N --lb ${LB} --kvdepth ${KVDEPTH}
+aieargs+=-M $M --mq ${MQ} -K $K -N $N --lb ${LB} --kvdepth ${KVDEPTH} --nh ${NH}
+_sfx=${MQ}x${K}x${N}_m${M}_h${NH}
 ifeq (${CAUSAL},1)
-target_suffix=${MQ}x${K}x${N}_m${M}_causal
+target_suffix=${_sfx}_causal
 else
-target_suffix=${MQ}x${K}x${N}_m${M}
+target_suffix=${_sfx}
 endif
 use_placed?=0
 use_iron?=0
