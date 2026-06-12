@@ -148,6 +148,23 @@ mod xrt {
         ) -> c_int;
         fn strix_npu_gemm_wait(h: *mut c_void, errbuf: *mut c_char, errcap: usize) -> c_int;
         fn strix_npu_gemm_close(h: *mut c_void);
+
+        // Persistent fused-attention context (open xclbin once, reuse the BOs).
+        #[allow(clippy::too_many_arguments)]
+        fn strix_npu_attn_open(
+            xclbin: *const c_char,
+            kernel: *const c_char,
+            instr: *const u32,
+            instr_words: usize,
+            in_cap: usize,
+            out_cap: usize,
+            in_host: *mut *mut c_void,
+            out_host: *mut *mut c_void,
+            errbuf: *mut c_char,
+            errcap: usize,
+        ) -> *mut c_void;
+        fn strix_npu_attn_run(h: *mut c_void, errbuf: *mut c_char, errcap: usize) -> c_int;
+        fn strix_npu_attn_close(h: *mut c_void);
     }
 
     /// A fixed-shape NPU GEMM with staged weights, zero-copy host I/O, and async
@@ -244,6 +261,77 @@ mod xrt {
     impl Drop for Gemm {
         fn drop(&mut self) {
             unsafe { strix_npu_gemm_close(self.handle) };
+        }
+    }
+
+    /// Persistent fused-attention context: opens the xclbin once, then runs many
+    /// times over the same mapped host_only BOs (no per-call register_xclbin).
+    pub struct AttnCtx {
+        handle: *mut c_void,
+        in_host: *mut c_void,
+        out_host: *mut c_void,
+        in_cap: usize,
+    }
+    unsafe impl Send for AttnCtx {}
+    unsafe impl Sync for AttnCtx {}
+
+    impl AttnCtx {
+        pub fn open(
+            xclbin_path: &str,
+            kernel_name: &str,
+            instr: &[u32],
+            in_cap: usize,
+            out_cap: usize,
+        ) -> Result<Self, String> {
+            let cx = CString::new(xclbin_path).map_err(|_| "xclbin NUL")?;
+            let ck = CString::new(kernel_name).map_err(|_| "kernel NUL")?;
+            let mut err = [0 as c_char; 512];
+            let (mut in_host, mut out_host): (*mut c_void, *mut c_void) =
+                (std::ptr::null_mut(), std::ptr::null_mut());
+            let h = unsafe {
+                strix_npu_attn_open(
+                    cx.as_ptr(),
+                    ck.as_ptr(),
+                    instr.as_ptr(),
+                    instr.len(),
+                    in_cap,
+                    out_cap,
+                    &mut in_host,
+                    &mut out_host,
+                    err.as_mut_ptr(),
+                    err.len(),
+                )
+            };
+            if h.is_null() {
+                Err(format!("npu_attn_open: {}", cbuf_to_string(&err)))
+            } else {
+                Ok(AttnCtx { handle: h, in_host, out_host, in_cap })
+            }
+        }
+
+        /// Copy `input` into the mapped input BO, run, and copy `out_bytes` of the
+        /// output BO into a fresh Vec.
+        pub fn run(&self, input: &[u8], out_bytes: usize) -> Result<Vec<u8>, String> {
+            if input.len() > self.in_cap {
+                return Err(format!("attn input {} > cap {}", input.len(), self.in_cap));
+            }
+            let mut err = [0 as c_char; 512];
+            unsafe {
+                std::ptr::copy_nonoverlapping(input.as_ptr(), self.in_host as *mut u8, input.len());
+            }
+            let r = unsafe { strix_npu_attn_run(self.handle, err.as_mut_ptr(), err.len()) };
+            if r != 0 {
+                return Err(format!("npu_attn_run: {}", cbuf_to_string(&err)));
+            }
+            let out =
+                unsafe { std::slice::from_raw_parts(self.out_host as *const u8, out_bytes) };
+            Ok(out.to_vec())
+        }
+    }
+
+    impl Drop for AttnCtx {
+        fn drop(&mut self) {
+            unsafe { strix_npu_attn_close(self.handle) };
         }
     }
 
@@ -626,6 +714,10 @@ pub use xrt::Context as NpuContext;
 /// A fixed-shape hybrid NPU GEMM: staged weights, zero-copy host I/O, async run.
 #[cfg(feature = "ryzen-ai")]
 pub use xrt::Gemm as NpuGemm;
+
+/// A persistent fused-attention context: open the xclbin once, run many times.
+#[cfg(feature = "ryzen-ai")]
+pub use xrt::AttnCtx as NpuAttnCtx;
 
 /// Exercise the xclbin load chain (alloc → UUID → load to device) for a real
 /// `.xclbin`, proving the NPU host loader works. Returns the UUID hex or error.

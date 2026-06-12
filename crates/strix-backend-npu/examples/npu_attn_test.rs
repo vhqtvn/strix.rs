@@ -59,6 +59,21 @@ fn main() {
         }
     }
 
+    // STRIX_ATTN_LOOP=N: open a PERSISTENT context once, run N times, report
+    // per-run latency (isolates the kernel+dispatch cost from xclbin reopen).
+    if let Ok(n) = std::env::var("STRIX_ATTN_LOOP").map(|s| s.parse::<u32>().unwrap_or(0)) {
+        if n > 0 {
+            let ctx = strix_backend_npu::NpuAttnCtx::open(xclbin, "MLIR_AIE", &insts, inb.len(), nh * m * d * 2)
+                .expect("attn ctx open");
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                ctx.run(&inb, nh * m * d * 2).expect("ctx run");
+            }
+            let per = t0.elapsed().as_secs_f64() / n as f64;
+            println!("persistent ctx: {n} runs, {:.3} ms/run", per * 1000.0);
+            return;
+        }
+    }
     let out = run_attn(xclbin, "MLIR_AIE", &insts, &inb, nh * m * d * 2).expect("run_attn FAILED");
     let raw_bf: Vec<u16> = out.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
     let npu: Vec<f32> = raw_bf.iter().map(|&b| bf2f(b)).collect();

@@ -465,17 +465,19 @@ fn bf2f(b: u16) -> f32 {
 }
 
 pub struct AttnShape {
-    xclbin: String,
-    insts: Vec<u32>,
+    ctx: strix_backend_npu::NpuAttnCtx, // persistent kernel context (opened once)
     pub bucket: usize, // B: max seq positions (= L)
     pub mt: usize,     // query-tile size
     pub lb: usize,     // kv block size
     pub nh: usize,     // q-heads per kv-head (GQA group)
     pub hd: usize,     // head_dim
 }
+// The NpuAttnCtx handle is reused read-only across the rayon pool.
+unsafe impl Sync for AttnShape {}
 
 impl AttnShape {
-    /// Load a causal flash-attention xclbin from `dir`. File naming:
+    /// Load a causal flash-attention xclbin from `dir` into a PERSISTENT context
+    /// (open once, run many — no per-call register_xclbin). File naming:
     ///   final_attn_b{B}_m{MT}_l{LB}_h{NH}_d{HD}.xclbin  (+ insts_*.txt)
     pub fn open(dir: &str, b: usize, mt: usize, lb: usize, nh: usize, hd: usize) -> Result<AttnShape> {
         let stem = format!("attn_b{b}_m{mt}_l{lb}_h{nh}_d{hd}");
@@ -487,7 +489,13 @@ impl AttnShape {
             Ok(t) => load_instr_txt(t).map_err(StrixError::backend)?,
             Err(_) => load_instr_bin(&raw).map_err(StrixError::backend)?,
         };
-        Ok(AttnShape { xclbin, insts, bucket: b, mt, lb, nh, hd })
+        // capacities: in = [Q (nh*B*hd) | KV replicated NQT×] bf16; out = nh*B*hd bf16.
+        let nqt = nh * (b / mt);
+        let in_cap = (nh * b * hd + nqt * 2 * b * hd) * 2;
+        let out_cap = nh * b * hd * 2;
+        let ctx = strix_backend_npu::NpuAttnCtx::open(&xclbin, "MLIR_AIE", &insts, in_cap, out_cap)
+            .map_err(|e| StrixError::backend(format!("attn ctx open {stem}: {e}")))?;
+        Ok(AttnShape { ctx, bucket: b, mt, lb, nh, hd })
     }
 
     /// Causal SDPA for the whole layer on the NPU. Inputs are the model's prefill
@@ -560,7 +568,9 @@ impl AttnShape {
                 }
             }
 
-            let out = strix_backend_npu::run_attn(&self.xclbin, "MLIR_AIE", &self.insts, &inb, out_bytes)
+            let out = self
+                .ctx
+                .run(&inb, out_bytes)
                 .map_err(|e| StrixError::backend(format!("npu attn run: {e}")))?;
 
             // scatter head-major output [nh, B, hd] → attn[t, (kvh*groups+g)*hd..]

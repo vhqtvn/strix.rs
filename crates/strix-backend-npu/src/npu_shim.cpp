@@ -323,4 +323,57 @@ int strix_npu_gemm_wait(void* h, char* errbuf, size_t errcap) {
 
 void strix_npu_gemm_close(void* h) { delete static_cast<NpuGemm*>(h); }
 
+// --- Persistent fused-attention context (2-buffer: in, out) ---
+// Open the xclbin ONCE (register + hw_context + kernel + BOs), then run many
+// times reusing the mapped host_only BOs (zero-copy). Eliminates the ~350ms
+// register_xclbin/hw_context cost that one-shot strix_npu_attn pays per call.
+struct NpuAttn {
+    xrt::device device;
+    xrt::hw_context context;
+    xrt::kernel kernel;
+    xrt::bo bo_instr, bo_in, bo_out;
+    uint32_t instr_words = 0;
+};
+
+void* strix_npu_attn_open(const char* xclbin_path, const char* kernel_name,
+                          const uint32_t* instr, size_t instr_words,
+                          size_t in_cap, size_t out_cap,
+                          void** in_host, void** out_host, char* errbuf, size_t errcap) {
+    try {
+        xrt::device device(0);
+        auto xclbin = xrt::xclbin(std::string(xclbin_path));
+        device.register_xclbin(xclbin);
+        xrt::hw_context context(device, xclbin.get_uuid());
+        xrt::kernel kernel(context, std::string(kernel_name));
+        auto* g = new NpuAttn{std::move(device), std::move(context), std::move(kernel)};
+        const size_t ib = instr_words * sizeof(uint32_t);
+        g->bo_instr = xrt::bo(g->device, ib, xrt::bo::flags::cacheable, g->kernel.group_id(1));
+        g->bo_in = xrt::bo(g->device, in_cap, xrt::bo::flags::host_only, g->kernel.group_id(3));
+        g->bo_out = xrt::bo(g->device, out_cap, xrt::bo::flags::host_only, g->kernel.group_id(4));
+        std::memcpy(g->bo_instr.map<void*>(), instr, ib);
+        g->bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        g->instr_words = (uint32_t)instr_words;
+        *in_host = g->bo_in.map<void*>();
+        *out_host = g->bo_out.map<void*>();
+        return g;
+    } catch (const std::exception& e) { set_err(errbuf, errcap, e.what()); return nullptr; }
+    catch (...) { set_err(errbuf, errcap, "unknown C++ exception"); return nullptr; }
+}
+
+// Caller has written the packed input into *in_host. Sync in → run → wait →
+// sync out; caller then reads *out_host.
+int strix_npu_attn_run(void* h, char* errbuf, size_t errcap) {
+    auto* g = static_cast<NpuAttn*>(h);
+    try {
+        g->bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        auto run = g->kernel(3u, g->bo_instr, g->instr_words, g->bo_in, g->bo_out);
+        run.wait();
+        g->bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        return 0;
+    } catch (const std::exception& e) { set_err(errbuf, errcap, e.what()); return 1; }
+    catch (...) { set_err(errbuf, errcap, "unknown C++ exception"); return 2; }
+}
+
+void strix_npu_attn_close(void* h) { delete static_cast<NpuAttn*>(h); }
+
 } // extern "C"
