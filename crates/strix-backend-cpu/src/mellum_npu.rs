@@ -364,10 +364,25 @@ pub struct SmolLm3Npu {
     pub down: NpuShape,
     pub qkv: Option<NpuShape>, // 2048 -> 3072 (2048+512+512)
     pub gu2: Option<NpuShape>, // 2048 -> 22016 (11008+11008)
+    pub attn: Option<AttnShape>, // stage-3 fused NPU SDPA (STRIX_NPU_ATTN)
 }
 
 impl SmolLm3Npu {
     pub fn open(dir: &str) -> Result<SmolLm3Npu> {
+        // Fused NPU SDPA: opt-in via STRIX_NPU_ATTN; bucket via STRIX_NPU_ATTN_B
+        // (default 256). smollm3 is GQA groups=4, head_dim=128.
+        let attn = if std::env::var("STRIX_NPU_ATTN").is_ok() {
+            let b: usize = std::env::var("STRIX_NPU_ATTN_B").ok().and_then(|s| s.parse().ok()).unwrap_or(256);
+            match AttnShape::open(dir, b, 32, 32, 4, 128) {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    eprintln!("[npu-attn] disabled ({e})");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Ok(SmolLm3Npu {
             qo: NpuShape::open(dir, 2048, 2048, 8)?,
             kv: NpuShape::open(dir, 2048, 512, 8)?,
@@ -375,6 +390,7 @@ impl SmolLm3Npu {
             down: NpuShape::open(dir, 11008, 2048, 8)?,
             qkv: NpuShape::open(dir, 2048, 3072, 8).ok(),
             gu2: NpuShape::open(dir, 2048, 22016, 8).ok(),
+            attn,
         })
     }
 }
@@ -425,5 +441,140 @@ impl Gemma3nNpu {
             plproj: NpuShape::open(dir, 2048, 8960, 4)?,
             qkv: NpuShape::open(dir, 2048, 3072, 8).ok(),
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NPU fused flash-attention (stage-3): causal SDPA on the XDNA2 NPU.
+// The fixed-shape kernel (docs/npu-build/attention) is built per bucket B (seq),
+// query-tile MT, kv-block LB, group size NH (q-heads per kv-head), head_dim HD.
+// One run handles ONE kv-head's group; we loop the model's n_kv heads. Sequences
+// shorter than B are padded (causal masks padding keys; padding-query outputs are
+// discarded). See [[npu-fusion-rewrite]] in memory.
+// ---------------------------------------------------------------------------
+#[inline]
+fn f2bf(x: f32) -> u16 {
+    // round-to-nearest-even bf16 (matches typical bf16 cast)
+    let b = x.to_bits();
+    let r = (b >> 16) & 1;
+    ((b.wrapping_add(0x7fff + r)) >> 16) as u16
+}
+#[inline]
+fn bf2f(b: u16) -> f32 {
+    f32::from_bits((b as u32) << 16)
+}
+
+pub struct AttnShape {
+    xclbin: String,
+    insts: Vec<u32>,
+    pub bucket: usize, // B: max seq positions (= L)
+    pub mt: usize,     // query-tile size
+    pub lb: usize,     // kv block size
+    pub nh: usize,     // q-heads per kv-head (GQA group)
+    pub hd: usize,     // head_dim
+}
+
+impl AttnShape {
+    /// Load a causal flash-attention xclbin from `dir`. File naming:
+    ///   final_attn_b{B}_m{MT}_l{LB}_h{NH}_d{HD}.xclbin  (+ insts_*.txt)
+    pub fn open(dir: &str, b: usize, mt: usize, lb: usize, nh: usize, hd: usize) -> Result<AttnShape> {
+        let stem = format!("attn_b{b}_m{mt}_l{lb}_h{nh}_d{hd}");
+        let xclbin = format!("{dir}/final_{stem}.xclbin");
+        let raw = std::fs::read(format!("{dir}/insts_{stem}.bin"))
+            .or_else(|_| std::fs::read(format!("{dir}/insts_{stem}.txt")))
+            .map_err(|e| StrixError::backend(format!("read attn insts {stem}: {e}")))?;
+        let insts = match std::str::from_utf8(&raw) {
+            Ok(t) => load_instr_txt(t).map_err(StrixError::backend)?,
+            Err(_) => load_instr_bin(&raw).map_err(StrixError::backend)?,
+        };
+        Ok(AttnShape { xclbin, insts, bucket: b, mt, lb, nh, hd })
+    }
+
+    /// Causal SDPA for the whole layer on the NPU. Inputs are the model's prefill
+    /// layout (already roped): q [m, nh_total*hd], kc/vc [m, nkv*hd]. Returns
+    /// attn [m, nh_total*hd]. `scale` (1/sqrt(hd)) is folded into the queries.
+    /// Loops the n_kv kv-heads; each call handles a group of `nh` q-heads.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sdpa(
+        &self,
+        q: &[f32],
+        kc: &[f32],
+        vc: &[f32],
+        m: usize,
+        nh_total: usize,
+        nkv: usize,
+        hd: usize,
+        scale: f32,
+    ) -> Result<Vec<f32>> {
+        let (b, mt, lb, nh) = (self.bucket, self.mt, self.lb, self.nh);
+        if hd != self.hd || nh_total / nkv != nh {
+            return Err(StrixError::backend(format!(
+                "attn shape mismatch: hd {hd}/{}, group {}/{nh}",
+                self.hd,
+                nh_total / nkv
+            )));
+        }
+        if m > b {
+            return Err(StrixError::backend(format!("seq {m} exceeds attn bucket {b}")));
+        }
+        let q_dim = nh_total * hd;
+        let kv_dim = nkv * hd;
+        let groups = nh;
+        let tph = b / mt;
+        let nqt = nh * tph;
+        let nblk = b / lb;
+        let out_bytes = nh * b * hd * 2;
+        let mut attn = vec![0.0f32; m * q_dim];
+
+        for kvh in 0..nkv {
+            // pack input: [ Q (nh*B*hd, head-major) | KV replicated nqt× ]
+            let mut inb: Vec<u8> = Vec::with_capacity((nh * b * hd + nqt * 2 * b * hd) * 2);
+            // Q: head g (= q-head kvh*groups+g), B positions (pad >=m with 0), hd.
+            for g in 0..nh {
+                let qh = (kvh * groups + g) * hd;
+                for t in 0..b {
+                    for d in 0..hd {
+                        let x = if t < m { scale * q[t * q_dim + qh + d] } else { 0.0 };
+                        inb.extend_from_slice(&f2bf(x).to_le_bytes());
+                    }
+                }
+            }
+            // KV (this kv-head), replicated once per query tile; blocked [lb,hd]‖[lb,hd].
+            let kh = kvh * hd;
+            for _tile in 0..nqt {
+                for blk in 0..nblk {
+                    for r in 0..lb {
+                        let t = blk * lb + r;
+                        for d in 0..hd {
+                            let x = if t < m { kc[t * kv_dim + kh + d] } else { 0.0 };
+                            inb.extend_from_slice(&f2bf(x).to_le_bytes());
+                        }
+                    }
+                    for r in 0..lb {
+                        let t = blk * lb + r;
+                        for d in 0..hd {
+                            let x = if t < m { vc[t * kv_dim + kh + d] } else { 0.0 };
+                            inb.extend_from_slice(&f2bf(x).to_le_bytes());
+                        }
+                    }
+                }
+            }
+
+            let out = strix_backend_npu::run_attn(&self.xclbin, "MLIR_AIE", &self.insts, &inb, out_bytes)
+                .map_err(|e| StrixError::backend(format!("npu attn run: {e}")))?;
+
+            // scatter head-major output [nh, B, hd] → attn[t, (kvh*groups+g)*hd..]
+            for g in 0..nh {
+                let qh = (kvh * groups + g) * hd;
+                for t in 0..m {
+                    let src = (g * b + t) * hd;
+                    for d in 0..hd {
+                        attn[t * q_dim + qh + d] =
+                            bf2f(u16::from_le_bytes([out[(src + d) * 2], out[(src + d) * 2 + 1]]));
+                    }
+                }
+            }
+        }
+        Ok(attn)
     }
 }

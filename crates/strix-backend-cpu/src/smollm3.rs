@@ -773,6 +773,24 @@ impl SmolLm3Model {
             let kc = &self.kc[il];
             let vc = &self.vc[il];
             let mut attn = vec![0.0f32; m * q_dim];
+            // Fused NPU SDPA (stage-3): replaces the CPU loop when the attn xclbin
+            // is loaded and the seq fits the bucket. Falls back to CPU otherwise.
+            let mut npu_attn_done = false;
+            #[cfg(feature = "npu")]
+            {
+                if let Some(ash) = self.npu.as_ref().and_then(|n| n.attn.as_ref()) {
+                    if m <= ash.bucket {
+                        match ash.sdpa(&q, kc, vc, m, nh, nkv, hd, scale) {
+                            Ok(a) => {
+                                attn = a;
+                                npu_attn_done = true;
+                            }
+                            Err(e) => eprintln!("[npu-attn] fallback to CPU SDPA: {e}"),
+                        }
+                    }
+                }
+            }
+            if !npu_attn_done {
             attn.par_chunks_mut(q_dim)
                 .enumerate()
                 .for_each(|(t, arow)| {
@@ -808,6 +826,7 @@ impl SmolLm3Model {
                         }
                     }
                 });
+            } // end !npu_attn_done (CPU SDPA fallback)
             let mut o = vec![0.0f32; m * hidden];
             self.bmm(
                 &bnm("attn_output.weight"),
