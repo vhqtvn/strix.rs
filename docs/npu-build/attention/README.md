@@ -58,11 +58,23 @@ Two IRON bugs fixed via MLIR inspection + a block-subrange diagnostic: (1) flat 
 DMA tap → `repeat_count > 255` BD limit → 2D `[rows, D]` patterns; (2) separate per-block
 `rt.fill`s collide on one fifo slot → one multi-object fill (matmul streaming idiom).
 
-⏳ **REMAINING toward integration** (shape/tiling engineering on the proven core):
-query tiling (at D=128, M=64: Q 16 KB + o_buf f32 32 KB + KV depth-2 32 KB + out 16 KB
-= 96 KB > 64 KB → tile to Mtile≈32, loop query tiles; prefill m=256 → 8 tiles); GQA
-(q-heads share a streamed kv-head); causal masking per block; integrate into the model
-forward (replace CPU SDPA).
+## ✅ Query tiling — implemented + validated (real shapes now fit)
+Queries are processed `Mtile` rows at a time (outer loop); each query tile re-streams
+all K/V blocks (inner loop). `attn_finalize` re-arms `(m,l)` per tile so one set of
+`[Mtile]`-sized Buffers is reused. Resident memory is bounded by `Mtile` (not total M)
+and one K/V block (not L) → real head_dims fit the 64 KB tile.
+- `attention.py` args: `-M`=Mtile, `--mq`=total queries, `-K`=L, `-N`=D, `--lb`,
+  `--kvdepth` (1 when depth-2 won't fit). K/V replicated NQT× in the host buffer
+  (the shim DMA has no stride-0 broadcast read; a memtile broadcast would avoid the
+  DDR replication — TODO).
+- Validated on XDNA2: **128×64×64 (2 query tiles)** cosine 0.9997; **256×256×128
+  (8 query tiles × 8 KV blocks, real head_dim 128, kvdepth=1)** cosine 0.9998,
+  rel-L2 0.031 — the qwen3/smollm3 per-head prefill attention shape, fully on the NPU.
+
+⏳ **REMAINING toward model integration**: causal masking (skip/limit blocks where
+j > i; partial mask on the diagonal block); GQA (q-heads share a streamed kv-head);
+wire into the model forward to replace CPU SDPA (stage-3 endpoint). The flash kernel
+now handles real per-head shapes — what's left is masking + plumbing.
 
 ## Files
 - `attention.cc` → goes in `aie_kernels/aie2p/`. Reuses `softmax.cc`'s

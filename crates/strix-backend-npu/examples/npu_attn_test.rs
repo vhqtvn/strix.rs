@@ -29,23 +29,29 @@ fn main() {
     let k: Vec<f32> = (0..l * d).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
     let v: Vec<f32> = (0..l * d).map(|i| ((i % 11) as f32 - 5.0) * 0.1).collect();
 
-    // pack bf16 LE in the STREAMING layout: [ Q | (K0‖V0) | (K1‖V1) | ... ],
-    // each K/V block = lb rows so the kernel's per-block fill is contiguous.
+    // pack bf16 LE in the STREAMING + QUERY-TILED layout:
+    //   [ Q (m*d) | KV blocks replicated per query tile ]
+    // mt = query-tile size (default = m → NQT=1, no tiling). Each tile re-reads
+    // all KV blocks, so the host replicates them NQT times (no stride-0 DMA).
     let lb = parse(6, 32);
-    let mut inb: Vec<u8> = Vec::with_capacity((m * d + 2 * l * d) * 2);
+    let mt = parse(7, m);
+    let nqt = m / mt;
+    let mut inb: Vec<u8> = Vec::with_capacity((m * d + nqt * 2 * l * d) * 2);
     let push = |buf: &mut Vec<u8>, x: f32| buf.extend_from_slice(&f2bf(x).to_le_bytes());
     for &x in q.iter() {
         push(&mut inb, x);
     }
-    for b in 0..(l / lb) {
-        for r in 0..lb {
-            for dd in 0..d {
-                push(&mut inb, k[(b * lb + r) * d + dd]);
+    for _tile in 0..nqt {
+        for b in 0..(l / lb) {
+            for r in 0..lb {
+                for dd in 0..d {
+                    push(&mut inb, k[(b * lb + r) * d + dd]);
+                }
             }
-        }
-        for r in 0..lb {
-            for dd in 0..d {
-                push(&mut inb, v[(b * lb + r) * d + dd]);
+            for r in 0..lb {
+                for dd in 0..d {
+                    push(&mut inb, v[(b * lb + r) * d + dd]);
+                }
             }
         }
     }

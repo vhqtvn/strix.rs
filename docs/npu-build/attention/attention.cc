@@ -104,14 +104,19 @@ void attn_block(bfloat16 *restrict q, bfloat16 *restrict kv,
     block_row(q + i * ATT_D, kk, vv, m_buf + i, l_buf + i, o_buf + i * ATT_D);
 }
 
+// Normalize one query tile and RE-ARM the running state for the next tile:
+// m←sentinel, l←0 (o_buf is overwritten by the next tile's first block). This
+// lets a single set of [ATT_M]-sized Buffers be reused across query tiles.
 void attn_finalize(float *restrict o_buf, float *restrict l_buf,
-                   bfloat16 *restrict out) {
+                   float *restrict m_buf, bfloat16 *restrict out) {
   event0();
   for (int i = 0; i < ATT_M; i++) {
     float inv = 1.f / l_buf[i];
     const float *oi = o_buf + i * ATT_D;
     bfloat16 *outi = out + i * ATT_D;
     for (int d = 0; d < ATT_D; d++) outi[d] = (bfloat16)(oi[d] * inv);
+    m_buf[i] = -3.0e38f;
+    l_buf[i] = 0.f;
   }
 }
 
