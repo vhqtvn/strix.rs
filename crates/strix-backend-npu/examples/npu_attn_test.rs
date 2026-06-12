@@ -14,7 +14,9 @@ fn bf2f(b: u16) -> f32 {
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let (xclbin, insts_path) = (&a[1], &a[2]);
-    let (m, l, d) = (64usize, 64usize, 64usize);
+    // optional shape: m l d lb  (default 64 64 64 32)
+    let parse = |i: usize, def: usize| a.get(i).and_then(|s| s.parse().ok()).unwrap_or(def);
+    let (m, l, d) = (parse(3, 64), parse(4, 64), parse(5, 64));
 
     let raw = std::fs::read(insts_path).expect("read insts");
     let insts = match std::str::from_utf8(&raw) {
@@ -29,7 +31,7 @@ fn main() {
 
     // pack bf16 LE in the STREAMING layout: [ Q | (K0‖V0) | (K1‖V1) | ... ],
     // each K/V block = lb rows so the kernel's per-block fill is contiguous.
-    let lb = 32usize;
+    let lb = parse(6, 32);
     let mut inb: Vec<u8> = Vec::with_capacity((m * d + 2 * l * d) * 2);
     let push = |buf: &mut Vec<u8>, x: f32| buf.extend_from_slice(&f2bf(x).to_le_bytes());
     for &x in q.iter() {
@@ -131,13 +133,14 @@ fn main() {
         }
         dot / (na.sqrt() * nb.sqrt())
     };
-    let b0 = attn_range(0, 32);
-    let b1 = attn_range(32, 64);
+    // if the NPU matches first-block-only, streaming/carry is broken.
+    let b0 = attn_range(0, lb);
+    let bl = attn_range(l - lb, l);
     println!(
-        "diag cosine: vs full {:.4} | vs block0-only {:.4} | vs block1-only {:.4}",
+        "diag cosine: vs full {:.4} | vs first-block-only {:.4} | vs last-block-only {:.4}",
         cos(&npu, &cpu),
         cos(&npu, &b0),
-        cos(&npu, &b1)
+        cos(&npu, &bl)
     );
 
     let (mut maxabs, mut err2, mut ref2, mut dot, mut na, mut nb) = (0f32, 0f32, 0f32, 0f32, 0f32, 0f32);

@@ -38,16 +38,31 @@ memory. Budget (bf16, 2 B/elem):
 - 256×256×128 (real prefill batch): Q/K/V 64 KB each = 192 KB, scores[256,256]bf16
   = 128 KB. **3–5× over.**
 
-⇒ Real shapes CANNOT be reached by bumping the `-D` macros. They mandate a
-**flash-attention dataflow**: stream K/V in blocks via ObjectFifos from the 512 KB
-memtile, **online softmax** (running max `m_i` + running denom `l_i`, rescale the
-partial output per KV block), tile the query dim (Mtile≈64), GQA (q-heads share a
-kv-head's streamed K/V), causal masking per block. This is the multi-tile IRON
-research core (effectively merges with stage 3). The single-core resident kernel
-(now validated + vectorized) is the proven inner-compute building block for it.
+⇒ Real shapes CANNOT be reached by bumping the `-D` macros — they need the streaming
+flash dataflow below.
 
-⏳ **REMAINING (stage 2/3 research core, multi-session)**: flash-attention real-shape
-dataflow (above) + integrate into the model forward (replace CPU SDPA).
+## ✅ Streaming flash attention — implemented + validated (lifts the ceiling)
+K/V now **stream block-by-block** (one K‖V block resident at a time); Q is resident;
+running flash state `(m, l, o)` is carried across blocks in **persistent core-local
+Buffers**; **online softmax** rescales the carried state by `exp2(m_old − m_new)` per
+block. L is no longer bounded by tile memory.
+- `attention.cc`: `block_row` (one query row × one block; first-block detected from the
+  `m = −3e38` sentinel) + `attn_block` (uniform streaming loop) + `attn_finalize`.
+- `attention.py`: `of_q` (resident) + `of_kv` (streamed, depth 2) + `of_o`; three f32
+  `Buffer`s carry `m`/`l`/`o`; ONE multi-object KV fill (3D tap `[NBLK,2·LB,D]`).
+- Validated on XDNA2: **64×64×64** cosine 0.9997 / rel-L2 0.035 (== resident kernel,
+  byte-identical); **64×256×64 (8 blocks)** cosine 0.9992 / rel-L2 0.039, matches FULL
+  (0.27 vs first/last block alone) — carry correct over many blocks.
+
+Two IRON bugs fixed via MLIR inspection + a block-subrange diagnostic: (1) flat `M*D`
+DMA tap → `repeat_count > 255` BD limit → 2D `[rows, D]` patterns; (2) separate per-block
+`rt.fill`s collide on one fifo slot → one multi-object fill (matmul streaming idiom).
+
+⏳ **REMAINING toward integration** (shape/tiling engineering on the proven core):
+query tiling (at D=128, M=64: Q 16 KB + o_buf f32 32 KB + KV depth-2 32 KB + out 16 KB
+= 96 KB > 64 KB → tile to Mtile≈32, loop query tiles; prefill m=256 → 8 tiles); GQA
+(q-heads share a streamed kv-head); causal masking per block; integrate into the model
+forward (replace CPU SDPA).
 
 ## Files
 - `attention.cc` → goes in `aie_kernels/aie2p/`. Reuses `softmax.cc`'s
