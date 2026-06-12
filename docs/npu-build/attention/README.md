@@ -24,10 +24,30 @@ Resolved 4 real AIE constraints getting there:
    `strix_npu_attn` in npu_shim.cpp / `run_attn` in lib.rs — the matmul shim is
    3-buffer a/b/out, attention is 2-buffer in/out.)
 
-⏳ **NEXT**: vectorize (scalar matmuls → `aie::mmul`/vector, currently
-correctness-over-speed), real shapes (m=256, hd=128/256, variable causal len, GQA,
-flash-style tiling since scores[256,256]bf16=128 KB > 64 KB tile), and integrate
-into the model forward (replace CPU SDPA).
+✅ **VECTORIZED** [commit c13da68]: D-axis Q·K^T dot products and probs·V
+accumulation use `aie::load_v` + `aie::mac` into lane-wise `accum` (reduce_add for
+scores, scalar-vec mac for V). Bit-identical to scalar on the NPU; ~16-32× fewer
+inner-loop ops. Plain row-major layout kept (no blocked-mmul DMA tiling). Requires
+D % 32 == 0 (true for all real head_dims 64/128/256).
+
+## ⛔ The resident one-shot design tops out at the 64×64×64 toy shape
+The kernel keeps the WHOLE packed Q‖K‖V + out resident in one tile's **64 KB** data
+memory. Budget (bf16, 2 B/elem):
+- 64×64×64 (toy): packed 3·64·64·2 = 24 KB + out 8 KB ≈ 33 KB. **fits.**
+- 64×64×**128** (real head_dim, tiny seq): packed 48 KB + out 16 KB ≈ 67 KB. **overflows.**
+- 256×256×128 (real prefill batch): Q/K/V 64 KB each = 192 KB, scores[256,256]bf16
+  = 128 KB. **3–5× over.**
+
+⇒ Real shapes CANNOT be reached by bumping the `-D` macros. They mandate a
+**flash-attention dataflow**: stream K/V in blocks via ObjectFifos from the 512 KB
+memtile, **online softmax** (running max `m_i` + running denom `l_i`, rescale the
+partial output per KV block), tile the query dim (Mtile≈64), GQA (q-heads share a
+kv-head's streamed K/V), causal masking per block. This is the multi-tile IRON
+research core (effectively merges with stage 3). The single-core resident kernel
+(now validated + vectorized) is the proven inner-compute building block for it.
+
+⏳ **REMAINING (stage 2/3 research core, multi-session)**: flash-attention real-shape
+dataflow (above) + integrate into the model forward (replace CPU SDPA).
 
 ## Files
 - `attention.cc` → goes in `aie_kernels/aie2p/`. Reuses `softmax.cc`'s
