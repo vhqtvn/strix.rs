@@ -37,6 +37,10 @@
 #define ATT_LB 32
 #endif
 
+#ifndef ATT_CAUSAL
+#define ATT_CAUSAL 0
+#endif
+
 #define ATT_VEC 32 // bf16 D-axis vector width (D is a multiple of 32)
 #define ATT_LOG2E 1.4426950408889634f
 
@@ -46,11 +50,22 @@
 static inline void block_row(const bfloat16 *restrict qi,
                              const bfloat16 *restrict kk,
                              const bfloat16 *restrict vv, float *restrict m_p,
-                             float *restrict l_p, float *restrict oi) {
+                             float *restrict l_p, float *restrict oi,
+                             int qrow_g, int kbase) {
   constexpr int DCHUNKS = ATT_D / ATT_VEC;
   // scaled scores for this block: sblk[jj] = (q_i · k_jj) × LOG2E
   alignas(128) float sblk[ATT_LB];
   for (int jj = 0; jj < ATT_LB; jj++) {
+#if ATT_CAUSAL
+    // causal mask: query qrow_g attends only keys ≤ qrow_g. Use a MODERATE
+    // log2-domain sentinel (-1e4): exp2(-1e4) underflows to 0 (real scaled
+    // scores are ≤ ~±40), while exp2's floor(x)→int32 exponent extraction would
+    // OVERFLOW on -3e38 and NOT underflow → masked keys would wrongly contribute.
+    if (kbase + jj > qrow_g) {
+      sblk[jj] = -1.0e4f;
+      continue;
+    }
+#endif
     const bfloat16 *kj = kk + jj * ATT_D;
     aie::accum<accfloat, ATT_VEC> sacc = aie::zeros<accfloat, ATT_VEC>();
     for (int c = 0; c < DCHUNKS; c++) {
@@ -94,14 +109,22 @@ extern "C" {
 // kv = [K_block (ATT_LB×D) ‖ V_block (ATT_LB×D)] for the current block. One
 // kernel handles every block (first detected from the m sentinel) → uniform
 // streaming loop, matching the proven matmul K-reduction dataflow.
+// idx_buf[0] = current query-tile index qt, idx_buf[1] = current block index kb
+// (advanced here; reset/advanced across tiles by attn_finalize). Used for causal
+// masking — the global query row is qt*ATT_M + i, the block's key base is kb*ATT_LB.
+// qt (query-tile index) and kb (block index) are passed directly from the
+// dataflow loops — avoids a persisted counter Buffer (whose init wasn't honored
+// at runtime). Global query row = qt*ATT_M + i; block key base = kb*ATT_LB.
 void attn_block(bfloat16 *restrict q, bfloat16 *restrict kv,
                 float *restrict m_buf, float *restrict l_buf,
-                float *restrict o_buf) {
+                float *restrict o_buf, int32_t qt, int32_t kb) {
   event0();
   const bfloat16 *kk = kv;
   const bfloat16 *vv = kv + ATT_LB * ATT_D;
+  int qbase = qt * ATT_M, kbase = kb * ATT_LB;
   for (int i = 0; i < ATT_M; i++)
-    block_row(q + i * ATT_D, kk, vv, m_buf + i, l_buf + i, o_buf + i * ATT_D);
+    block_row(q + i * ATT_D, kk, vv, m_buf + i, l_buf + i, o_buf + i * ATT_D,
+              qbase + i, kbase);
 }
 
 // Normalize one query tile and RE-ARM the running state for the next tile:
@@ -115,7 +138,7 @@ void attn_finalize(float *restrict o_buf, float *restrict l_buf,
     const float *oi = o_buf + i * ATT_D;
     bfloat16 *outi = out + i * ATT_D;
     for (int d = 0; d < ATT_D; d++) outi[d] = (bfloat16)(oi[d] * inv);
-    m_buf[i] = -3.0e38f;
+    m_buf[i] = -3.0e38f; // re-arm running state for the next query tile
     l_buf[i] = 0.f;
   }
 }

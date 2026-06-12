@@ -36,7 +36,8 @@ def attention(MT, MQ, L, D, LB, KVDEPTH=2):
     mf_ty = np.ndarray[(MT,), np.dtype[np.float32]]
     of_ty = np.ndarray[(MT * D,), np.dtype[np.float32]]
 
-    k_block = Kernel("attn_block", "attention.o", [q_ty, kv_ty, mf_ty, mf_ty, of_ty])
+    # qt, kb passed as scalar args from the dataflow loops (no persisted counter).
+    k_block = Kernel("attn_block", "attention.o", [q_ty, kv_ty, mf_ty, mf_ty, of_ty, np.int32, np.int32])
     k_fin = Kernel("attn_finalize", "attention.o", [of_ty, mf_ty, mf_ty, o_ty])
 
     of_q = ObjectFifo(q_ty, name="q", depth=1)
@@ -47,12 +48,16 @@ def attention(MT, MQ, L, D, LB, KVDEPTH=2):
     l_buf = Buffer(type=mf_ty, initial_value=np.zeros((MT,), dtype=np.float32))
     o_buf = Buffer(type=of_ty, initial_value=np.zeros((MT * D,), dtype=np.float32))
 
-    def core_fn(q_in, kv_in, o_out, mb, lb, ob, kb, kfin):
-        for _ in (range_(NQT) if NQT > 1 else range(NQT)):  # query tiles
+    def core_fn(q_in, kv_in, o_out, mb, lb, ob, kblk, kfin):
+        # Python range() (not range_): unrolls so qt/kb are i32 CONSTANTS the
+        # kernel can take as scalar args (an scf.for index is MLIR `index`, not
+        # i32). Fine at these sizes (NQT*NBLK calls); very long seqs would want an
+        # index_cast in a range_ loop (scalability TODO).
+        for qt in range(NQT):  # query tiles
             eq = q_in.acquire(1)
-            for _ in (range_(NBLK) if NBLK > 1 else range(NBLK)):  # KV blocks
+            for kb in range(NBLK):  # KV blocks
                 ek = kv_in.acquire(1)
-                kb(eq, ek, mb, lb, ob)
+                kblk(eq, ek, mb, lb, ob, qt, kb)  # loop indices → causal mask
                 kv_in.release(1)
             eo = o_out.acquire(1)
             kfin(ob, lb, mb, eo)  # normalize + re-arm (m,l) for the next tile

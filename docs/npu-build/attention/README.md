@@ -71,10 +71,21 @@ and one K/V block (not L) → real head_dims fit the 64 KB tile.
   (8 query tiles × 8 KV blocks, real head_dim 128, kvdepth=1)** cosine 0.9998,
   rel-L2 0.031 — the qwen3/smollm3 per-head prefill attention shape, fully on the NPU.
 
-⏳ **REMAINING toward model integration**: causal masking (skip/limit blocks where
-j > i; partial mask on the diagonal block); GQA (q-heads share a streamed kv-head);
+## ✅ Causal masking — implemented + validated
+`block_row` masks `sblk[jj] = -1e4` (NOT -3e38: exp2's floor→int32 exponent
+extraction overflows on -3e38 and fails to underflow; -1e4 gives exp2→0 cleanly)
+where `key_idx = kb*ATT_LB + jj > query_idx = qt*ATT_M + i`. `qt`/`kb` are passed
+as **i32 scalar args from the (unrolled) dataflow loops** — a persisted counter
+Buffer was tried first but the Buffer `initial_value` is NOT honored at runtime on
+this toolchain (int OR float), so the counters read garbage. Build flag `CAUSAL=1`.
+- Validated on XDNA2: **256×256×128 causal** cosine 0.999768, rel-L2 0.026; query 0
+  attends only key 0 → out = v[0] exactly. (Loops are Python-unrolled so qt/kb are
+  i32 constants; an scf.for index is MLIR `index` ≠ i32. NQT*NBLK calls — fine here;
+  very long seqs would want an index_cast in a range_ loop — scalability TODO.)
+
+⏳ **REMAINING toward model integration**: GQA (q-heads share a streamed kv-head);
 wire into the model forward to replace CPU SDPA (stage-3 endpoint). The flash kernel
-now handles real per-head shapes — what's left is masking + plumbing.
+now does real per-head causal prefill attention on the NPU — what's left is GQA + plumbing.
 
 ## Files
 - `attention.cc` → goes in `aie_kernels/aie2p/`. Reuses `softmax.cc`'s

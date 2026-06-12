@@ -73,10 +73,13 @@ fn main() {
     let r = |x: &f32| bf2f(f2bf(*x));
     let (qb, kb, vb): (Vec<f32>, Vec<f32>, Vec<f32>) =
         (q.iter().map(r).collect(), k.iter().map(r).collect(), v.iter().map(r).collect());
+    // causal (arg 8): query i (global) attends keys 0..=i only.
+    let causal = parse(8, 0) == 1;
     let mut cpu = vec![0f32; m * d];
     for i in 0..m {
-        let mut sc = vec![0f32; l];
-        for j in 0..l {
+        let jhi = if causal { (i + 1).min(l) } else { l };
+        let mut sc = vec![0f32; jhi];
+        for j in 0..jhi {
             let mut s = 0.0;
             for dd in 0..d {
                 s += qb[i * d + dd] * kb[j * d + dd];
@@ -92,7 +95,7 @@ fn main() {
         let inv = 1.0 / sum;
         for dd in 0..d {
             let mut o = 0.0;
-            for j in 0..l {
+            for j in 0..jhi {
                 o += sc[j] * vb[j * d + dd];
             }
             cpu[i * d + dd] = o * inv;

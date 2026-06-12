@@ -10,9 +10,14 @@ K?=64
 N?=64
 LB?=32
 KVDEPTH?=2
+CAUSAL?=0
 kernels=attention
 aieargs+=-M $M --mq ${MQ} -K $K -N $N --lb ${LB} --kvdepth ${KVDEPTH}
+ifeq (${CAUSAL},1)
+target_suffix=${MQ}x${K}x${N}_m${M}_causal
+else
 target_suffix=${MQ}x${K}x${N}_m${M}
+endif
 use_placed?=0
 use_iron?=0
 use_linear_buf_alloc?=1
@@ -22,7 +27,8 @@ else
 buffer_aloc_flag=bank-aware
 endif
 aie_py_src=${targetname}.py
-KERNEL_DEFINES=-DATT_M=${M} -DATT_L=${K} -DATT_D=${N} -DATT_LB=${LB}
+CAUSAL?=0
+KERNEL_DEFINES=-DATT_M=${M} -DATT_L=${K} -DATT_D=${N} -DATT_LB=${LB} -DATT_CAUSAL=${CAUSAL}
 
 include ${srcdir}/../matrix_multiplication/makefile-common
 
