@@ -100,6 +100,47 @@ int strix_npu_matmul(const char* xclbin_path, const char* kernel_name,
     }
 }
 
+// Run a 2-buffer kernel (one input, one output) — the fused-attention prototype:
+// kernel(opcode=3, bo_instr, instr_words, bo_in, bo_out). `in` is the packed
+// Q‖K‖V (in_bytes), `out` receives out_bytes. Returns 0 on success.
+int strix_npu_attn(const char* xclbin_path, const char* kernel_name,
+                   const uint32_t* instr, size_t instr_words,
+                   const void* in, size_t in_bytes,
+                   void* out, size_t out_bytes,
+                   char* errbuf, size_t errcap) {
+    try {
+        xrt::device device(0);
+        auto xclbin = xrt::xclbin(std::string(xclbin_path));
+        device.register_xclbin(xclbin);
+        xrt::hw_context context(device, xclbin.get_uuid());
+        xrt::kernel kernel(context, std::string(kernel_name));
+
+        auto bo_instr = xrt::bo(device, instr_words * sizeof(uint32_t),
+                                xrt::bo::flags::cacheable, kernel.group_id(1));
+        auto bo_in = xrt::bo(device, in_bytes, xrt::bo::flags::host_only, kernel.group_id(3));
+        auto bo_out = xrt::bo(device, out_bytes, xrt::bo::flags::host_only, kernel.group_id(4));
+
+        std::memcpy(bo_instr.map<void*>(), instr, instr_words * sizeof(uint32_t));
+        std::memcpy(bo_in.map<void*>(), in, in_bytes);
+        bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        unsigned int opcode = 3;
+        auto run = kernel(opcode, bo_instr, instr_words, bo_in, bo_out);
+        run.wait();
+
+        bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        std::memcpy(out, bo_out.map<void*>(), out_bytes);
+        return 0;
+    } catch (const std::exception& e) {
+        set_err(errbuf, errcap, e.what());
+        return 1;
+    } catch (...) {
+        set_err(errbuf, errcap, "unknown C++ exception");
+        return 2;
+    }
+}
+
 } // extern "C"
 
 // --- Persistent context: load the xclbin once, run many matmuls ---

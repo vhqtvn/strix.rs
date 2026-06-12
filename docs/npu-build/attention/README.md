@@ -6,20 +6,28 @@ of the fusion). This is the foundational piece of the NPU-fusion stage 2/3 (see
 [[npu-fusion-rewrite]] in memory).
 
 ## Status (2026-06-12)
-✅ **BUILDS** through the off-box pipeline → loadable xclbin + insts. Resolved 3 real
-AIE constraints getting there:
+✅ **BUILDS + VALIDATES on the XDNA2 NPU.** rel-L2 0.037, cosine 0.999684 vs a CPU
+reference (m=l=d=64, bf16) — within bf16 tolerance. Run:
+`cargo run -p strix-backend-npu --example npu_attn_test --features ryzen-ai -- <xclbin> <insts>`.
+
+Resolved 4 real AIE constraints getting there:
 1. kernel `.cc` path (attention/ is shallower than matrix_multiplication/<subdir>,
    so makefile-common's 4-`../` `kernels_dir` overshoots — use 3 `../`).
 2. **DMA channels**: a tile has only 2 input channels → pack Q‖K‖V into ONE input
    buffer (`attention_bf16(qkv, out)`), 1 in + 1 out fits 2/2.
 3. **Tile local memory (64 KB)**: double-buffered packed-QKV overflowed → `depth=1`
    single-buffer the ObjectFifos.
+4. **Stack-array alignment (the NaN bug)**: `softmax_simple_bf16` uses
+   `aie::cbegin_restrict_vector<32>` — ALIGNED 512-bit vector loads. The `scores`/`probs`
+   stack arrays were only 2-byte aligned, so the vector load read garbage and softmax
+   blew up → all-NaN output. Fix: `alignas(64)` on both. (2-buffer XRT harness:
+   `strix_npu_attn` in npu_shim.cpp / `run_attn` in lib.rs — the matmul shim is
+   3-buffer a/b/out, attention is 2-buffer in/out.)
 
-⏳ **NOT yet**: on-device numerical validation (needs a 2-buffer XRT harness; the
-existing `npu_loadtest`/`NpuGemm` shim is matmul-3-buffer: a, b/weight, out — the
-attention kernel is 2-buffer: in, out). Then: vectorize (scalar matmuls →
-`aie::mmul`/vector, currently correctness-over-speed), real shapes (m=256, hd=128/256,
-variable causal len, GQA), and integrate into the model forward.
+⏳ **NEXT**: vectorize (scalar matmuls → `aie::mmul`/vector, currently
+correctness-over-speed), real shapes (m=256, hd=128/256, variable causal len, GQA,
+flash-style tiling since scores[256,256]bf16=128 KB > 64 KB tile), and integrate
+into the model forward (replace CPU SDPA).
 
 ## Files
 - `attention.cc` → goes in `aie_kernels/aie2p/`. Reuses `softmax.cc`'s

@@ -35,8 +35,11 @@ void attention_bf16(bfloat16 *restrict qkv, bfloat16 *restrict out) {
   bfloat16 *restrict q = qkv;
   bfloat16 *restrict k = qkv + ATT_M * ATT_D;
   bfloat16 *restrict v = qkv + ATT_M * ATT_D + ATT_L * ATT_D;
-  bfloat16 scores[ATT_L];
-  bfloat16 probs[ATT_L];
+  // softmax_simple_bf16 uses aie::cbegin_restrict_vector<32> (ALIGNED 512-bit
+  // vector loads), so scores/probs must be 64-byte aligned — plain stack arrays
+  // are only 2-byte aligned and the unaligned vector load reads garbage → NaN.
+  alignas(64) bfloat16 scores[ATT_L];
+  alignas(64) bfloat16 probs[ATT_L];
   for (int i = 0; i < ATT_M; i++) {
     const bfloat16 *qi = q + i * ATT_D;
     // scores[j] = sum_d q[i,d] * k[j,d]   (Q · K^T)

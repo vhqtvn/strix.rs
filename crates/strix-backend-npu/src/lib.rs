@@ -82,6 +82,19 @@ mod xrt {
             errbuf: *mut c_char,
             errcap: usize,
         ) -> c_int;
+        // 2-buffer kernel (fused attention): one packed input, one output.
+        fn strix_npu_attn(
+            xclbin: *const c_char,
+            kernel_name: *const c_char,
+            instr: *const u32,
+            instr_words: usize,
+            input: *const c_void,
+            in_bytes: usize,
+            out: *mut c_void,
+            out_bytes: usize,
+            errbuf: *mut c_char,
+            errcap: usize,
+        ) -> c_int;
 
         // Persistent context: open the xclbin once, run many matmuls.
         fn strix_npu_open(
@@ -469,6 +482,40 @@ mod xrt {
             Err(format!("NPU matmul failed: {}", cbuf_to_string(&err)))
         }
     }
+
+    /// Run a 2-buffer kernel (fused attention): `input` is the packed Q‖K‖V bytes,
+    /// returns `out_bytes` of output.
+    pub fn run_attn(
+        xclbin_path: &str,
+        kernel_name: &str,
+        instr: &[u32],
+        input: &[u8],
+        out_bytes: usize,
+    ) -> Result<Vec<u8>, String> {
+        let cpath = CString::new(xclbin_path).map_err(|_| "xclbin path has interior NUL")?;
+        let kname = CString::new(kernel_name).map_err(|_| "kernel name has interior NUL")?;
+        let mut out = vec![0u8; out_bytes];
+        let mut err = [0 as c_char; 512];
+        let rc = unsafe {
+            strix_npu_attn(
+                cpath.as_ptr(),
+                kname.as_ptr(),
+                instr.as_ptr(),
+                instr.len(),
+                input.as_ptr() as *const c_void,
+                input.len(),
+                out.as_mut_ptr() as *mut c_void,
+                out_bytes,
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        };
+        if rc == 0 {
+            Ok(out)
+        } else {
+            Err(format!("NPU attn failed: {}", cbuf_to_string(&err)))
+        }
+    }
 }
 
 /// Parse an mlir-aie `insts_*.txt` (one 32-bit hex word per line) into words.
@@ -549,6 +596,25 @@ pub fn run_matmul(
     #[cfg(not(feature = "ryzen-ai"))]
     {
         let _ = (xclbin_path, kernel_name, instr, a, b, out_bytes);
+        Err("built without `ryzen-ai` feature".into())
+    }
+}
+
+/// Run a 2-buffer kernel (fused attention) on the NPU: one packed input → output.
+pub fn run_attn(
+    xclbin_path: &str,
+    kernel_name: &str,
+    instr: &[u32],
+    input: &[u8],
+    out_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    #[cfg(feature = "ryzen-ai")]
+    {
+        xrt::run_attn(xclbin_path, kernel_name, instr, input, out_bytes)
+    }
+    #[cfg(not(feature = "ryzen-ai"))]
+    {
+        let _ = (xclbin_path, kernel_name, instr, input, out_bytes);
         Err("built without `ryzen-ai` feature".into())
     }
 }
