@@ -595,6 +595,7 @@ impl RocmWeightAccel {
             "sdpa_pos",
             "topk_router",
             "f32_gemv",
+            "f32_gemv8",
             "shexp_add",
             "argmax_f32",
             "rmsnorm",
@@ -3972,9 +3973,9 @@ impl WeightAccel for RocmWeightAccel {
         };
         let f32g = |wname: &str, x: *mut c_void, y: *mut c_void, in_dim: usize, out_dim: usize| {
             self.launch(
-                "f32_gemv",
-                out_dim as u32,
-                32,
+                "f32_gemv8",
+                (out_dim.div_ceil(8)) as u32,
+                256,
                 0,
                 Args::new().ptr(ff(wname)).ptr(x).ptr(y).i(in_dim as i32).i(out_dim as i32),
             );
@@ -4216,6 +4217,9 @@ impl WeightAccel for RocmWeightAccel {
         // it. So return the final normed hidden `[hidden]`, not logits.
         rms(s.merged.ptr, ff("output_norm.weight"), s.xn.ptr, hidden, 1);
         self.gpu.sync().ok()?;
+        if prof_enabled() {
+            prof_dump("g3n decode");
+        }
         s.xn.download::<f32>(hidden).ok()
     }
 

@@ -1825,6 +1825,20 @@ extern "C" __global__ void f32_gemv(const float* __restrict__ w, const float* __
     if (l == 0) y[row] = acc;
 }
 
+// f32 GEMV, 8 rows / 256-thread block (8 waves/block) — far more in-flight memory
+// requests than the 1-wave/row f32_gemv, so the big f32 AltUp matmuls (out=2048)
+// hit memory bandwidth instead of stalling. grid = ceil(out_dim/8), block=256.
+extern "C" __global__ void f32_gemv8(const float* __restrict__ w, const float* __restrict__ x,
+                                     float* __restrict__ y, int in_dim, int out_dim) {
+    int row = blockIdx.x * 8 + (threadIdx.x >> 5), l = threadIdx.x & 31;
+    if (row >= out_dim) return;
+    const float* __restrict__ wr = w + (long long)row * in_dim;
+    float acc = 0.f;
+    for (int i = l; i < in_dim; i += 32) acc += wr[i] * x[i];
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
+    if (l == 0) y[row] = acc;
+}
+
 // GPU router top-k: logits[ne] -> ids[k] + renormalized softmax weights[k].
 // Single wave; iterative argmax (ne<=256, k<=16). Matches CPU softmax-all+topk+renorm.
 // Warp-parallel: 32 lanes, up to 4 logits/lane (ne<=128). Repeated warp argmax
