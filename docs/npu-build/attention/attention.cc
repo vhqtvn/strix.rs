@@ -96,10 +96,18 @@ static inline void block_row(const bfloat16 *restrict qi,
     *l_p = *l_p * corr + block_l;
     for (int d = 0; d < ATT_D; d++) oi[d] *= corr;
   }
-  for (int jj = 0; jj < ATT_LB; jj++) {
-    float p = (float)probsb.get(jj);
-    const bfloat16 *vj = vv + jj * ATT_D;
-    for (int d = 0; d < ATT_D; d++) oi[d] += p * (float)vj[d];
+  // V accumulation, vectorized over D: per d-chunk, mac all block probs×V into a
+  // lane accum, then add to the running f32 output. (corr rescale above stays
+  // scalar — only D muls/block, cheap vs the LB×D V work.) Masked jj have
+  // probs≈0 so their mac adds ~0.
+  for (int c = 0; c < DCHUNKS; c++) {
+    aie::accum<accfloat, ATT_VEC> acc = aie::zeros<accfloat, ATT_VEC>();
+    for (int jj = 0; jj < ATT_LB; jj++) {
+      bfloat16 p = probsb.get(jj);
+      acc = aie::mac(acc, p, aie::load_v<ATT_VEC>(vv + jj * ATT_D + c * ATT_VEC));
+    }
+    aie::vector<float, ATT_VEC> ov = aie::load_v<ATT_VEC>(oi + c * ATT_VEC);
+    aie::store_v(oi + c * ATT_VEC, aie::add(ov, acc.to_vector<float>()));
   }
   *m_p = m_new;
 }
