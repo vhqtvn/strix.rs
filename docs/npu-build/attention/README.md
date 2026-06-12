@@ -83,9 +83,22 @@ this toolchain (int OR float), so the counters read garbage. Build flag `CAUSAL=
   i32 constants; an scf.for index is MLIR `index` ≠ i32. NQT*NBLK calls — fine here;
   very long seqs would want an index_cast in a range_ loop — scalability TODO.)
 
-⏳ **REMAINING toward model integration**: GQA (q-heads share a streamed kv-head);
-wire into the model forward to replace CPU SDPA (stage-3 endpoint). The flash kernel
-now does real per-head causal prefill attention on the NPU — what's left is GQA + plumbing.
+## ✅ GQA + head_dim 64/128/256 — validated
+- **GQA**: NH query heads share one streamed KV head — loop `NQT = NH·TPH` tiles
+  head-major, pass the position-tile-within-head (`qti % TPH`) as the causal index
+  (kernel unchanged). Validated: 4 q-heads × 1 kv-head, 128×128, D=128, causal →
+  cosine 0.9997.
+- **head_dim**: 64 / 128 (qwen3, smollm3) / **256 (gemma3n)** all validated
+  (D=256 causal: cosine 0.9996). The kernel is D-parametric (DCHUNKS = D/32).
+
+⛔ **The flash kernel is now shape-complete for every target model**: streaming K/V
+(any L) + online softmax + query tiling (any M) + head_dim 64/128/256 + causal + GQA.
+
+⏳ **REMAINING — model integration (the actual speedup)**: wire the kernel into the
+Rust model forward to replace CPU SDPA (stage-3 endpoint). Needs: per-(kv-head) host
+packing of Q/K/V into the streaming+replicated layout, invoke `run_attn`, scatter the
+output back. Perf TODO: memtile KV broadcast to drop the DDR replication; an
+`index_cast` `range_` loop instead of unrolling for very long seqs.
 
 ## Files
 - `attention.cc` → goes in `aie_kernels/aie2p/`. Reuses `softmax.cc`'s
