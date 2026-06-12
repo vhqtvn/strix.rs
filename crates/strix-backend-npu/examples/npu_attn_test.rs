@@ -27,10 +27,25 @@ fn main() {
     let k: Vec<f32> = (0..l * d).map(|i| ((i % 7) as f32 - 3.0) * 0.1).collect();
     let v: Vec<f32> = (0..l * d).map(|i| ((i % 11) as f32 - 5.0) * 0.1).collect();
 
-    // pack Q‖K‖V as bf16 little-endian bytes
+    // pack bf16 LE in the STREAMING layout: [ Q | (K0‖V0) | (K1‖V1) | ... ],
+    // each K/V block = lb rows so the kernel's per-block fill is contiguous.
+    let lb = 32usize;
     let mut inb: Vec<u8> = Vec::with_capacity((m * d + 2 * l * d) * 2);
-    for &x in q.iter().chain(k.iter()).chain(v.iter()) {
-        inb.extend_from_slice(&f2bf(x).to_le_bytes());
+    let push = |buf: &mut Vec<u8>, x: f32| buf.extend_from_slice(&f2bf(x).to_le_bytes());
+    for &x in q.iter() {
+        push(&mut inb, x);
+    }
+    for b in 0..(l / lb) {
+        for r in 0..lb {
+            for dd in 0..d {
+                push(&mut inb, k[(b * lb + r) * d + dd]);
+            }
+        }
+        for r in 0..lb {
+            for dd in 0..d {
+                push(&mut inb, v[(b * lb + r) * d + dd]);
+            }
+        }
     }
 
     let out = run_attn(xclbin, "MLIR_AIE", &insts, &inb, m * d * 2).expect("run_attn FAILED");
@@ -78,6 +93,53 @@ fn main() {
 
     // Relative L2 norm — the standard attention-accuracy metric. Per-element
     // relative error is meaningless here because the outputs are near-zero-mean.
+    // diagnostic: attention restricted to a subrange of keys [lo,hi) — if the NPU
+    // matches block0-only or block1-only, the streaming carry/second-block is broken.
+    let attn_range = |lo: usize, hi: usize| -> Vec<f32> {
+        let mut o = vec![0f32; m * d];
+        for i in 0..m {
+            let mut sc = vec![0f32; hi - lo];
+            for (jx, j) in (lo..hi).enumerate() {
+                let mut s = 0.0;
+                for dd in 0..d {
+                    s += qb[i * d + dd] * kb[j * d + dd];
+                }
+                sc[jx] = s;
+            }
+            let mx = sc.iter().cloned().fold(f32::MIN, f32::max);
+            let mut sum = 0.0;
+            for s in sc.iter_mut() {
+                *s = (*s - mx).exp();
+                sum += *s;
+            }
+            for dd in 0..d {
+                let mut acc = 0.0;
+                for (jx, j) in (lo..hi).enumerate() {
+                    acc += sc[jx] * vb[j * d + dd];
+                }
+                o[i * d + dd] = acc / sum;
+            }
+        }
+        o
+    };
+    let cos = |a: &[f32], b: &[f32]| -> f32 {
+        let (mut dot, mut na, mut nb) = (0f32, 0f32, 0f32);
+        for i in 0..a.len() {
+            dot += a[i] * b[i];
+            na += a[i] * a[i];
+            nb += b[i] * b[i];
+        }
+        dot / (na.sqrt() * nb.sqrt())
+    };
+    let b0 = attn_range(0, 32);
+    let b1 = attn_range(32, 64);
+    println!(
+        "diag cosine: vs full {:.4} | vs block0-only {:.4} | vs block1-only {:.4}",
+        cos(&npu, &cpu),
+        cos(&npu, &b0),
+        cos(&npu, &b1)
+    );
+
     let (mut maxabs, mut err2, mut ref2, mut dot, mut na, mut nb) = (0f32, 0f32, 0f32, 0f32, 0f32, 0f32);
     let mut bad = false;
     for i in 0..m * d {
