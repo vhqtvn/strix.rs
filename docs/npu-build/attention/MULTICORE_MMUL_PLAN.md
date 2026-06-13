@@ -54,9 +54,22 @@ real prefill lengths). Two orthogonal levers, both needed:
   identical to single-core, each core reads its slice). Validated 128×128×128 causal
   (matvec): **1c 24.24 ms → 2c 6.39 (3.8×) → 4c 1.71 ms/run (14.2×)** — SUPERLINEAR
   (parallelizes per-core DMA + state, not just compute), cosine 0.9998 at every count.
-- ⏳ **NEXT:** combine I3+I4 (multi-core with the mmul kernel), scale to 8 cores (needs
-  more query tiles: bigger MQ or NH), GQA multi-core.
-- ⏳ **I5:** integrate multi-core/bucketed xclbins into the model; benchmark vs CPU.
+- ✅ **I3+I4 combined + I5 integrated + benchmarked:** smollm3 multi-core matvec attn
+  (NH=4, D=128, bucket128, **NC=8**) = 6.5 ms/run (59× over 386 ms single-core). Dropped
+  into the model (same host interface, no Rust change); prefill 12 tok 0.2 → **7.0 tok/s**.
+  Finding: mmul ≈ matvec per tile after multi-core (softmax + repack dominate) → matvec
+  multi-core is the practical winner.
+
+## ⛔ Honest verdict (the whole effort)
+The two levers WORK and are validated + integrated (59× over single-core NPU). **But
+NPU SDPA does not beat CPU SDPA** for these models: at seq=128, CPU 134.6 tok/s vs NPU
+65.5 (~2× slower) — CPU SDPA is already fast; the 144 sequential per-(layer,kv-head)
+calls + KV replication + packing dominate. NPU could only win at long seq (512+, CPU
+O(n²)) with bigger-bucket xclbins. **Plus a bf16 precision cost**: NPU(bf16) vs CPU(f32)
+tokens match at 32 tok, diverge at 64+ (per-layer 0.03 rel-L2 compounds over 36 layers).
+⇒ Confirms NPU prefill is the *power* path, already "fast enough"; SDPA-on-NPU is low-ROI
+vs the gemma3n hipGraph decode lever. The fast, correct NPU flash kernel is banked for a
+future power-optimized or very-long-context path.
 
 ## Risks / notes
 - Build loop is off-box on vha (~17 min/cycle) → minimize cycles, validate each I.
