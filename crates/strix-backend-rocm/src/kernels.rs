@@ -1994,6 +1994,74 @@ extern "C" __global__ void qkv_post(const float* __restrict__ q, const float* __
     }
 }
 
+// Graph-capturable qkv_post: pos read from a device buffer (not a launch arg) and
+// the KV-cache write offset (pos*kv_dim) computed on-device, so ONE captured graph
+// replays at every position. kdst/vdst are the cache BASE pointers. Rope stays
+// on-device (theta+pos) — no rope tables needed.
+extern "C" __global__ void qkv_post_pos(const float* __restrict__ q, const float* __restrict__ k,
+                                        const float* __restrict__ v, const float* __restrict__ qw,
+                                        const float* __restrict__ kw, const float* __restrict__ ff,
+                                        float* __restrict__ qout, float* __restrict__ kdst,
+                                        float* __restrict__ vdst, int hd, int n_heads, int n_kv,
+                                        const int* __restrict__ pos_buf, int kv_dim, float theta,
+                                        float eps, int norm_v, int kvf16, int qk_norm, int do_rope) {
+    int b = blockIdx.x, t = threadIdx.x, half = hd / 2;
+    int pos = pos_buf[0];
+    long koff = (long)pos * kv_dim; // element offset into the KV cache row
+    __shared__ float red[256];
+    if (b < n_heads) {
+        int h = b, base = h * hd;
+        float rs = 1.f;
+        if (qk_norm) {
+            float ss = 0.f;
+            for (int i = t; i < hd; i += 256) { float x = q[base + i]; ss += x * x; }
+            red[t] = ss; __syncthreads();
+            for (int s = 128; s > 0; s >>= 1) { if (t < s) red[t] += red[t + s]; __syncthreads(); }
+            rs = rsqrtf(red[0] / hd + eps);
+        }
+        for (int j = t; j < half; j += 256) {
+            float sn = 0.f, cs = 1.f;
+            if (do_rope) { float inv = __powf(theta, -2.f * j / hd) / ff[j]; float ang = pos * inv; sn = sinf(ang); cs = cosf(ang); }
+            float wj = qk_norm ? qw[j] : 1.f, wjh = qk_norm ? qw[j + half] : 1.f;
+            float x1 = q[base + j] * rs * wj;
+            float x2 = q[base + j + half] * rs * wjh;
+            qout[base + j] = x1 * cs - x2 * sn;
+            qout[base + j + half] = x2 * cs + x1 * sn;
+        }
+    } else {
+        int h = b - n_heads, base = h * hd;
+        if (h >= n_kv) return;
+        float rs = 1.f;
+        if (qk_norm) {
+            float ss = 0.f;
+            for (int i = t; i < hd; i += 256) { float x = k[base + i]; ss += x * x; }
+            red[t] = ss; __syncthreads();
+            for (int s = 128; s > 0; s >>= 1) { if (t < s) red[t] += red[t + s]; __syncthreads(); }
+            rs = rsqrtf(red[0] / hd + eps);
+        }
+        for (int j = t; j < half; j += 256) {
+            float sn = 0.f, cs = 1.f;
+            if (do_rope) { float inv = __powf(theta, -2.f * j / hd) / ff[j]; float ang = pos * inv; sn = sinf(ang); cs = cosf(ang); }
+            float wj = qk_norm ? kw[j] : 1.f, wjh = qk_norm ? kw[j + half] : 1.f;
+            float x1 = k[base + j] * rs * wj;
+            float x2 = k[base + j + half] * rs * wjh;
+            float ka = x1 * cs - x2 * sn, kb2 = x2 * cs + x1 * sn;
+            if (kvf16) { ((unsigned short*)kdst)[koff + base + j] = f2h(ka); ((unsigned short*)kdst)[koff + base + j + half] = f2h(kb2); }
+            else { kdst[koff + base + j] = ka; kdst[koff + base + j + half] = kb2; }
+        }
+        if (norm_v) {
+            float ss = 0.f;
+            for (int i = t; i < hd; i += 256) { float x = v[base + i]; ss += x * x; }
+            red[t] = ss; __syncthreads();
+            for (int s = 128; s > 0; s >>= 1) { if (t < s) red[t] += red[t + s]; __syncthreads(); }
+            float vrs = rsqrtf(red[0] / hd + eps);
+            for (int i = t; i < hd; i += 256) { float vv = v[base + i] * vrs; if (kvf16) ((unsigned short*)vdst)[koff + base + i] = f2h(vv); else vdst[koff + base + i] = vv; }
+        } else {
+            for (int i = t; i < hd; i += 256) { float vv = v[base + i]; if (kvf16) ((unsigned short*)vdst)[koff + base + i] = f2h(vv); else vdst[koff + base + i] = vv; }
+        }
+    }
+}
+
 // GeGLU: out = gelu_tanh(gate) * up. grid=ceil(n/64), block=64.
 extern "C" __global__ void geglu(const float* __restrict__ gate, const float* __restrict__ up,
                                  float* __restrict__ out, int n) {

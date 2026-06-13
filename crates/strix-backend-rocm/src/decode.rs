@@ -602,6 +602,7 @@ impl RocmWeightAccel {
             "addnorm",
             "rope",
             "qkv_post",
+            "qkv_post_pos",
             "geglu",
             "softcap",
             "sdpa",
