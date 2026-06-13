@@ -13,6 +13,8 @@ from ml_dtypes import bfloat16
 from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.device import NPU2
 from aie.iron.controlflow import range_
+from aie.extras.dialects.arith import index_cast
+from aie.extras import types as Ty  # 'T' is used below for the input-size
 from aie.helpers.taplib import TensorAccessPattern
 
 
@@ -52,16 +54,16 @@ def attention(MT, MQ, L, D, LB, KVDEPTH=2, NH=1):
     o_buf = Buffer(type=of_ty, initial_value=np.zeros((MT * D,), dtype=np.float32))
 
     def core_fn(q_in, kv_in, o_out, mb, lb, ob, kblk, kfin):
-        # Python range() (not range_): unrolls so qt/kb are i32 CONSTANTS the
-        # kernel can take as scalar args (an scf.for index is MLIR `index`, not
-        # i32). Fine at these sizes (NQT*NBLK calls); very long seqs would want an
-        # index_cast in a range_ loop (scalability TODO).
-        for qti in range(NQT):  # query tiles (head-major across the GQA group)
-            pt = qti % TPH       # position-tile within this head → causal index
+        # Runtime range_ loops (NOT Python unroll): keeps the core ELF tiny so big
+        # buckets/seqs fit program memory (unrolling NQT*NBLK calls overflowed the
+        # ELF at bucket-512). The scf.for index is MLIR `index`; index_cast it to
+        # i32 for the kernel's causal scalar args (pt = qti % TPH, kb).
+        for qti in range_(NQT):  # query tiles (head-major across the GQA group)
+            pt = index_cast(qti % TPH, to=Ty.i32())  # position-tile within head
             eq = q_in.acquire(1)
-            for kb in range(NBLK):  # KV blocks
+            for kb in range_(NBLK):  # KV blocks
                 ek = kv_in.acquire(1)
-                kblk(eq, ek, mb, lb, ob, pt, kb)  # pt,kb → causal mask
+                kblk(eq, ek, mb, lb, ob, pt, index_cast(kb, to=Ty.i32()))
                 kv_in.release(1)
             eo = o_out.acquire(1)
             kfin(ob, lb, mb, eo)  # normalize + re-arm (m,l) for the next tile
