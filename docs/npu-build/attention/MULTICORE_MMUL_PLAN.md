@@ -32,17 +32,22 @@ real prefill lengths). Two orthogonal levers, both needed:
   cheap vs the mmul savings, and avoidable later via DMA `dims_to_stream`.
 
 ## Increments (each validated on the existing harness before the next)
-- **I1 (de-risk mmul):** single-core kernel computes ONLY `S=Q·Kᵀ` via
-  `matmul_vectorized` (on-chip repack Q,K → blocked; output S row-major); validate S
-  vs CPU. Proves the MAC-array primitive in-kernel. ← START HERE
-- **I2:** add online-softmax on row-major S + `O=P·V` mmul; full single-core mmul
-  flash attn; validate vs CPU; measure (expect ~10× over matvec).
-- **I3:** push the tiling into the DMA (`dims_to_stream` on the Q/K/V fills) to drop
-  the on-chip repacks.
-- **I4 (multi-core):** N workers, KV broadcast (multiple `.cons()` / memtile forward),
-  query tiles distributed (`split`), outputs joined (`join`) — the whole_array
-  pattern, but no C-reduction (each core owns whole query rows). Scale 2→8 cores.
-- **I5:** integrate the multi-core/bucketed xclbins into the model; benchmark vs CPU.
+- ✅ **I1+I2 DONE [commit 302d6fe]** — `attention_mmul.cc`: full single-core mmul flash
+  attn (Q·Kᵀ and P·V on `aie::mmul<4,8,8>`, on-chip repack to blocked layout, per-row
+  online softmax on row-major S between). Validated 8×16×64 causal: cosine 0.9998,
+  rel-L2 0.023. The MAC-array flash COMPUTE is correct.
+- ⛔ **MEMORY BLOCKER (found in I2):** on-chip repack scratch (Qb+KTb+Vb+Ob+S+O ≈ 40KB+
+  at MT=32/D=128) overflows the 64KB tile. So the repack CANNOT stay on-chip at real
+  shapes — I3 is mandatory, not optional.
+- ⏳ **I3 (NEXT, the hard dataflow):** push tiling into the DMA via `dims_to_stream` on
+  the Q/K/V `of_q`/`of_kv` fills so blocked tiles arrive directly (no on-chip repack);
+  stage via the 512KB memtile. This is the intricate part (the whole_array `a_dims`/
+  `b_dims`/`c_dims` access patterns). S→softmax→P still needs an on-chip un-tile/re-tile
+  of just the [MT,LB] score tile (small, fits).
+- ⏳ **I4 (multi-core):** N workers, KV broadcast (multiple `.cons()`/memtile forward),
+  query tiles distributed (`split`), outputs joined (`join`) — whole_array pattern, NO
+  C-reduction (each core owns whole query rows). Scale 2→8 cores.
+- ⏳ **I5:** integrate multi-core/bucketed xclbins into the model; benchmark vs CPU.
 
 ## Risks / notes
 - Build loop is off-box on vha (~17 min/cycle) → minimize cycles, validate each I.
