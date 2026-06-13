@@ -99,6 +99,7 @@ if __name__ == "__main__":
     ap.add_argument("-N", type=int, default=64)          # D
     ap.add_argument("--lb", type=int, default=32)
     ap.add_argument("--nh", type=int, default=1)  # query heads sharing one KV head (GQA)
+    ap.add_argument("--nc", type=int, default=1)  # ignored (single-core); see attention_mc.py
     ap.add_argument("--kvdepth", type=int, default=2)
     ap.add_argument("--dev", type=str, default="npu2")
     ap.add_argument("--dtype_in", type=str, default="bf16")

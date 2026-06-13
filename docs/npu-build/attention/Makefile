@@ -12,9 +12,10 @@ LB?=32
 KVDEPTH?=2
 CAUSAL?=0
 NH?=1
+NC?=1
 kernels=attention
-aieargs+=-M $M --mq ${MQ} -K $K -N $N --lb ${LB} --kvdepth ${KVDEPTH} --nh ${NH}
-_sfx=${MQ}x${K}x${N}_m${M}_h${NH}
+aieargs+=-M $M --mq ${MQ} -K $K -N $N --lb ${LB} --kvdepth ${KVDEPTH} --nh ${NH} --nc ${NC}
+_sfx=${MQ}x${K}x${N}_m${M}_h${NH}_c${NC}
 ifeq (${CAUSAL},1)
 target_suffix=${_sfx}_causal
 else
