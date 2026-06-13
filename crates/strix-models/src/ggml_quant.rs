@@ -170,6 +170,7 @@ pub fn dequantize_into(ty: GgmlType, bytes: &[u8], out: &mut [f32]) -> Result<()
         GgmlType::Q5_0 => dequant_q5_0(bytes, out),
         GgmlType::Q5_1 => dequant_q5_1(bytes, out),
         GgmlType::Q4K => dequant_q4_k(bytes, out),
+        GgmlType::Q5K => dequant_q5_k(bytes, out),
         GgmlType::Q6K => dequant_q6_k(bytes, out),
         other => {
             return Err(StrixError::unsupported(format!(
@@ -355,6 +356,48 @@ fn dequant_q4_k(bytes: &[u8], out: &mut [f32]) {
     }
 }
 
+/// Q5_K superblock (256 values), 176 bytes:
+/// [f16 d][f16 dmin][12 scale bytes][32 qh high-bit bytes][128 qs low-nibble bytes].
+/// 8 sub-blocks of 32 with 6-bit scale/min (like Q4_K) plus a 5th bit from `qh`:
+/// `y = d*sc*(qlow | (qh_bit?16:0)) - dmin*m`. Matches llama.cpp `dequantize_row_q5_K`.
+fn dequant_q5_k(bytes: &[u8], out: &mut [f32]) {
+    for (blk, ob) in bytes.chunks_exact(176).zip(out.chunks_mut(256)) {
+        let d = read_f16(&blk[0..2]);
+        let dmin = read_f16(&blk[2..4]);
+        let scales = &blk[4..16];
+        let qh = &blk[16..48]; // 32 high-bit bytes (one bit per value, 8 values/byte)
+        let qs = &blk[48..176]; // 128 low-nibble bytes
+
+        let mut is = 0usize;
+        let mut w = 0usize;
+        // qh bit masks shift up by 2 each 64-value chunk: low halves use u1, high u2.
+        let mut u1: u8 = 1;
+        let mut u2: u8 = 2;
+        for chunk in 0..4 {
+            let ql = &qs[chunk * 32..chunk * 32 + 32];
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let d1 = d * sc1 as f32;
+            let min1 = dmin * m1 as f32;
+            let d2 = d * sc2 as f32;
+            let min2 = dmin * m2 as f32;
+            for l in 0..32 {
+                let hi = if qh[l] & u1 != 0 { 16.0 } else { 0.0 };
+                ob[w] = d1 * ((ql[l] & 0x0F) as f32 + hi) - min1;
+                w += 1;
+            }
+            for l in 0..32 {
+                let hi = if qh[l] & u2 != 0 { 16.0 } else { 0.0 };
+                ob[w] = d2 * ((ql[l] >> 4) as f32 + hi) - min2;
+                w += 1;
+            }
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+}
+
 /// Q6_K superblock (256 values): [128 ql][64 qh][16 i8 scales][f16 d].
 /// 6-bit quants (4 low bits in `ql`, 2 high bits in `qh`), 16 int8 sub-scales.
 /// `y = d * scale * (q - 32)`. Matches llama.cpp `dequantize_row_q6_K`.
@@ -472,9 +515,27 @@ mod tests {
 
     #[test]
     fn unimplemented_quant_errors_at_dequant_not_parse() {
-        // Q5_K is recognized (block sizes known) but not yet dequantized.
-        assert_eq!(GgmlType::from_u32(13).unwrap(), GgmlType::Q5K);
-        assert!(dequantize(GgmlType::Q5K, &[0u8; 176], 256).is_err());
+        // Q2_K is recognized (block sizes known) but not yet dequantized.
+        assert_eq!(GgmlType::from_u32(10).unwrap(), GgmlType::Q2K);
+        assert!(dequantize(GgmlType::Q2K, &[0u8; 84], 256).is_err());
+    }
+
+    #[test]
+    fn q5_k_first_value_uses_high_bit() {
+        // Hand-built Q5_K block (176 bytes): d=1.0, dmin=0, scales[0]=1 (others 0),
+        // qh[0] bit0 set, qs[0]=0x0F. For value 0: sc=scales[0]&63=1, m=scales[4]&63=0,
+        // low nibble 15 + high bit (16) = 31 ⇒ y[0] = d*sc*31 - dmin*m = 31.
+        let mut blk = vec![0u8; 176];
+        blk[0..2].copy_from_slice(&f16::from_f32(1.0).to_le_bytes()); // d
+                                                                      // blk[2..4] = dmin = 0
+        blk[4] = 1; // scales[0] = 1
+        blk[16] = 0b0000_0001; // qh[0]: bit0 set (value 0's high bit)
+        blk[48] = 0x0F; // qs[0]: low nibble = 15
+        let y = dequantize(GgmlType::Q5K, &blk, 256).unwrap();
+        assert_eq!(y.len(), 256);
+        assert!((y[0] - 31.0).abs() < 1e-3, "y[0] = {}", y[0]);
+        // value 32 (high nibble of qs[0]) uses sub-scale is+1 = scales[1] = 0 ⇒ 0.
+        assert_eq!(y[32], 0.0);
     }
 
     #[test]
