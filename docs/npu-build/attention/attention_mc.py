@@ -12,6 +12,9 @@ from ml_dtypes import bfloat16
 
 from aie.iron import Buffer, Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.device import NPU2
+from aie.iron.controlflow import range_
+from aie.extras.dialects.arith import index_cast
+from aie.extras import types as Ty
 from aie.helpers.taplib import TensorAccessPattern
 
 
@@ -49,12 +52,14 @@ def attention(MT, MQ, L, D, LB, NH, NC):
         base = c * TPC  # this core's first global query-tile index
 
         def core_fn(q_in, kv_in, o_out, mb, lb, ob, kblk, kfin, base=base):
-            for lt in range(TPC):  # local tile index
-                pt = (base + lt) % TPH  # position-tile within head → causal index
+            # range_ (runtime loop) → tiny ELF (unrolling TPC*NBLK overflowed at
+            # bucket-512). pt = (base+lt)%TPH and kb index_cast to i32 for causal.
+            for lt in range_(TPC):  # local tile index
+                pt = index_cast((base + lt) % TPH, to=Ty.i32())
                 eq = q_in.acquire(1)
-                for kb in range(NBLK):
+                for kb in range_(NBLK):
                     ek = kv_in.acquire(1)
-                    kblk(eq, ek, mb, lb, ob, pt, kb)
+                    kblk(eq, ek, mb, lb, ob, pt, index_cast(kb, to=Ty.i32()))
                     kv_in.release(1)
                 eo = o_out.acquire(1)
                 kfin(ob, lb, mb, eo)

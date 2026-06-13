@@ -82,10 +82,18 @@ def attention(MT, MQ, L, D, LB, KVDEPTH=2, NH=1):
         # Q: NQT objects of (Mtile × D), 2D inner pattern (keeps DMA repeat < 256).
         rt.fill(of_q.prod(), IN, tap=TensorAccessPattern((T,), 0, [NQT, MT, D], [MT * D, D, 1]))
         # K/V: NQT*NBLK objects, contiguous over the replicated region (no stride-0).
+        # 4D tap: outer dims [NQT, NBLK] (each ≤255) instead of a flat NQT*NBLK
+        # (which lowers to repeat_count > 255 at bucket-512). Inner [2*LB, D] = one
+        # KV object; the fifo auto-segments. KV is replicated NQT× in the host.
         rt.fill(
             of_kv.prod(),
             IN,
-            tap=TensorAccessPattern((T,), NH * MQ * D, [NQT * NBLK, 2 * LB, D], [2 * LB * D, D, 1]),
+            tap=TensorAccessPattern(
+                (T,),
+                NH * MQ * D,
+                [NQT, NBLK, 2 * LB, D],
+                [NBLK * 2 * LB * D, 2 * LB * D, D, 1],
+            ),
         )
         # O: NQT output tiles (head-major).
         rt.drain(of_o.cons(), O, tap=TensorAccessPattern((NH * MQ * D,), 0, [NQT, MT, D], [MT * D, D, 1]), wait=True)
