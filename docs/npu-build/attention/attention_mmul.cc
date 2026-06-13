@@ -100,24 +100,18 @@ void attn_block(bfloat16 *restrict q, bfloat16 *restrict kv,
   const bfloat16 *V = kv + ATT_D * ATT_LB; // [LB, D]
   const int qbase = qt * ATT_M, kbase = kb * ATT_LB;
 
-  // --- scratch (blocked + row-major intermediates). static: too big for the
-  // small AIE stack, and on a single core static = persistent local data mem.
-  // NOTE: at real shapes (MT=32,D=128) this on-chip repack overflows the 64KB
-  // tile → the production path tiles in the DMA (dims_to_stream), not here. ---
-  alignas(64) static bfloat16 Qb[ATT_M * ATT_D];
-  alignas(64) static bfloat16 KTb[ATT_D * ATT_LB];
+  // --- scratch. Q/KT/V arrive ALREADY BLOCKED from the host (I3: no on-chip
+  // repack of the big operands — that overflowed 64KB). Only the small [MT,LB]
+  // score tile is un-tiled / re-tiled on-chip for the row-wise softmax. static:
+  // too big for the small AIE stack; single core → static = persistent local mem.
   alignas(64) static bfloat16 Sb[ATT_M * ATT_LB];
   alignas(64) static bfloat16 Pb[ATT_M * ATT_LB];
-  alignas(64) static bfloat16 Vb[ATT_LB * ATT_D];
   alignas(64) static bfloat16 Ob[ATT_M * ATT_D];
   alignas(128) static float S[ATT_M * ATT_LB];
   alignas(64) static bfloat16 P[ATT_M * ATT_LB];
-  alignas(128) static float O[ATT_M * ATT_D];
 
-  // 1) S = Q·Kᵀ on the MAC array.
-  tile_rm<ATT_M, ATT_D, MM_R, MM_S>(q, Qb);   // A
-  tile_rm<ATT_D, ATT_LB, MM_S, MM_T>(KT, KTb); // B (KT is [D,LB] row-major)
-  mm_blk<ATT_M, ATT_D, ATT_LB>(Qb, KTb, Sb);
+  // 1) S = Q·Kᵀ on the MAC array. q and KT are pre-blocked by the host.
+  mm_blk<ATT_M, ATT_D, ATT_LB>(q, KT, Sb);
   untile_rm<ATT_M, ATT_LB, MM_R, MM_T>(Sb, S); // → row-major S[MT,LB]
 
   // 2) per-row online softmax on row-major S (scale + causal mask), update m/l,
@@ -153,12 +147,20 @@ void attn_block(bfloat16 *restrict q, bfloat16 *restrict kv,
     m_buf[i] = m_new;
   }
 
-  // 3) O_block = P·V on the MAC array; add to the running output.
-  tile_rm<ATT_M, ATT_LB, MM_R, MM_S>(P, Pb); // A
-  tile_rm<ATT_LB, ATT_D, MM_S, MM_T>(V, Vb); // B
-  mm_blk<ATT_M, ATT_LB, ATT_D>(Pb, Vb, Ob);
-  untile_rm<ATT_M, ATT_D, MM_R, MM_T>(Ob, O);
-  for (int i = 0; i < ATT_M * ATT_D; i++) o_buf[i] += O[i];
+  // 3) O_block = P·V on the MAC array; add to the running output. P is tiled
+  //    on-chip (it's produced here); V is pre-blocked by the host. Un-tile Ob
+  //    directly into o_buf (no separate O buffer — saves local memory).
+  tile_rm<ATT_M, ATT_LB, MM_R, MM_S>(P, Pb);
+  mm_blk<ATT_M, ATT_LB, ATT_D>(Pb, V, Ob);
+  {
+    constexpr int MB = ATT_M / MM_R, NB = ATT_D / MM_T;
+    for (int mb = 0; mb < MB; mb++)
+      for (int nb = 0; nb < NB; nb++)
+        for (int rr = 0; rr < MM_R; rr++)
+          for (int tt = 0; tt < MM_T; tt++)
+            o_buf[(mb * MM_R + rr) * ATT_D + (nb * MM_T + tt)] +=
+                (float)Ob[(mb * NB + nb) * (MM_R * MM_T) + rr * MM_T + tt];
+  }
 }
 
 void attn_finalize(float *restrict o_buf, float *restrict l_buf,

@@ -39,23 +39,67 @@ fn main() {
     // the shared kv head's blocks nqt times — no stride-0 DMA).
     let tph = m / mt;
     let nqt = nh * tph;
+    // STRIX_ATTN_BLOCKED=1: pack Q/KT/V in mmul-blocked [r,s]/[s,t] tile layout
+    // (for attention_mmul.cc). Else the matvec layout (Q row-major, KT [d,lb]).
+    let blocked = std::env::var("STRIX_ATTN_BLOCKED").is_ok();
+    let (rr_, ss_, tt_) = (4usize, 8usize, 8usize);
     let mut inb: Vec<u8> = Vec::with_capacity((nh * m * d + nqt * 2 * l * d) * 2);
     let push = |buf: &mut Vec<u8>, x: f32| buf.extend_from_slice(&f2bf(x).to_le_bytes());
-    for &x in q.iter() {
-        push(&mut inb, x);
-    }
-    for _tile in 0..nqt {
-        for b in 0..(l / lb) {
-            // K TRANSPOSED to [d, lb] (contiguous key-columns for the matvec)
-            for dd in 0..d {
-                for r in 0..lb {
-                    push(&mut inb, k[(b * lb + r) * d + dd]);
+    if blocked {
+        // Q: per query tile (mt rows of the [nh*m,d] q), blocked [mt/r][d/s][r][s].
+        for qti in 0..nqt {
+            for mb in 0..(mt / rr_) {
+                for kb in 0..(d / ss_) {
+                    for r in 0..rr_ {
+                        for s in 0..ss_ {
+                            push(&mut inb, q[(qti * mt + mb * rr_ + r) * d + (kb * ss_ + s)]);
+                        }
+                    }
                 }
             }
-            // V stays [lb, d]
-            for r in 0..lb {
+        }
+        for _tile in 0..nqt {
+            for b in 0..(l / lb) {
+                // KT blocked [d/s][lb/t][s][t]; KT[di,ki]=K[ki,di]
+                for kb in 0..(d / ss_) {
+                    for nb in 0..(lb / tt_) {
+                        for s in 0..ss_ {
+                            for t in 0..tt_ {
+                                push(&mut inb, k[(b * lb + nb * tt_ + t) * d + (kb * ss_ + s)]);
+                            }
+                        }
+                    }
+                }
+                // V blocked [lb/s][d/t][s][t]
+                for kb in 0..(lb / ss_) {
+                    for nb in 0..(d / tt_) {
+                        for s in 0..ss_ {
+                            for t in 0..tt_ {
+                                push(&mut inb, v[(b * lb + kb * ss_ + s) * d + (nb * tt_ + t)]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        let _ = (rr_, ss_, tt_);
+        for &x in q.iter() {
+            push(&mut inb, x);
+        }
+        for _tile in 0..nqt {
+            for b in 0..(l / lb) {
+                // K TRANSPOSED to [d, lb] (contiguous key-columns for the matvec)
                 for dd in 0..d {
-                    push(&mut inb, v[(b * lb + r) * d + dd]);
+                    for r in 0..lb {
+                        push(&mut inb, k[(b * lb + r) * d + dd]);
+                    }
+                }
+                // V stays [lb, d]
+                for r in 0..lb {
+                    for dd in 0..d {
+                        push(&mut inb, v[(b * lb + r) * d + dd]);
+                    }
                 }
             }
         }
