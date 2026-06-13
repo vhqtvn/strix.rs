@@ -53,8 +53,17 @@ static inline void block_row(const bfloat16 *restrict qi,
                              float *restrict l_p, float *restrict oi,
                              int qrow_g, int kbase) {
   constexpr int DCHUNKS = ATT_D / ATT_VEC;
-  // scaled scores for this block: sblk[jj] = (q_i · k_jj) × LOG2E
+  // scores[LB] = Σ_d q_i[d] · KT[d, :]   (KT = this block's K TRANSPOSED to
+  // [D, LB], packed that way by the host). The key reduction lives in the LB
+  // lanes via scalar-vector mac over d — NO per-key cross-lane aie::reduce_add,
+  // which was the measured bottleneck (a horizontal reduction per key/row).
   alignas(128) float sblk[ATT_LB];
+  {
+    aie::accum<accfloat, ATT_LB> sacc = aie::zeros<accfloat, ATT_LB>();
+    for (int d = 0; d < ATT_D; d++)
+      sacc = aie::mac(sacc, qi[d], aie::load_v<ATT_LB>(kk + d * ATT_LB));
+    aie::store_v(sblk, sacc.to_vector<float>());
+  }
   for (int jj = 0; jj < ATT_LB; jj++) {
 #if ATT_CAUSAL
     // causal mask: query qrow_g attends only keys ≤ qrow_g. Use a MODERATE
@@ -66,14 +75,7 @@ static inline void block_row(const bfloat16 *restrict qi,
       continue;
     }
 #endif
-    const bfloat16 *kj = kk + jj * ATT_D;
-    aie::accum<accfloat, ATT_VEC> sacc = aie::zeros<accfloat, ATT_VEC>();
-    for (int c = 0; c < DCHUNKS; c++) {
-      aie::vector<bfloat16, ATT_VEC> qv = aie::load_v<ATT_VEC>(qi + c * ATT_VEC);
-      aie::vector<bfloat16, ATT_VEC> kv = aie::load_v<ATT_VEC>(kj + c * ATT_VEC);
-      sacc = aie::mac(sacc, qv, kv);
-    }
-    sblk[jj] = aie::reduce_add(sacc.to_vector<float>()) * ATT_LOG2E;
+    sblk[jj] *= ATT_LOG2E;
   }
   aie::vector<float, ATT_LB> sv = aie::load_v<ATT_LB>(sblk);
 
@@ -96,27 +98,29 @@ static inline void block_row(const bfloat16 *restrict qi,
     *l_p = *l_p * corr + block_l;
     for (int d = 0; d < ATT_D; d++) oi[d] *= corr;
   }
-  // V accumulation, vectorized over D: per d-chunk, mac all block probs×V into a
-  // lane accum, then add to the running f32 output. (corr rescale above stays
-  // scalar — only D muls/block, cheap vs the LB×D V work.) Masked jj have
-  // probs≈0 so their mac adds ~0.
+  // V accumulation: O[:] += Σ_j probs[j] · V[j, :]. jj-outer so each prob lane
+  // is extracted ONCE (not per d-chunk) — DCHUNKS f32 accums held across j.
+  // Masked jj have probs≈0 so their mac adds ~0.
+  aie::accum<accfloat, ATT_VEC> acc[DCHUNKS];
+  for (int c = 0; c < DCHUNKS; c++) acc[c] = aie::zeros<accfloat, ATT_VEC>();
+  for (int jj = 0; jj < ATT_LB; jj++) {
+    bfloat16 p = probsb.get(jj);
+    const bfloat16 *vj = vv + jj * ATT_D;
+    for (int c = 0; c < DCHUNKS; c++)
+      acc[c] = aie::mac(acc[c], p, aie::load_v<ATT_VEC>(vj + c * ATT_VEC));
+  }
   for (int c = 0; c < DCHUNKS; c++) {
-    aie::accum<accfloat, ATT_VEC> acc = aie::zeros<accfloat, ATT_VEC>();
-    for (int jj = 0; jj < ATT_LB; jj++) {
-      bfloat16 p = probsb.get(jj);
-      acc = aie::mac(acc, p, aie::load_v<ATT_VEC>(vv + jj * ATT_D + c * ATT_VEC));
-    }
     aie::vector<float, ATT_VEC> ov = aie::load_v<ATT_VEC>(oi + c * ATT_VEC);
-    aie::store_v(oi + c * ATT_VEC, aie::add(ov, acc.to_vector<float>()));
+    aie::store_v(oi + c * ATT_VEC, aie::add(ov, acc[c].to_vector<float>()));
   }
   *m_p = m_new;
 }
 
 extern "C" {
 
-// kv = [K_block (ATT_LB×D) ‖ V_block (ATT_LB×D)] for the current block. One
-// kernel handles every block (first detected from the m sentinel) → uniform
-// streaming loop, matching the proven matmul K-reduction dataflow.
+// kv = [KT_block (D×ATT_LB, K TRANSPOSED) ‖ V_block (ATT_LB×D)] for the current
+// block. K is transposed by the host so the score matvec reads contiguous LB-key
+// columns. One kernel handles every block (first detected from the m sentinel).
 // idx_buf[0] = current query-tile index qt, idx_buf[1] = current block index kb
 // (advanced here; reset/advanced across tiles by attn_finalize). Used for causal
 // masking — the global query row is qt*ATT_M + i, the block's key base is kb*ATT_LB.

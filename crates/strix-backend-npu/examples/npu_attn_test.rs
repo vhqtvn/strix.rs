@@ -46,11 +46,13 @@ fn main() {
     }
     for _tile in 0..nqt {
         for b in 0..(l / lb) {
-            for r in 0..lb {
-                for dd in 0..d {
+            // K TRANSPOSED to [d, lb] (contiguous key-columns for the matvec)
+            for dd in 0..d {
+                for r in 0..lb {
                     push(&mut inb, k[(b * lb + r) * d + dd]);
                 }
             }
+            // V stays [lb, d]
             for r in 0..lb {
                 for dd in 0..d {
                     push(&mut inb, v[(b * lb + r) * d + dd]);

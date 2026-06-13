@@ -547,13 +547,15 @@ impl AttnShape {
                     }
                 }
             }
-            // KV (this kv-head), replicated once per query tile; blocked [lb,hd]‖[lb,hd].
+            // KV (this kv-head), replicated once per query tile. K TRANSPOSED to
+            // [hd, lb] (contiguous key-columns for the kernel's score matvec); V
+            // stays [lb, hd].
             let kh = kvh * hd;
             for _tile in 0..nqt {
                 for blk in 0..nblk {
-                    for r in 0..lb {
-                        let t = blk * lb + r;
-                        for d in 0..hd {
+                    for d in 0..hd {
+                        for r in 0..lb {
+                            let t = blk * lb + r;
                             let x = if t < m { kc[t * kv_dim + kh + d] } else { 0.0 };
                             inb.extend_from_slice(&f2bf(x).to_le_bytes());
                         }
