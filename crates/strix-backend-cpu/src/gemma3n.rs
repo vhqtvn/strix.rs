@@ -25,7 +25,7 @@ use strix_core::accel::{G3nConfig, WeightAccel};
 use strix_core::backend::Decoder;
 use strix_core::error::{Result, StrixError};
 use strix_core::sampler::Logits;
-use strix_models::ggml_quant::{dequantize_into, GgmlType};
+use strix_models::ggml_quant::{dequantize, dequantize_into, quantize_q8_0, GgmlType};
 use strix_models::gguf::GgufFile;
 
 const N_ALTUP: usize = 4;
@@ -456,6 +456,15 @@ impl Gemma3nModel {
                 GgmlType::Q4_1 => accel.upload_q4_1(name, bytes, in_dim, out_dim),
                 GgmlType::Q6K => accel.upload_q6_k(name, bytes, in_dim, out_dim),
                 GgmlType::Q8_0 => accel.upload_q8_0(name, bytes, in_dim, out_dim),
+                // token_embd is the tied lm_head (Q4_K — no GPU kernel). Repack to
+                // Q8_0 once so the per-token lm_head runs on the iGPU (q8_0_gemv)
+                // instead of a 256K-vocab CPU dequant gemv (the decode bottleneck).
+                _ if name == "token_embd.weight" => {
+                    match dequantize(ty, bytes, in_dim * out_dim) {
+                        Ok(f) => accel.upload_q8_0(name, &quantize_q8_0(&f), in_dim, out_dim),
+                        Err(_) => false,
+                    }
+                }
                 _ => false,
             };
             if ok {

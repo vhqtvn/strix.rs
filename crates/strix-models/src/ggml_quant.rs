@@ -186,6 +186,25 @@ fn read_f16(b: &[u8]) -> f32 {
     f16::from_le_bytes([b[0], b[1]]).to_f32()
 }
 
+/// Quantize `f32` → GGUF Q8_0 bytes (32 vals/block → [f16 d][32×i8]). `x.len()`
+/// must be a multiple of 32. Used to repack a CPU-only quant (e.g. Q4_K token_embd)
+/// into a GPU-uploadable Q8_0 so the lm_head can run on the iGPU.
+pub fn quantize_q8_0(x: &[f32]) -> Vec<u8> {
+    let nb = x.len() / 32;
+    let mut out = Vec::with_capacity(nb * 34);
+    for b in 0..nb {
+        let blk = &x[b * 32..b * 32 + 32];
+        let amax = blk.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        let d = amax / 127.0;
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        out.extend_from_slice(&f16::from_f32(d).to_le_bytes());
+        for &v in blk {
+            out.push(((v * id).round().clamp(-127.0, 127.0) as i8) as u8);
+        }
+    }
+    out
+}
+
 /// Quantize `f32` values to GGML Q4_0 blocks (32 vals → [f16 d][16 nibble bytes]),
 /// matching `ggml_quantize_row_q4_0`. `n_elements` must be a multiple of 32.
 /// Used to build a lighter Q4_0 lm_head from a Q6_K tied embedding.
