@@ -3008,6 +3008,16 @@ impl WeightAccel for RocmWeightAccel {
                 }
             }
         }
+        // STRIX_NOGRAPH: direct launches (no capture/replay), 1 sync/token via
+        // mlm_logits — isolates the hipGraph CPU-enqueue benefit vs graph replay.
+        if std::env::var("STRIX_NOGRAPH").is_ok() {
+            for (il, &(win, full)) in layers.iter().enumerate() {
+                if !self.mlm_layer_pos(il, win, full, topk) {
+                    return None;
+                }
+            }
+            return self.mlm_logits();
+        }
         if self.mlm_graph.is_none() {
             unsafe {
                 if crate::ffi::hipStreamBeginCapture(self.gpu.stream, 0) != 0 {
