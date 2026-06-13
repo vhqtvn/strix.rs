@@ -87,7 +87,9 @@ fn main() {
         for &x in q.iter() {
             push(&mut inb, x);
         }
-        for _tile in 0..nqt {
+        // STRIX_ATTN_KV_ONCE=1 (memtile broadcast): KV stored ONCE, not replicated.
+        let kv_copies = if std::env::var("STRIX_ATTN_KV_ONCE").is_ok() { 1 } else { nqt };
+        for _tile in 0..kv_copies {
             for b in 0..(l / lb) {
                 // K TRANSPOSED to [d, lb] (contiguous key-columns for the matvec)
                 for dd in 0..d {
