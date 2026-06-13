@@ -44,9 +44,18 @@ real prefill lengths). Two orthogonal levers, both needed:
   stage via the 512KB memtile. This is the intricate part (the whole_array `a_dims`/
   `b_dims`/`c_dims` access patterns). S→softmax→P still needs an on-chip un-tile/re-tile
   of just the [MT,LB] score tile (small, fits).
-- ⏳ **I4 (multi-core):** N workers, KV broadcast (multiple `.cons()`/memtile forward),
-  query tiles distributed (`split`), outputs joined (`join`) — whole_array pattern, NO
-  C-reduction (each core owns whole query rows). Scale 2→8 cores.
+- ✅ **I3 DONE [commit de4d5e1]:** host pre-tiles Q/KT/V into blocked layout (free in
+  the pack loop, no 3rd DMA channel) → mmul kernel reads blocked operands directly;
+  only the small [MT,LB] score tile un-tiles on-chip. Fits 64KB at D=128 (MT=16):
+  cosine 0.9997, 50 ms/run (~4× faster/tile than matvec).
+- ✅ **I4 DONE [commit c298624], `attention_mc.py`:** N INDEPENDENT pipelines (simpler
+  than the whole_array memtile hierarchy — attention has no cross-core reduction, so
+  each core owns whole query tiles with its own Q/KV/out fifos + Buffers; host layout
+  identical to single-core, each core reads its slice). Validated 128×128×128 causal
+  (matvec): **1c 24.24 ms → 2c 6.39 (3.8×) → 4c 1.71 ms/run (14.2×)** — SUPERLINEAR
+  (parallelizes per-core DMA + state, not just compute), cosine 0.9998 at every count.
+- ⏳ **NEXT:** combine I3+I4 (multi-core with the mmul kernel), scale to 8 cores (needs
+  more query tiles: bigger MQ or NH), GQA multi-core.
 - ⏳ **I5:** integrate multi-core/bucketed xclbins into the model; benchmark vs CPU.
 
 ## Risks / notes
