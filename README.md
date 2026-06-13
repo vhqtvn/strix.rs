@@ -70,7 +70,7 @@ comparison, not peak; expect higher prefill on long warm prompts):
 | Gemma-3n-E4B | Q4_0 | NPU prefill + iGPU decode | 16.2 | 18.4 |
 | Gemma-4-12B-QAT | Q4_0 | iGPU (full forward) | 21.5 | 10.9 |
 | Qwen3.6-35B-A3B | Q6_K | NPU prefill + iGPU decode | 3.1 | 1.66 |
-| Qwen3.5-4B | Q8_0 | CPU prefill + resident iGPU decode (Q4) | 5.7 | **26.0** |
+| Qwen3.5-4B | Q8_0 | CPU prefill + resident iGPU decode (Q4 dp4a) | 5.7 | **28.3** |
 
 Notes:
 - **NPU dense-projection prefill is the headline win** (~13× on Qwen3, ~4.7× on
@@ -94,8 +94,8 @@ runs on the iGPU — the **Gated-DeltaNet recurrence** (a from-scratch GPU scan 
 output gating + partial RoPE, dense SwiGLU FFN, and the tied lm_head — with one sync per
 token. Prefill stays on CPU/NPU and seeds the device KV + SSM/conv state (the iGPU is
 never used for prefill). Decode arc: CPU **2.5** → per-weight GEMV **~6.6** → resident
-**~11.7** → +coalesced DeltaNet state **~14.5** → **+Q8→Q4 weight repack (`STRIX_Q35_Q4`)
-~26 tok/s** (~10×). The Q4 repack halves the (bandwidth-bound) weight reads; it's
+**~11.7** → +coalesced DeltaNet state **~14.5** → **+Q8→Q4 weight repack (`STRIX_Q35_Q4`, int8-dp4a GEMV)
+~28 tok/s** (~11×). The Q4 repack halves the (bandwidth-bound) weight reads; it's
 opt-in/lossy in principle but was token-identical to Q8 on the tested prompt.
 
 ## Build & run

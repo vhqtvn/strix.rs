@@ -415,6 +415,11 @@ struct Q35State {
     th: Dbuf,     // [hidden] generic hidden temp (proj out)
     xn: Dbuf,     // [hidden] final norm
     logits: Dbuf, // [vocab]
+    // int8-activation quant scratch for the dp4a GEMV (STRIX_Q35_Q4 path).
+    xq_lo: Dbuf,
+    xq_hi: Dbuf,
+    xq_d: Dbuf,
+    xq_sum: Dbuf,
     // per-layer persistent state
     k_cache: Vec<Dbuf>, // full-attn layers: [max_seq*n_kv*hd] (empty Dbuf for deltanet layers)
     v_cache: Vec<Dbuf>,
@@ -4623,6 +4628,14 @@ impl WeightAccel for RocmWeightAccel {
         let kv_dim = cfg.n_head_kv * hd;
         let (key_dim, value_dim, conv_dim) = (cfg.key_dim(), cfg.value_dim(), cfg.conv_dim());
         let s_v = cfg.s_v;
+        // Largest GEMV input (for the int8-activation quant scratch): hidden, value_dim
+        // (ssm_out), q_dim (attn_output), or dense_ff (ffn_down).
+        let nb_max = cfg
+            .hidden
+            .max(value_dim)
+            .max(q_dim)
+            .max(cfg.dense_ff)
+            .div_ceil(32);
         let (mut k_cache, mut v_cache, mut ssm, mut conv) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for il in 0..cfg.n_layer {
@@ -4664,6 +4677,10 @@ impl WeightAccel for RocmWeightAccel {
             th: mk(cfg.hidden),
             xn: mk(cfg.hidden),
             logits: mk(cfg.vocab),
+            xq_lo: self.gpu.alloc(nb_max * 16).expect("q35 xq_lo"),
+            xq_hi: self.gpu.alloc(nb_max * 16).expect("q35 xq_hi"),
+            xq_d: mk(nb_max),
+            xq_sum: mk(nb_max),
             k_cache,
             v_cache,
             ssm,
@@ -4750,15 +4767,32 @@ impl WeightAccel for RocmWeightAccel {
                         .i(w.out_dim as i32),
                 );
             } else if let Some(w) = self.q4.get(wkey) {
+                // int8-activation dp4a path: quantize x → xq, then 8-rows/block GEMV.
                 self.launch(
-                    "q4_gemv",
-                    w.out_dim as u32,
+                    "xquant",
+                    (w.in_dim / 32) as u32,
                     32,
+                    0,
+                    Args::new()
+                        .ptr(x)
+                        .ptr(q.xq_lo.ptr)
+                        .ptr(q.xq_hi.ptr)
+                        .ptr(q.xq_d.ptr)
+                        .ptr(q.xq_sum.ptr)
+                        .i(w.in_dim as i32),
+                );
+                self.launch(
+                    "q4_gemv_dp",
+                    w.out_dim.div_ceil(8) as u32,
+                    256,
                     0,
                     Args::new()
                         .ptr(w.scales.ptr)
                         .ptr(w.quants.ptr)
-                        .ptr(x)
+                        .ptr(q.xq_lo.ptr)
+                        .ptr(q.xq_hi.ptr)
+                        .ptr(q.xq_d.ptr)
+                        .ptr(q.xq_sum.ptr)
                         .ptr(y)
                         .i(w.in_dim as i32)
                         .i(w.out_dim as i32),
