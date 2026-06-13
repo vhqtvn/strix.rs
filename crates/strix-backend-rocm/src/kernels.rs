@@ -2720,4 +2720,158 @@ extern "C" __global__ void g3n_add_streams123(float* __restrict__ corr, const fl
 
 // inp_per_layer[i] = (tmp[i] + pe[i]) * inv_sqrt2, then scale[*] applied elsewhere. grid ceil(n/256).
 // (alias of g3n_addscale; kept distinct for clarity is unnecessary — use g3n_addscale.)
+
+// ============================ qwen35 (Qwen3.5) resident decode ============================
+// Gated-DeltaNet + full-attn hybrid. All validated bit-exact vs CPU (examples/deltanet_check).
+
+// Causal depthwise conv1d (kernel dconv) over qkv[conv_dim] using conv state
+// cs[conv_dim*(dconv-1)] (oldest..newest), + silu, then shift state. grid=ceil(conv_dim/256).
+extern "C" __global__ void dn_conv1d(const float* __restrict__ qkv, const float* __restrict__ cw,
+                                     float* __restrict__ cs, float* __restrict__ out,
+                                     int conv_dim, int dconv) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= conv_dim) return;
+    const float* w = cw + (long long)c * dconv;
+    float* st = cs + (long long)c * (dconv - 1);
+    float acc = 0.f;
+    for (int k = 0; k < dconv - 1; k++) acc += w[k] * st[k];
+    acc += w[dconv - 1] * qkv[c];
+    out[c] = acc / (1.f + __expf(-acc));
+    for (int k = 0; k < dconv - 2; k++) st[k] = st[k + 1];
+    st[dconv - 2] = qkv[c];
+}
+
+// L2-normalize q and k per k-head segment [s_v]: x / sqrt(max(sum x^2, eps)).
+// grid = 2*n_kh (first n_kh = q segments, rest = k), block = s_v.
+extern "C" __global__ void dn_l2norm(const float* __restrict__ q, const float* __restrict__ k,
+                                     float* __restrict__ qn, float* __restrict__ kn,
+                                     int s_v, int n_kh, float eps) {
+    int seg = blockIdx.x, i = threadIdx.x;
+    const float* src; float* dst; int kh;
+    if (seg < n_kh) { kh = seg;        src = q + (long long)kh * s_v; dst = qn + (long long)kh * s_v; }
+    else            { kh = seg - n_kh; src = k + (long long)kh * s_v; dst = kn + (long long)kh * s_v; }
+    __shared__ float red[1024];
+    float val = (i < s_v) ? src[i] : 0.f;
+    red[i] = val * val; __syncthreads();
+    for (int o = blockDim.x >> 1; o > 0; o >>= 1) { if (i < o) red[i] += red[i + o]; __syncthreads(); }
+    float r = rsqrtf(fmaxf(red[0], eps));
+    if (i < s_v) dst[i] = val * r;
+}
+
+// decay[vh] = exp(ssm_a[vh] * softplus(alpha_raw[vh] + ssm_dt[vh])); beta[vh] = sigmoid(beta_raw[vh]).
+extern "C" __global__ void dn_decaybeta(const float* __restrict__ alpha_raw, const float* __restrict__ beta_raw,
+                                        const float* __restrict__ ssm_a, const float* __restrict__ ssm_dt,
+                                        float* __restrict__ decay, float* __restrict__ beta, int n_vh) {
+    int vh = blockIdx.x * blockDim.x + threadIdx.x;
+    if (vh >= n_vh) return;
+    float x = alpha_raw[vh] + ssm_dt[vh];
+    float sp = (x > 20.f) ? x : log1pf(__expf(x));
+    decay[vh] = __expf(ssm_a[vh] * sp);
+    beta[vh] = 1.f / (1.f + __expf(-beta_raw[vh]));
+}
+
+// Gated DeltaNet single-token recurrent update. grid = n_vh, block = s_v (thread per
+// state COLUMN j). State is stored TRANSPOSED: st[vh*s_v*s_v + i*s_v + j] = S[i][j],
+// so consecutive threads (j) access consecutive addresses → coalesced. kh = vh % n_kh.
+extern "C" __global__ void deltanet_step(
+    float* __restrict__ state, const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ decay,
+    const float* __restrict__ beta, float* __restrict__ out, int s_v, int n_kh, float scale) {
+    int vh = blockIdx.x, j = threadIdx.x;
+    if (j >= s_v) return;
+    int kh = vh % n_kh;
+    extern __shared__ float sh[];
+    float* qsh = sh; float* ksh = sh + s_v;
+    for (int i = j; i < s_v; i += blockDim.x) { qsh[i] = q[kh*s_v+i]; ksh[i] = k[kh*s_v+i]; }
+    __syncthreads();
+    float dec = decay[vh], bt = beta[vh];
+    float* base = state + (long long)vh * s_v * s_v;   // S[i][j] at base[i*s_v + j]
+    float dotk = 0.f;
+    for (int i = 0; i < s_v; i++) { float s = base[i*s_v + j] * dec; base[i*s_v + j] = s; dotk += s * ksh[i]; }
+    float delta = (v[vh*s_v + j] - dotk) * bt;
+    float dotq = 0.f;
+    for (int i = 0; i < s_v; i++) { float s = base[i*s_v + j] + delta * ksh[i]; base[i*s_v + j] = s; dotq += s * qsh[i]; }
+    out[vh*s_v + j] = dotq * scale;
+}
+
+// Per v-head: rmsnorm(core_h, w) * silu(z_h). grid = n_vh, block = s_v.
+extern "C" __global__ void dn_gatednorm(const float* __restrict__ core, const float* __restrict__ z,
+                                        const float* __restrict__ w, float* __restrict__ out,
+                                        int s_v, float eps) {
+    int vh = blockIdx.x, i = threadIdx.x;
+    const float* c = core + (long long)vh * s_v;
+    __shared__ float red[1024];
+    float val = (i < s_v) ? c[i] : 0.f;
+    red[i] = val * val; __syncthreads();
+    for (int o = blockDim.x >> 1; o > 0; o >>= 1) { if (i < o) red[i] += red[i + o]; __syncthreads(); }
+    float r = rsqrtf(red[0] / s_v + eps);
+    if (i < s_v) {
+        float zz = z[(long long)vh * s_v + i];
+        out[(long long)vh * s_v + i] = (val * r * w[i]) * (zz / (1.f + __expf(-zz)));
+    }
+}
+
+// Per-head RMSNorm of strided source into packed dst[i*hd + d] = rmsnorm(src[i*in_stride + d], w).
+// grid = n (heads), block = hd. Used for q (in_stride=2*hd, skips the gate half) and k (in_stride=hd).
+extern "C" __global__ void q35_head_rmsnorm(const float* __restrict__ src, const float* __restrict__ w,
+                                            float* __restrict__ dst, int in_stride, int hd, float eps) {
+    int head = blockIdx.x, d = threadIdx.x;
+    const float* s = src + (long long)head * in_stride;
+    __shared__ float red[1024];
+    float val = (d < hd) ? s[d] : 0.f;
+    red[d] = val * val; __syncthreads();
+    for (int o = blockDim.x >> 1; o > 0; o >>= 1) { if (d < o) red[d] += red[d + o]; __syncthreads(); }
+    float r = rsqrtf(red[0] / hd + eps);
+    if (d < hd) dst[(long long)head * hd + d] = val * r * w[d];
+}
+
+// Extract the gate half of the fused q+gate projection: gate[h*hd+d] = qg[h*2*hd + hd + d].
+// grid = n_heads, block = hd.
+extern "C" __global__ void q35_gate_extract(const float* __restrict__ qg, float* __restrict__ gate,
+                                            int hd) {
+    int h = blockIdx.x, d = threadIdx.x;
+    if (d < hd) gate[(long long)h * hd + d] = qg[(long long)h * 2 * hd + hd + d];
+}
+
+// Partial NEOX RoPE on the first n_rot dims of each head vector [head_dim].
+// pairs (j, j+n_rot/2) for j in 0..n_rot/2. grid=ceil(n_heads*n_rot/2 / 64), block=64.
+extern "C" __global__ void q35_rope_partial(float* __restrict__ v, int head_dim, int n_rot,
+                                            int n_heads, int pos, float theta) {
+    int half = n_rot / 2;
+    int idx = blockIdx.x * 64 + threadIdx.x;
+    if (idx >= n_heads * half) return;
+    int head = idx / half, j = idx % half;
+    long long base = (long long)head * head_dim;
+    float freq = powf(theta, -2.0f * (float)j / (float)n_rot);
+    float ang = (float)pos * freq;
+    float c = cosf(ang), s = sinf(ang);
+    float x1 = v[base + j], x2 = v[base + j + half];
+    v[base + j] = x1 * c - x2 * s;
+    v[base + j + half] = x1 * s + x2 * c;
+}
+
+// Append normed+roped k and raw v (each [kv_dim]) into token-major caches at pos.
+// grid = ceil(kv_dim/256), block = 256.
+extern "C" __global__ void q35_kv_append(const float* __restrict__ k, const float* __restrict__ v,
+                                         float* __restrict__ kc, float* __restrict__ vc,
+                                         int kv_dim, int pos) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= kv_dim) return;
+    long long off = (long long)pos * kv_dim + i;
+    kc[off] = k[i];
+    vc[off] = v[i];
+}
+
+// Output gating: attn[i] *= sigmoid(gate[i]) (both [n_heads*hd]). grid=ceil(n/256), block=256.
+extern "C" __global__ void q35_out_gate(float* __restrict__ attn, const float* __restrict__ gate, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) attn[i] *= 1.f / (1.f + __expf(-gate[i]));
+}
+
+// f32 SwiGLU activation (no quant): out[i] = silu(gate[i]) * up[i]. grid=ceil(n/256), block=256.
+extern "C" __global__ void q35_silu_mul(const float* __restrict__ gate, const float* __restrict__ up,
+                                        float* __restrict__ out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { float g = gate[i]; out[i] = (g / (1.f + __expf(-g))) * up[i]; }
+}
 "#;

@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::os::raw::c_void;
 
-use strix_core::accel::{G3nConfig, GpuDecodeConfig, WeightAccel};
+use strix_core::accel::{G3nConfig, GpuDecodeConfig, Q35GpuConfig, WeightAccel};
 
 use crate::ffi::hipFunction_t;
 use crate::hip::{Dbuf, HipGpu};
@@ -343,43 +343,83 @@ struct Scratch {
 /// Scratch + device KV for the gemma3n (MatFormer) on-device decode. The 4 AltUp
 /// streams (h/pred/corr) stay resident across all layers; the rest are per-op temps.
 struct G3nScratch {
-    h: Dbuf,      // [4*hidden] the 4 AltUp streams (AltUp-correct writes here directly)
-    pred: Dbuf,   // [4*hidden]
-    x0: Dbuf,     // [hidden] base (scaled) embedding
-    cur: Dbuf,    // [hidden] normed active prediction
-    q: Dbuf,      // [n_heads*hd]
-    k: Dbuf,      // [n_kv*hd]
-    v: Dbuf,      // [n_kv*hd]
-    attn: Dbuf,   // [n_heads*hd]
-    t_hid: Dbuf,  // [hidden] generic hidden temp (ao / ff / pj)
-    rn: Dbuf,     // [hidden] rmsnorm temp (modalities / norms)
-    modal: Dbuf,  // [4]
-    coef: Dbuf,   // [16] predict coefs
-    cc: Dbuf,     // [4] correct coefs
-    lo: Dbuf,     // [laurel_rank]
-    laurel: Dbuf, // [hidden] laurel_out
-    pa: Dbuf,     // [hidden] post-attn gated
-    attn_laurel: Dbuf, // [hidden]
-    gate: Dbuf,   // [max_ffn]
-    up: Dbuf,     // [max_ffn]
-    afg: Dbuf,    // [hidden] attn_ffw_laurel_gated
-    pe: Dbuf,     // [ea*n_layers] per-layer token embd (scaled), uploaded per token
-    proj: Dbuf,   // [ea*n_layers] per_layer_model_proj output
+    h: Dbuf,             // [4*hidden] the 4 AltUp streams (AltUp-correct writes here directly)
+    pred: Dbuf,          // [4*hidden]
+    x0: Dbuf,            // [hidden] base (scaled) embedding
+    cur: Dbuf,           // [hidden] normed active prediction
+    q: Dbuf,             // [n_heads*hd]
+    k: Dbuf,             // [n_kv*hd]
+    v: Dbuf,             // [n_kv*hd]
+    attn: Dbuf,          // [n_heads*hd]
+    t_hid: Dbuf,         // [hidden] generic hidden temp (ao / ff / pj)
+    rn: Dbuf,            // [hidden] rmsnorm temp (modalities / norms)
+    modal: Dbuf,         // [4]
+    coef: Dbuf,          // [16] predict coefs
+    cc: Dbuf,            // [4] correct coefs
+    lo: Dbuf,            // [laurel_rank]
+    laurel: Dbuf,        // [hidden] laurel_out
+    pa: Dbuf,            // [hidden] post-attn gated
+    attn_laurel: Dbuf,   // [hidden]
+    gate: Dbuf,          // [max_ffn]
+    up: Dbuf,            // [max_ffn]
+    afg: Dbuf,           // [hidden] attn_ffw_laurel_gated
+    pe: Dbuf,            // [ea*n_layers] per-layer token embd (scaled), uploaded per token
+    proj: Dbuf,          // [ea*n_layers] per_layer_model_proj output
     inp_per_layer: Dbuf, // [ea*n_layers]
-    g: Dbuf,      // [ea] PLE gate
-    pn: Dbuf,     // [hidden] PLE post-norm
-    merged: Dbuf, // [hidden]
-    u: Dbuf,      // [hidden] merge temp
-    tgt: Dbuf,    // [1] l2 target scalar
-    xn: Dbuf,     // [hidden] final norm (returned; lm_head runs on CPU — token_embd is Q4_K)
+    g: Dbuf,             // [ea] PLE gate
+    pn: Dbuf,            // [hidden] PLE post-norm
+    merged: Dbuf,        // [hidden]
+    u: Dbuf,             // [hidden] merge temp
+    tgt: Dbuf,           // [1] l2 target scalar
+    xn: Dbuf,            // [hidden] final norm (returned; lm_head runs on CPU — token_embd is Q4_K)
     // int8-activation quant buffers for the Q4 GEMMs (packed char4 dp4a format).
     xq_lo: Dbuf,
     xq_hi: Dbuf,
     xq_d: Dbuf,
     xq_sum: Dbuf,
-    ones: Dbuf, // [hd/2] rope_freqs=1 (gemma3n uses plain NEOX rope)
+    ones: Dbuf,         // [hd/2] rope_freqs=1 (gemma3n uses plain NEOX rope)
     k_cache: Vec<Dbuf>, // own-KV layers (0..kv_from_start)
     v_cache: Vec<Dbuf>,
+}
+
+/// Resident state for the `qwen35` decode (DeltaNet + full-attn hybrid). The
+/// hidden state `h` stays on-device across all layers; per-layer KV caches (full
+/// attn) and SSM/conv recurrent state (DeltaNet) persist across tokens.
+struct Q35State {
+    cfg: Q35GpuConfig,
+    h: Dbuf, // [hidden] resident hidden state
+    n: Dbuf, // [hidden] normed (pre-mixer / pre-ffn)
+    // full-attn working buffers
+    qg: Dbuf,   // [n_head*2*head_dim] fused q+gate projection
+    q: Dbuf,    // [n_head*head_dim] q (split, normed, roped)
+    gate: Dbuf, // [n_head*head_dim] gate (split)
+    k: Dbuf,    // [n_kv*head_dim]
+    v: Dbuf,    // [n_kv*head_dim]
+    attn: Dbuf, // [n_head*head_dim]
+    // deltanet working buffers
+    qkv: Dbuf,       // [conv_dim] pre-conv projection
+    conv_out: Dbuf,  // [conv_dim]
+    z: Dbuf,         // [value_dim] gate (silu)
+    beta_raw: Dbuf,  // [n_vh]
+    alpha_raw: Dbuf, // [n_vh]
+    qn: Dbuf,        // [key_dim]
+    kn: Dbuf,        // [key_dim]
+    decay: Dbuf,     // [n_vh]
+    beta: Dbuf,      // [n_vh]
+    core: Dbuf,      // [value_dim]
+    gated: Dbuf,     // [value_dim]
+    // ffn
+    ffg: Dbuf,    // [dense_ff]
+    ffu: Dbuf,    // [dense_ff]
+    act: Dbuf,    // [dense_ff]
+    th: Dbuf,     // [hidden] generic hidden temp (proj out)
+    xn: Dbuf,     // [hidden] final norm
+    logits: Dbuf, // [vocab]
+    // per-layer persistent state
+    k_cache: Vec<Dbuf>, // full-attn layers: [max_seq*n_kv*hd] (empty Dbuf for deltanet layers)
+    v_cache: Vec<Dbuf>,
+    ssm: Vec<Dbuf>,  // deltanet layers: [n_vh*s_v*s_v]
+    conv: Vec<Dbuf>, // deltanet layers: [conv_dim*(dconv-1)]
 }
 
 /// Max flash-decoding key-split factor (buffer sizing cap). The actual split is
@@ -409,6 +449,7 @@ pub struct RocmWeightAccel {
     scratch: Option<Scratch>,
     g3n: Option<G3nConfig>,
     g3s: Option<G3nScratch>,
+    q35: Option<Q35State>,
     /// Persistent per-weight `gemv` scratch (x input / y output), reused across calls
     /// (Dbuf has no free-on-drop, so per-call alloc would leak). Sized to GEMV_MAX_*.
     gemv_x: Dbuf,
@@ -623,6 +664,17 @@ impl RocmWeightAccel {
             "sdpa_pv_wmma",
             "xquant_npu",
             "rescale_npu",
+            "dn_conv1d",
+            "dn_l2norm",
+            "dn_decaybeta",
+            "deltanet_step",
+            "dn_gatednorm",
+            "q35_head_rmsnorm",
+            "q35_gate_extract",
+            "q35_rope_partial",
+            "q35_kv_append",
+            "q35_out_gate",
+            "q35_silu_mul",
         ] {
             funcs.insert(name, gpu.get_function(module, name).ok()?);
         }
@@ -682,6 +734,7 @@ impl RocmWeightAccel {
             scratch: None,
             g3n: None,
             g3s: None,
+            q35: None,
             gemv_x,
             gemv_y,
             moe: HashMap::new(),
@@ -3988,7 +4041,12 @@ impl WeightAccel for RocmWeightAccel {
                 (out_dim.div_ceil(8)) as u32,
                 256,
                 0,
-                Args::new().ptr(ff(wname)).ptr(x).ptr(y).i(in_dim as i32).i(out_dim as i32),
+                Args::new()
+                    .ptr(ff(wname))
+                    .ptr(x)
+                    .ptr(y)
+                    .i(in_dim as i32)
+                    .i(out_dim as i32),
             );
         };
         let rms = |x: *mut c_void, w: *mut c_void, y: *mut c_void, dim: usize, rows: usize| {
@@ -4001,10 +4059,22 @@ impl WeightAccel for RocmWeightAccel {
             );
         };
         let vadd = |h: *mut c_void, x: *mut c_void, n: usize| {
-            self.launch("vec_add", cells(n), 256, 0, Args::new().ptr(h).ptr(x).i(n as i32));
+            self.launch(
+                "vec_add",
+                cells(n),
+                256,
+                0,
+                Args::new().ptr(h).ptr(x).i(n as i32),
+            );
         };
         let addscale = |a: *mut c_void, b: *mut c_void, o: *mut c_void, n: usize, sc: f32| {
-            self.launch("g3n_addscale", cells(n), 256, 0, Args::new().ptr(a).ptr(b).ptr(o).i(n as i32).f(sc));
+            self.launch(
+                "g3n_addscale",
+                cells(n),
+                256,
+                0,
+                Args::new().ptr(a).ptr(b).ptr(o).i(n as i32).f(sc),
+            );
         };
         let quantize = |src: *mut c_void, in_dim: usize| {
             self.launch(
@@ -4012,7 +4082,13 @@ impl WeightAccel for RocmWeightAccel {
                 (in_dim / 32) as u32,
                 32,
                 0,
-                Args::new().ptr(src).ptr(s.xq_lo.ptr).ptr(s.xq_hi.ptr).ptr(s.xq_d.ptr).ptr(s.xq_sum.ptr).i(in_dim as i32),
+                Args::new()
+                    .ptr(src)
+                    .ptr(s.xq_lo.ptr)
+                    .ptr(s.xq_hi.ptr)
+                    .ptr(s.xq_d.ptr)
+                    .ptr(s.xq_sum.ptr)
+                    .i(in_dim as i32),
             );
         };
         let q4dp = |w: &ResQ4, y: *mut c_void| {
@@ -4021,7 +4097,16 @@ impl WeightAccel for RocmWeightAccel {
                 (w.out_dim.div_ceil(8)) as u32,
                 256,
                 0,
-                Args::new().ptr(w.scales.ptr).ptr(w.quants.ptr).ptr(s.xq_lo.ptr).ptr(s.xq_hi.ptr).ptr(s.xq_d.ptr).ptr(s.xq_sum.ptr).ptr(y).i(w.in_dim as i32).i(w.out_dim as i32),
+                Args::new()
+                    .ptr(w.scales.ptr)
+                    .ptr(w.quants.ptr)
+                    .ptr(s.xq_lo.ptr)
+                    .ptr(s.xq_hi.ptr)
+                    .ptr(s.xq_d.ptr)
+                    .ptr(s.xq_sum.ptr)
+                    .ptr(y)
+                    .i(w.in_dim as i32)
+                    .i(w.out_dim as i32),
             );
         };
         let q41dp = |w: &ResQ41, y: *mut c_void| {
@@ -4030,7 +4115,17 @@ impl WeightAccel for RocmWeightAccel {
                 (w.out_dim.div_ceil(8)) as u32,
                 256,
                 0,
-                Args::new().ptr(w.scales.ptr).ptr(w.mins.ptr).ptr(w.quants.ptr).ptr(s.xq_lo.ptr).ptr(s.xq_hi.ptr).ptr(s.xq_d.ptr).ptr(s.xq_sum.ptr).ptr(y).i(w.in_dim as i32).i(w.out_dim as i32),
+                Args::new()
+                    .ptr(w.scales.ptr)
+                    .ptr(w.mins.ptr)
+                    .ptr(w.quants.ptr)
+                    .ptr(s.xq_lo.ptr)
+                    .ptr(s.xq_hi.ptr)
+                    .ptr(s.xq_d.ptr)
+                    .ptr(s.xq_sum.ptr)
+                    .ptr(y)
+                    .i(w.in_dim as i32)
+                    .i(w.out_dim as i32),
             );
         };
         // GEMM by GGUF tensor name (Q4_0 / Q4_1 / Q6_K), device->device.
@@ -4047,7 +4142,14 @@ impl WeightAccel for RocmWeightAccel {
                     w.out_dim.div_ceil(16) as u32,
                     256,
                     0,
-                    Args::new().ptr(w.scales.ptr).ptr(w.ql.ptr).ptr(w.qh.ptr).ptr(x).ptr(y).i(w.in_dim as i32).i(w.out_dim as i32),
+                    Args::new()
+                        .ptr(w.scales.ptr)
+                        .ptr(w.ql.ptr)
+                        .ptr(w.qh.ptr)
+                        .ptr(x)
+                        .ptr(y)
+                        .i(w.in_dim as i32)
+                        .i(w.out_dim as i32),
                 );
             } else {
                 panic!("g3n: missing GEMM weight {name}");
@@ -4060,21 +4162,51 @@ impl WeightAccel for RocmWeightAccel {
         s.x0.upload(x0).ok()?;
         s.pe.upload(pe).ok()?;
         self.gpu.upload_at(&s.h, 0, x0).ok()?; // h[stream0] = x0
-        // per_layer_model_proj·x0 → proj (F16 weight uploaded as f32) ; rmsnorm per
-        // ea-slice (scale-invariant, so the 1/sqrt(hidden) scale is skipped)
-        f32g("per_layer_model_proj.weight", s.x0.ptr, s.proj.ptr, hidden, ea * nl);
+                                               // per_layer_model_proj·x0 → proj (F16 weight uploaded as f32) ; rmsnorm per
+                                               // ea-slice (scale-invariant, so the 1/sqrt(hidden) scale is skipped)
+        f32g(
+            "per_layer_model_proj.weight",
+            s.x0.ptr,
+            s.proj.ptr,
+            hidden,
+            ea * nl,
+        );
         self.launch(
             "rmsnorm",
             nl as u32,
             256,
             0,
-            Args::new().ptr(s.proj.ptr).ptr(ff("per_layer_proj_norm.weight")).ptr(s.inp_per_layer.ptr).i(ea as i32).i(1).f(eps),
+            Args::new()
+                .ptr(s.proj.ptr)
+                .ptr(ff("per_layer_proj_norm.weight"))
+                .ptr(s.inp_per_layer.ptr)
+                .i(ea as i32)
+                .i(1)
+                .f(eps),
         );
-        addscale(s.inp_per_layer.ptr, s.pe.ptr, s.inp_per_layer.ptr, ea * nl, inv_sqrt2);
+        addscale(
+            s.inp_per_layer.ptr,
+            s.pe.ptr,
+            s.inp_per_layer.ptr,
+            ea * nl,
+            inv_sqrt2,
+        );
         // AltUp init: streams 1..3 = magnitude-matched altup_proj·x0
         for i in 0..3 {
-            f32g(&format!("altup_proj.{i}"), s.x0.ptr, hp(i + 1), hidden, hidden);
-            self.launch("g3n_magmatch", 1, 256, 0, Args::new().ptr(s.x0.ptr).ptr(hp(i + 1)).i(hidden as i32));
+            f32g(
+                &format!("altup_proj.{i}"),
+                s.x0.ptr,
+                hp(i + 1),
+                hidden,
+                hidden,
+            );
+            self.launch(
+                "g3n_magmatch",
+                1,
+                256,
+                0,
+                Args::new().ptr(s.x0.ptr).ptr(hp(i + 1)).i(hidden as i32),
+            );
         }
 
         for il in 0..nl {
@@ -4087,18 +4219,46 @@ impl WeightAccel for RocmWeightAccel {
             let modal = |x: *mut c_void| {
                 rms(x, ff(&lc("altup_router_norm.weight")), s.rn.ptr, hidden, 1);
                 f32g(&lc("altup_router.weight"), s.rn.ptr, s.modal.ptr, hidden, 4);
-                self.launch("g3n_tanhscale", 1, 4, 0, Args::new().ptr(s.modal.ptr).i(4).f(1.0 / hidden as f32));
+                self.launch(
+                    "g3n_tanhscale",
+                    1,
+                    4,
+                    0,
+                    Args::new().ptr(s.modal.ptr).i(4).f(1.0 / hidden as f32),
+                );
             };
             modal(hp(0));
-            f32g(&lc("altup_predict_coef.weight"), s.modal.ptr, s.coef.ptr, 4, 16);
-            self.launch("g3n_predict", cells(4 * hidden), 256, 0, Args::new().ptr(s.h.ptr).ptr(s.coef.ptr).ptr(s.pred.ptr).i(hidden as i32));
+            f32g(
+                &lc("altup_predict_coef.weight"),
+                s.modal.ptr,
+                s.coef.ptr,
+                4,
+                16,
+            );
+            self.launch(
+                "g3n_predict",
+                cells(4 * hidden),
+                256,
+                0,
+                Args::new()
+                    .ptr(s.h.ptr)
+                    .ptr(s.coef.ptr)
+                    .ptr(s.pred.ptr)
+                    .i(hidden as i32),
+            );
 
             // attention on predicted active stream
             rms(predp(0), ff(&lc("attn_norm.weight")), s.cur.ptr, hidden, 1);
             // laurel branch: rmsnorm(laurel_r·laurel_l·cur) + cur
             f32g(&lc("laurel_l.weight"), s.cur.ptr, s.lo.ptr, hidden, lrank);
             f32g(&lc("laurel_r.weight"), s.lo.ptr, s.t_hid.ptr, lrank, hidden);
-            rms(s.t_hid.ptr, ff(&lc("laurel_post_norm.weight")), s.laurel.ptr, hidden, 1);
+            rms(
+                s.t_hid.ptr,
+                ff(&lc("laurel_post_norm.weight")),
+                s.laurel.ptr,
+                hidden,
+                1,
+            );
             vadd(s.laurel.ptr, s.cur.ptr, hidden);
 
             mmdev(&lc("attn_q.weight"), s.cur.ptr, hidden, s.q.ptr);
@@ -4153,7 +4313,11 @@ impl WeightAccel for RocmWeightAccel {
                 kvfrom - 1
             };
             let full_len = pos + 1;
-            let win = if swa && cfg.n_swa > 0 { cfg.n_swa } else { usize::MAX };
+            let win = if swa && cfg.n_swa > 0 {
+                cfg.n_swa
+            } else {
+                usize::MAX
+            };
             let ws = full_len.saturating_sub(win);
             let len = (full_len - ws) as i32;
             let so = ws * kvd * elsz;
@@ -4164,21 +4328,49 @@ impl WeightAccel for RocmWeightAccel {
                 nh as u32,
                 256,
                 0,
-                Args::new().ptr(s.q.ptr).ptr(kbase).ptr(vbase).ptr(s.attn.ptr).i(hd as i32).i(len).i(groups as i32).i(nkv as i32).f(1.0).i(if self.kv_f16 { 1 } else { 0 }),
+                Args::new()
+                    .ptr(s.q.ptr)
+                    .ptr(kbase)
+                    .ptr(vbase)
+                    .ptr(s.attn.ptr)
+                    .i(hd as i32)
+                    .i(len)
+                    .i(groups as i32)
+                    .i(nkv as i32)
+                    .f(1.0)
+                    .i(if self.kv_f16 { 1 } else { 0 }),
             );
             // output proj → t_hid; pa = rmsnorm(ao,post_attn)+active_pred
             mmdev(&lc("attn_output.weight"), s.attn.ptr, qd, s.t_hid.ptr);
-            rms(s.t_hid.ptr, ff(&lc("post_attention_norm.weight")), s.pa.ptr, hidden, 1);
+            rms(
+                s.t_hid.ptr,
+                ff(&lc("post_attention_norm.weight")),
+                s.pa.ptr,
+                hidden,
+                1,
+            );
             vadd(s.pa.ptr, predp(0), hidden);
             addscale(s.pa.ptr, s.laurel.ptr, s.attn_laurel.ptr, hidden, inv_sqrt2);
 
             // FFN (reuse cur as fn_in, pa as ff temp)
             let nff = cfg.ffn[il];
-            rms(s.attn_laurel.ptr, ff(&lc("ffn_norm.weight")), s.cur.ptr, hidden, 1);
+            rms(
+                s.attn_laurel.ptr,
+                ff(&lc("ffn_norm.weight")),
+                s.cur.ptr,
+                hidden,
+                1,
+            );
             mmdev(&lc("ffn_gate.weight"), s.cur.ptr, hidden, s.gate.ptr);
             mmdev(&lc("ffn_up.weight"), s.cur.ptr, hidden, s.up.ptr);
             if il < nspar {
-                self.launch("g3n_gtopk", 1, 256, 0, Args::new().ptr(s.gate.ptr).i(nff as i32).f(smul));
+                self.launch(
+                    "g3n_gtopk",
+                    1,
+                    256,
+                    0,
+                    Args::new().ptr(s.gate.ptr).i(nff as i32).f(smul),
+                );
             }
             // gelu(gate)*up → packed Q8 for the down GEMV
             self.launch(
@@ -4186,7 +4378,14 @@ impl WeightAccel for RocmWeightAccel {
                 (nff / 32) as u32,
                 32,
                 0,
-                Args::new().ptr(s.gate.ptr).ptr(s.up.ptr).ptr(s.xq_lo.ptr).ptr(s.xq_hi.ptr).ptr(s.xq_d.ptr).ptr(s.xq_sum.ptr).i(nff as i32),
+                Args::new()
+                    .ptr(s.gate.ptr)
+                    .ptr(s.up.ptr)
+                    .ptr(s.xq_lo.ptr)
+                    .ptr(s.xq_hi.ptr)
+                    .ptr(s.xq_d.ptr)
+                    .ptr(s.xq_sum.ptr)
+                    .i(nff as i32),
             );
             if let Some(w) = self.q4.get(&lc("ffn_down.weight")) {
                 q4dp(w, s.t_hid.ptr);
@@ -4195,33 +4394,119 @@ impl WeightAccel for RocmWeightAccel {
             } else {
                 panic!("g3n: ffn_down not Q4");
             }
-            rms(s.t_hid.ptr, ff(&lc("post_ffw_norm.weight")), s.afg.ptr, hidden, 1);
+            rms(
+                s.t_hid.ptr,
+                ff(&lc("post_ffw_norm.weight")),
+                s.afg.ptr,
+                hidden,
+                1,
+            );
             vadd(s.afg.ptr, s.attn_laurel.ptr, hidden);
 
             // AltUp correct → write into h directly
             modal(s.afg.ptr);
-            f32g(&lc("altup_correct_coef.weight"), s.modal.ptr, s.cc.ptr, 4, 4);
+            f32g(
+                &lc("altup_correct_coef.weight"),
+                s.modal.ptr,
+                s.cc.ptr,
+                4,
+                4,
+            );
             self.launch("g3n_addone", 1, 4, 0, Args::new().ptr(s.cc.ptr).i(4));
-            self.launch("g3n_correct", cells(4 * hidden), 256, 0, Args::new().ptr(s.pred.ptr).ptr(s.afg.ptr).ptr(s.cc.ptr).ptr(s.h.ptr).i(hidden as i32).i(0));
+            self.launch(
+                "g3n_correct",
+                cells(4 * hidden),
+                256,
+                0,
+                Args::new()
+                    .ptr(s.pred.ptr)
+                    .ptr(s.afg.ptr)
+                    .ptr(s.cc.ptr)
+                    .ptr(s.h.ptr)
+                    .i(hidden as i32)
+                    .i(0),
+            );
 
             // PLE first_prediction: fp = corrected[act]*correct_scale; g=gelu(inp_gate·fp)*inp_per_layer;
             // pn = rmsnorm(per_layer_proj·g); streams 1..3 += pn
-            self.launch("g3n_mul", cells(hidden), 256, 0, Args::new().ptr(hp(0)).ptr(ff(&lc("altup_correct_scale.weight"))).ptr(s.t_hid.ptr).i(hidden as i32));
-            f32g(&lc("per_layer_inp_gate.weight"), s.t_hid.ptr, s.g.ptr, hidden, ea);
+            self.launch(
+                "g3n_mul",
+                cells(hidden),
+                256,
+                0,
+                Args::new()
+                    .ptr(hp(0))
+                    .ptr(ff(&lc("altup_correct_scale.weight")))
+                    .ptr(s.t_hid.ptr)
+                    .i(hidden as i32),
+            );
+            f32g(
+                &lc("per_layer_inp_gate.weight"),
+                s.t_hid.ptr,
+                s.g.ptr,
+                hidden,
+                ea,
+            );
             let ipl = unsafe { (s.inp_per_layer.ptr as *mut f32).add(il * ea) as *mut c_void };
-            self.launch("g3n_gelumul", cells(ea), 256, 0, Args::new().ptr(s.g.ptr).ptr(ipl).ptr(s.g.ptr).i(ea as i32));
-            f32g(&lc("per_layer_proj.weight"), s.g.ptr, s.t_hid.ptr, ea, hidden);
-            rms(s.t_hid.ptr, ff(&lc("per_layer_post_norm.weight")), s.pn.ptr, hidden, 1);
-            self.launch("g3n_add_streams123", cells(3 * hidden), 256, 0, Args::new().ptr(s.h.ptr).ptr(s.pn.ptr).i(hidden as i32));
+            self.launch(
+                "g3n_gelumul",
+                cells(ea),
+                256,
+                0,
+                Args::new().ptr(s.g.ptr).ptr(ipl).ptr(s.g.ptr).i(ea as i32),
+            );
+            f32g(
+                &lc("per_layer_proj.weight"),
+                s.g.ptr,
+                s.t_hid.ptr,
+                ea,
+                hidden,
+            );
+            rms(
+                s.t_hid.ptr,
+                ff(&lc("per_layer_post_norm.weight")),
+                s.pn.ptr,
+                hidden,
+                1,
+            );
+            self.launch(
+                "g3n_add_streams123",
+                cells(3 * hidden),
+                256,
+                0,
+                Args::new().ptr(s.h.ptr).ptr(s.pn.ptr).i(hidden as i32),
+            );
         }
 
         // merge streams: merged = h[act] + Σ unembd_proj_i·h[i+1] (l2-matched); rmsnorm absorbs 1/4
-        self.launch("g3n_l2", 1, 256, 0, Args::new().ptr(hp(0)).ptr(s.tgt.ptr).i(hidden as i32));
+        self.launch(
+            "g3n_l2",
+            1,
+            256,
+            0,
+            Args::new().ptr(hp(0)).ptr(s.tgt.ptr).i(hidden as i32),
+        );
         self.gpu.zero(s.merged.ptr, hidden * 4).ok()?;
         vadd(s.merged.ptr, hp(0), hidden);
         for i in 0..3 {
-            f32g(&format!("altup_unembd_proj.{i}"), hp(i + 1), s.u.ptr, hidden, hidden);
-            self.launch("g3n_l2add", 1, 256, 0, Args::new().ptr(s.merged.ptr).ptr(s.u.ptr).ptr(s.tgt.ptr).i(hidden as i32));
+            f32g(
+                &format!("altup_unembd_proj.{i}"),
+                hp(i + 1),
+                s.u.ptr,
+                hidden,
+                hidden,
+            );
+            self.launch(
+                "g3n_l2add",
+                1,
+                256,
+                0,
+                Args::new()
+                    .ptr(s.merged.ptr)
+                    .ptr(s.u.ptr)
+                    .ptr(s.tgt.ptr)
+                    .i(hidden as i32),
+            );
         }
         // Final norm only. lm_head stays on the CPU: gemma3n's token_embd is Q4_K
         // (no GPU GEMV) and it's a one-shot 262k-vocab projection — the caller does
@@ -4328,6 +4613,400 @@ impl WeightAccel for RocmWeightAccel {
             self.npu_init();
         }
         true
+    }
+
+    fn configure_decode_qwen35(&mut self, cfg: Q35GpuConfig) -> bool {
+        let mk = |n: usize| self.gpu.alloc((n.max(1)) * 4).expect("q35 scratch");
+        let hd = cfg.head_dim;
+        let qg_dim = cfg.n_head * 2 * hd;
+        let q_dim = cfg.n_head * hd;
+        let kv_dim = cfg.n_head_kv * hd;
+        let (key_dim, value_dim, conv_dim) = (cfg.key_dim(), cfg.value_dim(), cfg.conv_dim());
+        let s_v = cfg.s_v;
+        let (mut k_cache, mut v_cache, mut ssm, mut conv) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for il in 0..cfg.n_layer {
+            if cfg.is_recr(il) {
+                k_cache.push(mk(1));
+                v_cache.push(mk(1));
+                ssm.push(mk(cfg.n_vh * s_v * s_v));
+                conv.push(mk(conv_dim * (cfg.dconv - 1)));
+            } else {
+                k_cache.push(mk(kv_dim * cfg.max_seq));
+                v_cache.push(mk(kv_dim * cfg.max_seq));
+                ssm.push(mk(1));
+                conv.push(mk(1));
+            }
+        }
+        self.q35 = Some(Q35State {
+            h: mk(cfg.hidden),
+            n: mk(cfg.hidden),
+            qg: mk(qg_dim),
+            q: mk(q_dim),
+            gate: mk(q_dim),
+            k: mk(kv_dim),
+            v: mk(kv_dim),
+            attn: mk(q_dim),
+            qkv: mk(conv_dim),
+            conv_out: mk(conv_dim),
+            z: mk(value_dim),
+            beta_raw: mk(cfg.n_vh),
+            alpha_raw: mk(cfg.n_vh),
+            qn: mk(key_dim),
+            kn: mk(key_dim),
+            decay: mk(cfg.n_vh),
+            beta: mk(cfg.n_vh),
+            core: mk(value_dim),
+            gated: mk(value_dim),
+            ffg: mk(cfg.dense_ff),
+            ffu: mk(cfg.dense_ff),
+            act: mk(cfg.dense_ff),
+            th: mk(cfg.hidden),
+            xn: mk(cfg.hidden),
+            logits: mk(cfg.vocab),
+            k_cache,
+            v_cache,
+            ssm,
+            conv,
+            cfg,
+        });
+        true
+    }
+
+    fn seed_qwen35_kv(&mut self, il: usize, k: &[f32], v: &[f32]) -> bool {
+        let Some(q) = self.q35.as_ref() else {
+            return false;
+        };
+        self.gpu.upload_at(&q.k_cache[il], 0, k).is_ok()
+            && self.gpu.upload_at(&q.v_cache[il], 0, v).is_ok()
+    }
+
+    fn seed_qwen35_state(&mut self, il: usize, ssm: &[f32], conv: &[f32]) -> bool {
+        let Some(q) = self.q35.as_ref() else {
+            return false;
+        };
+        // The device kernel stores S TRANSPOSED (st[vh*S² + i*s_v + j]) for coalesced
+        // access; the CPU prefill state is [vh*S² + j*s_v + i]. Transpose per v-head.
+        let (s_v, n_vh) = (q.cfg.s_v, q.cfg.n_vh);
+        let mut t = vec![0.0f32; ssm.len()];
+        for vh in 0..n_vh {
+            let base = vh * s_v * s_v;
+            for j in 0..s_v {
+                for i in 0..s_v {
+                    t[base + i * s_v + j] = ssm[base + j * s_v + i];
+                }
+            }
+        }
+        self.gpu.upload_at(&q.ssm[il], 0, &t).is_ok()
+            && self.gpu.upload_at(&q.conv[il], 0, conv).is_ok()
+    }
+
+    fn decode_step_qwen35(&mut self, h: &[f32], pos: usize) -> Option<Vec<f32>> {
+        let q = self.q35.as_ref()?;
+        let cfg = &q.cfg;
+        let (eps, hidden, hd) = (cfg.eps, cfg.hidden, cfg.head_dim);
+        let (key_dim, value_dim, conv_dim) = (cfg.key_dim(), cfg.value_dim(), cfg.conv_dim());
+        let (s_v, n_vh, n_kh) = (cfg.s_v, cfg.n_vh, cfg.n_kh);
+        let kv_dim = cfg.n_head_kv * hd;
+        let q_dim = cfg.n_head * hd;
+        let groups = cfg.n_head / cfg.n_head_kv;
+        let dn_scale = 1.0 / (s_v as f32).sqrt();
+        let attn_scale = 1.0 / (hd as f32).sqrt();
+        let ff = |n: &str| {
+            self.f32w
+                .get(n)
+                .unwrap_or_else(|| panic!("q35: missing f32 {n}"))
+                .ptr
+        };
+        // Resident no-sync GEMV by weight key (Q8_0 / Q6_K / Q4_0).
+        let gemv = |wkey: &str, x: *mut c_void, y: *mut c_void| {
+            if let Some(w) = self.q8.get(wkey) {
+                self.launch(
+                    "q8_0_gemv",
+                    w.out_dim as u32,
+                    32,
+                    0,
+                    Args::new()
+                        .ptr(w.scales.ptr)
+                        .ptr(w.quants.ptr)
+                        .ptr(x)
+                        .ptr(y)
+                        .i(w.in_dim as i32)
+                        .i(w.out_dim as i32),
+                );
+            } else if let Some(w) = self.q6.get(wkey) {
+                self.launch(
+                    "q6_gemv",
+                    w.out_dim.div_ceil(16) as u32,
+                    256,
+                    0,
+                    Args::new()
+                        .ptr(w.scales.ptr)
+                        .ptr(w.ql.ptr)
+                        .ptr(w.qh.ptr)
+                        .ptr(x)
+                        .ptr(y)
+                        .i(w.in_dim as i32)
+                        .i(w.out_dim as i32),
+                );
+            } else if let Some(w) = self.q4.get(wkey) {
+                self.launch(
+                    "q4_gemv",
+                    w.out_dim as u32,
+                    32,
+                    0,
+                    Args::new()
+                        .ptr(w.scales.ptr)
+                        .ptr(w.quants.ptr)
+                        .ptr(x)
+                        .ptr(y)
+                        .i(w.in_dim as i32)
+                        .i(w.out_dim as i32),
+                );
+            } else {
+                panic!("q35: missing resident weight {wkey}");
+            }
+        };
+        let rms = |x: *mut c_void, w: *mut c_void, y: *mut c_void| {
+            self.launch(
+                "rmsnorm",
+                1,
+                256,
+                0,
+                Args::new()
+                    .ptr(x)
+                    .ptr(w)
+                    .ptr(y)
+                    .i(hidden as i32)
+                    .i(1)
+                    .f(eps),
+            );
+        };
+        let addr = |buf: &Dbuf, off: usize| (buf.ptr as *mut f32).wrapping_add(off) as *mut c_void;
+
+        q.h.upload(h).ok()?;
+        for il in 0..cfg.n_layer {
+            let b = |s: &str| format!("blk.{il}.{s}");
+            rms(q.h.ptr, ff(&b("attn_norm.weight")), q.n.ptr);
+            if cfg.is_recr(il) {
+                gemv(&b("attn_qkv.weight"), q.n.ptr, q.qkv.ptr);
+                gemv(&b("attn_gate.weight"), q.n.ptr, q.z.ptr);
+                gemv(&b("ssm_beta.weight"), q.n.ptr, q.beta_raw.ptr);
+                gemv(&b("ssm_alpha.weight"), q.n.ptr, q.alpha_raw.ptr);
+                self.launch(
+                    "dn_conv1d",
+                    conv_dim.div_ceil(256) as u32,
+                    256,
+                    0,
+                    Args::new()
+                        .ptr(q.qkv.ptr)
+                        .ptr(ff(&b("ssm_conv1d.weight")))
+                        .ptr(q.conv[il].ptr)
+                        .ptr(q.conv_out.ptr)
+                        .i(conv_dim as i32)
+                        .i(cfg.dconv as i32),
+                );
+                self.launch(
+                    "dn_l2norm",
+                    (2 * n_kh) as u32,
+                    s_v as u32,
+                    0,
+                    Args::new()
+                        .ptr(q.conv_out.ptr)
+                        .ptr(addr(&q.conv_out, key_dim))
+                        .ptr(q.qn.ptr)
+                        .ptr(q.kn.ptr)
+                        .i(s_v as i32)
+                        .i(n_kh as i32)
+                        .f(eps),
+                );
+                self.launch(
+                    "dn_decaybeta",
+                    n_vh.div_ceil(64) as u32,
+                    64,
+                    0,
+                    Args::new()
+                        .ptr(q.alpha_raw.ptr)
+                        .ptr(q.beta_raw.ptr)
+                        .ptr(ff(&b("ssm_a")))
+                        .ptr(ff(&b("ssm_dt.bias")))
+                        .ptr(q.decay.ptr)
+                        .ptr(q.beta.ptr)
+                        .i(n_vh as i32),
+                );
+                self.launch(
+                    "deltanet_step",
+                    n_vh as u32,
+                    s_v as u32,
+                    (2 * s_v * 4) as u32,
+                    Args::new()
+                        .ptr(q.ssm[il].ptr)
+                        .ptr(q.qn.ptr)
+                        .ptr(q.kn.ptr)
+                        .ptr(addr(&q.conv_out, 2 * key_dim))
+                        .ptr(q.decay.ptr)
+                        .ptr(q.beta.ptr)
+                        .ptr(q.core.ptr)
+                        .i(s_v as i32)
+                        .i(n_kh as i32)
+                        .f(dn_scale),
+                );
+                self.launch(
+                    "dn_gatednorm",
+                    n_vh as u32,
+                    s_v as u32,
+                    0,
+                    Args::new()
+                        .ptr(q.core.ptr)
+                        .ptr(q.z.ptr)
+                        .ptr(ff(&b("ssm_norm.weight")))
+                        .ptr(q.gated.ptr)
+                        .i(s_v as i32)
+                        .f(eps),
+                );
+                gemv(&b("ssm_out.weight"), q.gated.ptr, q.th.ptr);
+            } else {
+                gemv(&b("attn_q.weight"), q.n.ptr, q.qg.ptr);
+                gemv(&b("attn_k.weight"), q.n.ptr, q.k.ptr);
+                gemv(&b("attn_v.weight"), q.n.ptr, q.v.ptr);
+                self.launch(
+                    "q35_head_rmsnorm",
+                    cfg.n_head as u32,
+                    hd as u32,
+                    0,
+                    Args::new()
+                        .ptr(q.qg.ptr)
+                        .ptr(ff(&b("attn_q_norm.weight")))
+                        .ptr(q.q.ptr)
+                        .i((2 * hd) as i32)
+                        .i(hd as i32)
+                        .f(eps),
+                );
+                self.launch(
+                    "q35_gate_extract",
+                    cfg.n_head as u32,
+                    hd as u32,
+                    0,
+                    Args::new().ptr(q.qg.ptr).ptr(q.gate.ptr).i(hd as i32),
+                );
+                self.launch(
+                    "q35_head_rmsnorm",
+                    cfg.n_head_kv as u32,
+                    hd as u32,
+                    0,
+                    Args::new()
+                        .ptr(q.k.ptr)
+                        .ptr(ff(&b("attn_k_norm.weight")))
+                        .ptr(q.k.ptr)
+                        .i(hd as i32)
+                        .i(hd as i32)
+                        .f(eps),
+                );
+                let (nr, theta) = (cfg.n_rot, cfg.rope_theta);
+                self.launch(
+                    "q35_rope_partial",
+                    (cfg.n_head * nr / 2).div_ceil(64) as u32,
+                    64,
+                    0,
+                    Args::new()
+                        .ptr(q.q.ptr)
+                        .i(hd as i32)
+                        .i(nr as i32)
+                        .i(cfg.n_head as i32)
+                        .i(pos as i32)
+                        .f(theta),
+                );
+                self.launch(
+                    "q35_rope_partial",
+                    (cfg.n_head_kv * nr / 2).div_ceil(64) as u32,
+                    64,
+                    0,
+                    Args::new()
+                        .ptr(q.k.ptr)
+                        .i(hd as i32)
+                        .i(nr as i32)
+                        .i(cfg.n_head_kv as i32)
+                        .i(pos as i32)
+                        .f(theta),
+                );
+                self.launch(
+                    "q35_kv_append",
+                    kv_dim.div_ceil(256) as u32,
+                    256,
+                    0,
+                    Args::new()
+                        .ptr(q.k.ptr)
+                        .ptr(q.v.ptr)
+                        .ptr(q.k_cache[il].ptr)
+                        .ptr(q.v_cache[il].ptr)
+                        .i(kv_dim as i32)
+                        .i(pos as i32),
+                );
+                self.launch(
+                    "sdpa",
+                    cfg.n_head as u32,
+                    256,
+                    0,
+                    Args::new()
+                        .ptr(q.q.ptr)
+                        .ptr(q.k_cache[il].ptr)
+                        .ptr(q.v_cache[il].ptr)
+                        .ptr(q.attn.ptr)
+                        .i(hd as i32)
+                        .i((pos + 1) as i32)
+                        .i(groups as i32)
+                        .i(cfg.n_head_kv as i32)
+                        .f(attn_scale)
+                        .i(0),
+                );
+                self.launch(
+                    "q35_out_gate",
+                    q_dim.div_ceil(256) as u32,
+                    256,
+                    0,
+                    Args::new().ptr(q.attn.ptr).ptr(q.gate.ptr).i(q_dim as i32),
+                );
+                gemv(&b("attn_output.weight"), q.attn.ptr, q.th.ptr);
+            }
+            self.launch(
+                "vec_add",
+                hidden.div_ceil(256) as u32,
+                256,
+                0,
+                Args::new().ptr(q.h.ptr).ptr(q.th.ptr).i(hidden as i32),
+            );
+            // dense SwiGLU FFN
+            rms(q.h.ptr, ff(&b("post_attention_norm.weight")), q.n.ptr);
+            gemv(&b("ffn_gate.weight"), q.n.ptr, q.ffg.ptr);
+            gemv(&b("ffn_up.weight"), q.n.ptr, q.ffu.ptr);
+            self.launch(
+                "q35_silu_mul",
+                cfg.dense_ff.div_ceil(256) as u32,
+                256,
+                0,
+                Args::new()
+                    .ptr(q.ffg.ptr)
+                    .ptr(q.ffu.ptr)
+                    .ptr(q.act.ptr)
+                    .i(cfg.dense_ff as i32),
+            );
+            gemv(&b("ffn_down.weight"), q.act.ptr, q.th.ptr);
+            self.launch(
+                "vec_add",
+                hidden.div_ceil(256) as u32,
+                256,
+                0,
+                Args::new().ptr(q.h.ptr).ptr(q.th.ptr).i(hidden as i32),
+            );
+        }
+        rms(q.h.ptr, ff("output_norm.weight"), q.xn.ptr);
+        gemv("token_embd.weight", q.xn.ptr, q.logits.ptr);
+        let _ = value_dim;
+        if prof_enabled() {
+            prof_dump("q35 decode");
+        }
+        self.gpu.sync().ok()?;
+        q.logits.download::<f32>(cfg.vocab).ok()
     }
 
     fn decode_step(&mut self, h: &[f32], pos: usize) -> Option<Vec<f32>> {
@@ -4697,7 +5376,10 @@ impl WeightAccel for RocmWeightAccel {
                     hidden.div_ceil(256) as u32,
                     256,
                     0,
-                    Args::new().ptr(s.h.ptr).ptr(s.t_hidden.ptr).i(hidden as i32),
+                    Args::new()
+                        .ptr(s.h.ptr)
+                        .ptr(s.t_hidden.ptr)
+                        .i(hidden as i32),
                 );
             }
             // ffn rmsnorm h->xn, then grid-parallel Q8 quantize (gate/up read xn)
@@ -4750,7 +5432,10 @@ impl WeightAccel for RocmWeightAccel {
                     hidden.div_ceil(256) as u32,
                     256,
                     0,
-                    Args::new().ptr(s.h.ptr).ptr(s.t_hidden.ptr).i(hidden as i32),
+                    Args::new()
+                        .ptr(s.h.ptr)
+                        .ptr(s.t_hidden.ptr)
+                        .i(hidden as i32),
                 );
             }
         }

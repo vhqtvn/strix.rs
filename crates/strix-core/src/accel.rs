@@ -68,6 +68,48 @@ pub struct GpuDecodeConfig {
     pub layers: Vec<GpuLayerCfg>,
 }
 
+/// Whole-model config for the `qwen35` (Qwen3.5) resident decode forward — a
+/// Gated-DeltaNet + full-attn hybrid with a dense SwiGLU FFN. Layers where
+/// `(il+1) % full_attn_interval != 0` are recurrent (DeltaNet); the rest full GQA.
+#[derive(Debug, Clone)]
+pub struct Q35GpuConfig {
+    pub n_layer: usize,
+    pub hidden: usize,
+    pub vocab: usize,
+    pub eps: f32,
+    pub full_attn_interval: usize,
+    // full-attn layers
+    pub n_head: usize,
+    pub n_head_kv: usize,
+    pub head_dim: usize,
+    pub n_rot: usize,
+    pub rope_theta: f32,
+    // DeltaNet (recurrent) layers
+    pub n_vh: usize,
+    pub n_kh: usize,
+    pub s_v: usize,
+    pub dconv: usize,
+    // dense FFN
+    pub dense_ff: usize,
+    pub max_seq: usize,
+}
+
+impl Q35GpuConfig {
+    /// True if layer `il` is a recurrent (DeltaNet) layer; false = full attn.
+    pub fn is_recr(&self, il: usize) -> bool {
+        self.full_attn_interval == 0 || (il + 1) % self.full_attn_interval != 0
+    }
+    pub fn key_dim(&self) -> usize {
+        self.n_kh * self.s_v
+    }
+    pub fn value_dim(&self) -> usize {
+        self.n_vh * self.s_v
+    }
+    pub fn conv_dim(&self) -> usize {
+        2 * self.key_dim() + self.value_dim()
+    }
+}
+
 /// Whole-model config for the gemma3n (MatFormer) on-device decode forward.
 /// gemma3n's forward is wholly different from the generic transformer
 /// `decode_step` (4 AltUp streams, Laurel, PLE, gaussian-topk sparsity), so it
@@ -393,6 +435,26 @@ pub trait WeightAccel: Send + Sync {
     /// on-device, no vocab-wide logits readback). `None` if unsupported — callers
     /// fall back to `decode_step` + CPU argmax. Same KV side effect as `decode_step`.
     fn decode_step_argmax(&mut self, _h: &[f32], _pos: usize) -> Option<u32> {
+        None
+    }
+
+    // ---- qwen35 (Qwen3.5) resident decode: DeltaNet + full-attn hybrid ----
+    /// Configure the resident `qwen35` decode (allocate scratch + per-layer KV /
+    /// SSM / conv state buffers). Weights + f32 norms must already be uploaded.
+    fn configure_decode_qwen35(&mut self, _cfg: Q35GpuConfig) -> bool {
+        false
+    }
+    /// Seed a full-attn layer's device KV cache (token-major `[tokens][n_kv*hd]`).
+    fn seed_qwen35_kv(&mut self, _il: usize, _k: &[f32], _v: &[f32]) -> bool {
+        false
+    }
+    /// Seed a DeltaNet layer's recurrent SSM state `[n_vh*s_v*s_v]` + conv state
+    /// `[conv_dim*(dconv-1)]` from the CPU/NPU prefill.
+    fn seed_qwen35_state(&mut self, _il: usize, _ssm: &[f32], _conv: &[f32]) -> bool {
+        false
+    }
+    /// Run one resident `qwen35` decode step (all kernels queued, 1 sync/token).
+    fn decode_step_qwen35(&mut self, _h: &[f32], _pos: usize) -> Option<Vec<f32>> {
         None
     }
 

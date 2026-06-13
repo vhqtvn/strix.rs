@@ -171,9 +171,10 @@ fn run_qwen35(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Res
     }
 
     let load_start = Instant::now();
+    let tag = gguf.architecture().unwrap_or("qwen35").to_string();
     let mut model = Qwen35Model::from_gguf(gguf).context("build qwen35 model")?;
     eprintln!(
-        "[qwen35moe] model built in {:.1}s, prompt = {} tokens",
+        "[{tag}] model built in {:.1}s, prompt = {} tokens",
         load_start.elapsed().as_secs_f64(),
         prompt_ids.len()
     );
@@ -190,13 +191,13 @@ fn run_qwen35(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Res
                 let t = Instant::now();
                 match model.attach_npu(npu) {
                     Ok(n) => eprintln!(
-                        "[qwen35moe] {n} dense projections staged on NPU ({:.1}s)",
+                        "[{tag}] {n} dense projections staged on NPU ({:.1}s)",
                         t.elapsed().as_secs_f64()
                     ),
-                    Err(e) => eprintln!("[qwen35moe] NPU staging failed: {e}"),
+                    Err(e) => eprintln!("[{tag}] NPU staging failed: {e}"),
                 }
             }
-            Err(e) => eprintln!("[qwen35moe] NPU open failed ({dir}): {e}"),
+            Err(e) => eprintln!("[{tag}] NPU open failed ({dir}): {e}"),
         }
     }
 
@@ -210,12 +211,21 @@ fn run_qwen35(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Res
                 let t = Instant::now();
                 let n = model.attach_accel(accel);
                 eprintln!(
-                    "[qwen35moe] {n} dense weights resident on {name} ({:.1}s upload)",
+                    "[{tag}] {n} dense weights resident on {name} ({:.1}s upload)",
                     t.elapsed().as_secs_f64()
                 );
+                // Dense qwen35 (Qwen3.5): opt into the resident on-device decode
+                // (DeltaNet+attn forward on the iGPU, 1 sync/token). No-op for the
+                // MoE arch. STRIX_Q35_RESIDENT=0 keeps the per-weight-gemv path.
+                if std::env::var("STRIX_Q35_RESIDENT").as_deref() != Ok("0") {
+                    let max_seq = prompt_ids.len() + max_tokens + 16;
+                    if model.enable_gpu_decode(max_seq) {
+                        eprintln!("[{tag}] resident on-device decode enabled (max_seq {max_seq})");
+                    }
+                }
             }
             None => eprintln!(
-                "[qwen35moe] --gpu: no Vulkan accel (rebuild --features vulkan; ROCm gemv is a no-op for MoE)"
+                "[{tag}] --gpu: no Vulkan accel (rebuild --features vulkan; ROCm gemv is a no-op for MoE)"
             ),
         }
     }
@@ -229,7 +239,7 @@ fn run_qwen35(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Res
     // Show the top-5 next-token logits for the prompt (sanity vs llama.cpp).
     let mut top: Vec<(usize, f32)> = logits.0.iter().cloned().enumerate().collect();
     top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    eprintln!("[qwen35moe] prompt next-token top5:");
+    eprintln!("[{tag}] prompt next-token top5:");
     for &(id, l) in top.iter().take(5) {
         eprintln!("    id={id:<8} logit={l:.4}");
     }
@@ -244,9 +254,9 @@ fn run_qwen35(gguf: GgufFile, prompt: &str, max_tokens: usize, gpu: bool) -> Res
     let decode_secs = decode_start.elapsed().as_secs_f64();
 
     let ids_str: Vec<String> = generated.iter().map(|t| t.to_string()).collect();
-    println!("[qwen35moe] generated token IDs: {}", ids_str.join(","));
+    println!("[{tag}] generated token IDs: {}", ids_str.join(","));
     eprintln!(
-        "[qwen35moe] prefill {:.1} tok/s ({} tok in {prefill_secs:.2}s) | decode {:.2} tok/s",
+        "[{tag}] prefill {:.1} tok/s ({} tok in {prefill_secs:.2}s) | decode {:.2} tok/s",
         prompt_ids.len() as f64 / prefill_secs,
         prompt_ids.len(),
         (max_tokens.saturating_sub(1)) as f64 / decode_secs.max(1e-9),
@@ -688,7 +698,9 @@ fn run_gguf(path: &Path, prompt: &str, max_tokens: usize, chat: bool, gpu: bool)
     // Qwen3.5/3.6-MoE (qwen35moe) bring-up — Phase 0: recognize + parse config +
     // validate tensors. Forward not yet implemented (hybrid Gated-DeltaNet/MoE,
     // see docs/qwen36-arch.md). Reports and exits rather than failing in GemmaModel.
-    if arch == "qwen35moe" {
+    // Qwen3.5/3.6 hybrid (Gated-DeltaNet + full attn): `qwen35moe` = MoE FFN,
+    // `qwen35` = dense FFN (e.g. Qwen3.5-4B). Same forward, different FFN block.
+    if arch == "qwen35moe" || arch == "qwen35" {
         return run_qwen35(gguf, prompt, max_tokens, gpu);
     }
     if arch == "mellum" {

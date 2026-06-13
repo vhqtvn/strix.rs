@@ -9,16 +9,22 @@
 
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
+use strix_core::accel::Q35GpuConfig;
 use strix_core::backend::Decoder;
 static PROF_GEMM: AtomicU64 = AtomicU64::new(0);
 static PROF_SCAN: AtomicU64 = AtomicU64::new(0);
 static PROF_SDPA: AtomicU64 = AtomicU64::new(0);
+// Decode-path breakdown (µs), gated by STRIX_DECODE_PROF. Printed every 8 tokens.
+static DPROF_MIX: AtomicU64 = AtomicU64::new(0);
+static DPROF_FFN: AtomicU64 = AtomicU64::new(0);
+static DPROF_HEAD: AtomicU64 = AtomicU64::new(0);
+static DPROF_N: AtomicU64 = AtomicU64::new(0);
 fn padd(c: &AtomicU64, t: std::time::Instant) {
     c.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 use strix_core::error::{Result, StrixError};
 use strix_core::sampler::Logits;
-use strix_models::ggml_quant::{dequantize_into, GgmlType};
+use strix_models::ggml_quant::{dequantize, dequantize_into, quantize_q4_0, GgmlType};
 use strix_models::gguf::GgufFile;
 
 fn mu32(g: &GgufFile, key: &str) -> Result<u32> {
@@ -47,11 +53,13 @@ pub struct Qwen35Cfg {
     pub n_rot: usize, // rope dimension_count (partial: < head_dim)
     pub rope_sections: [i64; 4],
     pub full_attn_interval: usize,
-    // MoE
+    // MoE (`qwen35moe`); all zero for the dense `qwen35` arch.
     pub n_expert: usize,
     pub n_expert_used: usize,
     pub expert_ff: usize,
     pub shared_ff: usize,
+    // Dense FFN size (`qwen35`); zero for the MoE arch.
+    pub dense_ff: usize,
     // SSM / Gated-DeltaNet (recurrent layers)
     pub ssm_d_conv: usize,
     pub ssm_d_inner: usize,
@@ -64,13 +72,16 @@ impl Qwen35Cfg {
     pub fn from_gguf(g: &GgufFile) -> Result<Qwen35Cfg> {
         let arch = g
             .architecture()
-            .ok_or_else(|| StrixError::invalid("qwen35: no general.architecture"))?;
-        if arch != "qwen35moe" {
+            .ok_or_else(|| StrixError::invalid("qwen35: no general.architecture"))?
+            .to_string();
+        // `qwen35` = dense, `qwen35moe` = MoE. Both are the same Qwen3.5/3.6-class
+        // hybrid (Gated-DeltaNet + full attn); they differ only in the FFN block.
+        if arch != "qwen35" && arch != "qwen35moe" {
             return Err(StrixError::unsupported(format!(
-                "qwen35: arch `{arch}` is not qwen35moe"
+                "qwen35: arch `{arch}` is not qwen35/qwen35moe"
             )));
         }
-        let k = |s: &str| format!("qwen35moe.{s}");
+        let k = |s: &str| format!("{arch}.{s}");
         // rope sections [11,11,10,0]
         let mut rope_sections = [0i64; 4];
         if let Some(arr) = g
@@ -103,10 +114,11 @@ impl Qwen35Cfg {
             n_rot: mu32_or(g, &k("rope.dimension_count"), 0) as usize,
             rope_sections,
             full_attn_interval: mu32_or(g, &k("full_attention_interval"), 4) as usize,
-            n_expert: mu32(g, &k("expert_count"))? as usize,
-            n_expert_used: mu32(g, &k("expert_used_count"))? as usize,
-            expert_ff: mu32(g, &k("expert_feed_forward_length"))? as usize,
+            n_expert: mu32_or(g, &k("expert_count"), 0) as usize,
+            n_expert_used: mu32_or(g, &k("expert_used_count"), 0) as usize,
+            expert_ff: mu32_or(g, &k("expert_feed_forward_length"), 0) as usize,
             shared_ff: mu32_or(g, &k("expert_shared_feed_forward_length"), 0) as usize,
+            dense_ff: mu32_or(g, &k("feed_forward_length"), 0) as usize,
             ssm_d_conv: mu32(g, &k("ssm.conv_kernel"))? as usize,
             ssm_d_inner: mu32(g, &k("ssm.inner_size"))? as usize,
             ssm_d_state: mu32(g, &k("ssm.state_size"))? as usize,
@@ -121,17 +133,31 @@ impl Qwen35Cfg {
         self.full_attn_interval == 0 || (il + 1) % self.full_attn_interval != 0
     }
 
+    /// True for the MoE arch (`qwen35moe`); false for the dense `qwen35`.
+    pub fn is_moe(&self) -> bool {
+        self.n_expert > 0
+    }
+
     pub fn report(&self) -> String {
         let n_attn = (0..self.n_layer).filter(|&l| !self.is_recr(l)).count();
+        let ffn = if self.is_moe() {
+            format!(
+                "MoE: {} experts top-{}, expert_ff={}, shared_ff={}",
+                self.n_expert, self.n_expert_used, self.expert_ff, self.shared_ff
+            )
+        } else {
+            format!("dense FFN: ff={}", self.dense_ff)
+        };
         format!(
-            "qwen35moe: {} layers ({} recurrent / {} full-attn), hidden={}, vocab={}, ctx={}\n  \
+            "{}: {} layers ({} recurrent / {} full-attn), hidden={}, vocab={}, ctx={}\n  \
              attn: head_dim={} n_head={} n_head_kv={} (GQA {}:1), QK-norm, IMRoPE n_rot={} sections={:?} freq_base={:.0}\n  \
-             MoE: {} experts top-{}, expert_ff={}, shared_ff={}\n  \
+             {}\n  \
              SSM(GatedDeltaNet): d_conv={} d_inner={} d_state={} v_heads(dt_rank)={} k_heads(n_group)={}, rms_eps={:.1e}",
+            if self.is_moe() { "qwen35moe" } else { "qwen35" },
             self.n_layer, self.n_layer - n_attn, n_attn, self.hidden, self.vocab, self.ctx_len,
             self.head_dim, self.n_head, self.n_head_kv, self.n_head / self.n_head_kv.max(1),
             self.n_rot, self.rope_sections, self.rope_freq_base,
-            self.n_expert, self.n_expert_used, self.expert_ff, self.shared_ff,
+            ffn,
             self.ssm_d_conv, self.ssm_d_inner, self.ssm_d_state, self.ssm_dt_rank, self.ssm_n_group, self.rms_eps,
         )
     }
@@ -196,24 +222,31 @@ pub fn p0_validate(g: &GgufFile) -> Result<(Qwen35Cfg, String)> {
             want(b("attn_k_norm.weight"), &[cfg.head_dim]);
             want(b("attn_output.weight"), &[attn_out_in, cfg.hidden]);
         }
-        // MoE (every layer)
-        want(b("ffn_gate_inp.weight"), &[cfg.hidden, cfg.n_expert]);
-        want(
-            b("ffn_gate_exps.weight"),
-            &[cfg.hidden, cfg.expert_ff, cfg.n_expert],
-        );
-        want(
-            b("ffn_up_exps.weight"),
-            &[cfg.hidden, cfg.expert_ff, cfg.n_expert],
-        );
-        want(
-            b("ffn_down_exps.weight"),
-            &[cfg.expert_ff, cfg.hidden, cfg.n_expert],
-        );
-        want(b("ffn_gate_inp_shexp.weight"), &[cfg.hidden]);
-        want(b("ffn_gate_shexp.weight"), &[cfg.hidden, cfg.shared_ff]);
-        want(b("ffn_up_shexp.weight"), &[cfg.hidden, cfg.shared_ff]);
-        want(b("ffn_down_shexp.weight"), &[cfg.shared_ff, cfg.hidden]);
+        if cfg.is_moe() {
+            // MoE FFN (every layer): routed experts + sigmoid-gated shared expert.
+            want(b("ffn_gate_inp.weight"), &[cfg.hidden, cfg.n_expert]);
+            want(
+                b("ffn_gate_exps.weight"),
+                &[cfg.hidden, cfg.expert_ff, cfg.n_expert],
+            );
+            want(
+                b("ffn_up_exps.weight"),
+                &[cfg.hidden, cfg.expert_ff, cfg.n_expert],
+            );
+            want(
+                b("ffn_down_exps.weight"),
+                &[cfg.expert_ff, cfg.hidden, cfg.n_expert],
+            );
+            want(b("ffn_gate_inp_shexp.weight"), &[cfg.hidden]);
+            want(b("ffn_gate_shexp.weight"), &[cfg.hidden, cfg.shared_ff]);
+            want(b("ffn_up_shexp.weight"), &[cfg.hidden, cfg.shared_ff]);
+            want(b("ffn_down_shexp.weight"), &[cfg.shared_ff, cfg.hidden]);
+        } else {
+            // Dense SwiGLU FFN (`qwen35`).
+            want(b("ffn_gate.weight"), &[cfg.hidden, cfg.dense_ff]);
+            want(b("ffn_up.weight"), &[cfg.hidden, cfg.dense_ff]);
+            want(b("ffn_down.weight"), &[cfg.dense_ff, cfg.hidden]);
+        }
     }
 
     let tied = !t.contains_key("output.weight");
@@ -396,6 +429,9 @@ pub struct Qwen35Model {
     // `None` (default / CPU build), every matmul takes the CPU path → behaviour is
     // byte-identical to the pure-CPU forward. See docs/ideas/moe-accel-plan.md (P1).
     accel: Option<Box<dyn strix_core::WeightAccel>>,
+    // Resident GPU decode active (qwen35 DeltaNet+attn forward runs on-device, 1
+    // sync/token). Set by `enable_gpu_decode`; prefill stays on CPU/NPU + seeds device state.
+    gpu_decode: bool,
     // Optional NPU offload of the dense projections during batched prefill
     // (the 256-expert MoE ~30GB int8 exceeds the BO pool → experts stay CPU).
     #[cfg(feature = "npu")]
@@ -433,6 +469,7 @@ impl Qwen35Model {
             gguf,
             pos: 0,
             accel: None,
+            gpu_decode: false,
             #[cfg(feature = "npu")]
             npu: None,
         })
@@ -480,6 +517,89 @@ impl Qwen35Model {
         }
         self.npu = Some(npu);
         Ok(n)
+    }
+
+    /// Dequantize the embedding row for `token` → `[hidden]` (CPU; the resident
+    /// GPU decode takes this as its per-token input `h`).
+    fn embed_row(&self, token: u32) -> Result<Vec<f32>> {
+        let hidden = self.cfg.hidden;
+        let emb = self.w("token_embd.weight")?;
+        let bpr = (hidden / emb.ty.block_elems()) * emb.ty.block_bytes();
+        let mut h = vec![0.0f32; hidden];
+        dequantize_into(
+            emb.ty,
+            &emb.bytes[token as usize * bpr..token as usize * bpr + bpr],
+            &mut h,
+        )?;
+        Ok(h)
+    }
+
+    /// Enable the resident on-device decode (DeltaNet+attn forward on the iGPU, 1
+    /// sync/token). Requires an attached accelerator with the Q8_0 weights resident.
+    /// Uploads the f32 norm / SSM-parameter weights, then configures the device
+    /// scratch + per-layer KV / SSM / conv state buffers (`max_seq` = prompt+gen).
+    /// Returns true if the backend accepted the config. Prefill still runs on
+    /// CPU/NPU and seeds the device state via `prefill`.
+    pub fn enable_gpu_decode(&mut self, max_seq: usize) -> bool {
+        // Resident path implements the dense `qwen35` FFN only (not the MoE arch).
+        if self.accel.is_none() || self.cfg.is_moe() {
+            return false;
+        }
+        let cfg = self.cfg.clone();
+        // Collect the f32 weights (dequantized) before borrowing the accel mutably.
+        let mut f32s: Vec<(String, Vec<f32>)> = Vec::new();
+        let mut take = |s: &Self, key: String, out: &mut Vec<(String, Vec<f32>)>| {
+            if let Ok(d) = s.vecw(&key) {
+                out.push((key, d));
+            }
+        };
+        for il in 0..cfg.n_layer {
+            let b = |s: &str| format!("blk.{il}.{s}");
+            take(self, b("attn_norm.weight"), &mut f32s);
+            take(self, b("post_attention_norm.weight"), &mut f32s);
+            if cfg.is_recr(il) {
+                take(self, b("ssm_conv1d.weight"), &mut f32s);
+                take(self, b("ssm_a"), &mut f32s);
+                take(self, b("ssm_dt.bias"), &mut f32s);
+                take(self, b("ssm_norm.weight"), &mut f32s);
+            } else {
+                take(self, b("attn_q_norm.weight"), &mut f32s);
+                take(self, b("attn_k_norm.weight"), &mut f32s);
+            }
+        }
+        take(self, "output_norm.weight".into(), &mut f32s);
+
+        let s_v = cfg.ssm_d_inner / cfg.ssm_dt_rank;
+        let n_rot = if cfg.n_rot > 0 {
+            cfg.n_rot
+        } else {
+            cfg.head_dim
+        };
+        let gcfg = Q35GpuConfig {
+            n_layer: cfg.n_layer,
+            hidden: cfg.hidden,
+            vocab: cfg.vocab,
+            eps: cfg.rms_eps,
+            full_attn_interval: cfg.full_attn_interval,
+            n_head: cfg.n_head,
+            n_head_kv: cfg.n_head_kv,
+            head_dim: cfg.head_dim,
+            n_rot,
+            rope_theta: cfg.rope_freq_base,
+            n_vh: cfg.ssm_dt_rank,
+            n_kh: cfg.ssm_n_group,
+            s_v,
+            dconv: cfg.ssm_d_conv,
+            dense_ff: cfg.dense_ff,
+            max_seq,
+        };
+        let accel = self.accel.as_mut().unwrap();
+        for (k, d) in &f32s {
+            accel.upload_f32(k, d);
+        }
+        let ok = accel.configure_decode_qwen35(gcfg);
+        self.gpu_decode = ok;
+        ok
     }
 
     /// iGPU dense GEMM for batched prefill (resident Q8 weight, chunks of 256).
@@ -574,21 +694,33 @@ impl Qwen35Model {
                     names.push(format!("blk.{il}.{t}.weight"));
                 }
             } else {
-                for t in ["attn_qkv", "attn_gate", "ssm_out"] {
+                for t in ["attn_qkv", "attn_gate", "ssm_out", "ssm_beta", "ssm_alpha"] {
                     names.push(format!("blk.{il}.{t}.weight"));
                 }
             }
-            for t in [
-                "ffn_gate_shexp",
-                "ffn_up_shexp",
-                "ffn_down_shexp",
-                "ffn_gate_inp_shexp",
-            ] {
-                names.push(format!("blk.{il}.{t}.weight"));
+            if self.cfg.is_moe() {
+                for t in [
+                    "ffn_gate_shexp",
+                    "ffn_up_shexp",
+                    "ffn_down_shexp",
+                    "ffn_gate_inp_shexp",
+                ] {
+                    names.push(format!("blk.{il}.{t}.weight"));
+                }
+            } else {
+                // Dense FFN (`qwen35`): the full FFN goes resident on the iGPU.
+                for t in ["ffn_gate", "ffn_up", "ffn_down"] {
+                    names.push(format!("blk.{il}.{t}.weight"));
+                }
             }
         }
         if self.gguf.tensors().contains_key("output.weight") {
             names.push("output.weight".to_string());
+        } else {
+            // Tied lm_head: upload the embedding matrix so the (large vocab×hidden)
+            // head GEMV runs on-device instead of CPU. The embedding *lookup* stays
+            // CPU (one row); this resident copy is used only by the head `mm`.
+            names.push("token_embd.weight".to_string());
         }
         let mut n = 0usize;
         // Returns true iff the weight was adopted by the accelerator.
@@ -606,6 +738,11 @@ impl Qwen35Model {
                 _ => false,
             }
         };
+        // STRIX_Q35_Q4: repack the resident matmul weights Q8_0 → Q4_0 on upload to
+        // HALVE the decode weight-bandwidth (~2× the bandwidth-bound resident decode),
+        // at a precision cost (lossy — greedy tokens may differ from the Q8 reference).
+        // Opt-in; only meaningful for the dense qwen35 resident path.
+        let q4_repack = std::env::var("STRIX_Q35_Q4").is_ok() && !self.cfg.is_moe();
         for name in &names {
             let Some(ti) = self.gguf.tensors().get(name) else {
                 continue;
@@ -613,7 +750,15 @@ impl Qwen35Model {
             let (ty, in_dim) = (ti.ggml_type, ti.dims[0] as usize);
             let out_dim: usize = ti.dims[1..].iter().map(|&d| d as usize).product();
             if let Ok(bytes) = self.gguf.tensor_bytes(name) {
-                if up(&mut accel, name, bytes, ty, in_dim, out_dim) {
+                let adopted = if q4_repack && ty == GgmlType::Q8_0 {
+                    match dequantize(ty, bytes, in_dim * out_dim) {
+                        Ok(f) => accel.upload_q4_0(name, &quantize_q4_0(&f), in_dim, out_dim),
+                        Err(_) => up(&mut accel, name, bytes, ty, in_dim, out_dim),
+                    }
+                } else {
+                    up(&mut accel, name, bytes, ty, in_dim, out_dim)
+                };
+                if adopted {
                     n += 1;
                 }
             }
@@ -773,7 +918,11 @@ impl Qwen35Model {
                 rmsnorm(ns, hs, &pn, eps);
             }
             let t1 = std::time::Instant::now();
-            self.moe_batch(&n, m, il, &mut h)?;
+            if cfg.is_moe() {
+                self.moe_batch(&n, m, il, &mut h)?;
+            } else {
+                self.dense_ffn_batch(&n, m, il, &mut h)?;
+            }
             t_moe += t1.elapsed().as_secs_f64();
         }
         if prof {
@@ -1295,6 +1444,7 @@ impl Qwen35Model {
             )?;
         }
 
+        let dprof = std::env::var("STRIX_DECODE_PROF").is_ok();
         for il in 0..cfg.n_layer {
             let b = |s: &str| format!("blk.{il}.{s}");
             // attn/token-mixer pre-norm
@@ -1302,11 +1452,15 @@ impl Qwen35Model {
             let mut n = vec![0.0f32; hidden];
             rmsnorm(&mut n, &h, &an, eps);
 
+            let tm = std::time::Instant::now();
             let mixed = if cfg.is_recr(il) {
                 self.deltanet(&n, il, &mut row)?
             } else {
                 self.attn(&n, il, pos, &mut row)?
             };
+            if dprof {
+                padd(&DPROF_MIX, tm);
+            }
             for i in 0..hidden {
                 h[i] += mixed[i];
             }
@@ -1316,9 +1470,17 @@ impl Qwen35Model {
             let pn = self.vecw(&b("post_attention_norm.weight"))?;
             let mut nn = vec![0.0f32; hidden];
             rmsnorm(&mut nn, &h, &pn, eps);
-            let moe = self.moe(&nn, il, &mut row)?;
+            let tf = std::time::Instant::now();
+            let ffn = if cfg.is_moe() {
+                self.moe(&nn, il, &mut row)?
+            } else {
+                self.dense_ffn(&nn, il, &mut row)?
+            };
+            if dprof {
+                padd(&DPROF_FFN, tf);
+            }
             for i in 0..hidden {
-                h[i] = ffn_res[i] + moe[i];
+                h[i] = ffn_res[i] + ffn[i];
             }
         }
         self.pos += 1;
@@ -1335,7 +1497,21 @@ impl Qwen35Model {
             ("token_embd.weight", self.w("token_embd.weight")?)
         };
         let mut logits = vec![0.0f32; cfg.vocab];
+        let th = std::time::Instant::now();
         self.mm(head_key, &mut logits, &nh, &head, &mut row);
+        if dprof {
+            padd(&DPROF_HEAD, th);
+            let n = DPROF_N.fetch_add(1, Ordering::Relaxed) + 1;
+            if n % 8 == 0 {
+                let us = |c: &AtomicU64| c.load(Ordering::Relaxed) as f64 / 1e3 / n as f64;
+                eprintln!(
+                    "[decode prof] {n} tok avg/tok: mixer {:.1}ms | ffn {:.1}ms | lm_head {:.1}ms",
+                    us(&DPROF_MIX),
+                    us(&DPROF_FFN),
+                    us(&DPROF_HEAD),
+                );
+            }
+        }
         Ok(Some(logits))
     }
 
@@ -1599,6 +1775,61 @@ impl Qwen35Model {
         Ok(o)
     }
 
+    /// Dense SwiGLU FFN (`qwen35`): `down( silu(gate(x)) * up(x) )`. Returns the FFN
+    /// output (caller adds the residual). GPU gemv per weight key if resident.
+    fn dense_ffn(&self, x: &[f32], il: usize, row: &mut [f32]) -> Result<Vec<f32>> {
+        let cfg = &self.cfg;
+        let hidden = cfg.hidden;
+        let ff = cfg.dense_ff;
+        let b = |s: &str| format!("blk.{il}.{s}");
+        let wg = self.w(&b("ffn_gate.weight"))?;
+        let wu = self.w(&b("ffn_up.weight"))?;
+        let wd = self.w(&b("ffn_down.weight"))?;
+        let mut g = vec![0.0f32; ff];
+        let mut u = vec![0.0f32; ff];
+        self.mm(&b("ffn_gate.weight"), &mut g, x, &wg, row);
+        self.mm(&b("ffn_up.weight"), &mut u, x, &wu, row);
+        let mut act = vec![0.0f32; ff];
+        for i in 0..ff {
+            act[i] = silu(g[i]) * u[i];
+        }
+        let mut out = vec![0.0f32; hidden];
+        self.mm(&b("ffn_down.weight"), &mut out, &act, &wd, row);
+        Ok(out)
+    }
+
+    /// Batched dense SwiGLU FFN for prefill (weight-read-once); adds the result into
+    /// `h` rows (residual), matching `moe_batch`/`moe_finish`'s convention.
+    fn dense_ffn_batch(&mut self, x: &[f32], m: usize, il: usize, h: &mut [f32]) -> Result<()> {
+        let cfg = self.cfg.clone();
+        let hidden = cfg.hidden;
+        let ff = cfg.dense_ff;
+        let b = |s: &str| format!("blk.{il}.{s}");
+        let mut g = vec![0.0f32; m * ff];
+        let mut u = vec![0.0f32; m * ff];
+        if !self.gpu_gemm(&b("ffn_gate.weight"), x, m, hidden, ff, &mut g) {
+            let wg = self.w(&b("ffn_gate.weight"))?;
+            qmatmul_batch(&mut g, x, m, wg.bytes, wg.ty, hidden, ff);
+        }
+        if !self.gpu_gemm(&b("ffn_up.weight"), x, m, hidden, ff, &mut u) {
+            let wu = self.w(&b("ffn_up.weight"))?;
+            qmatmul_batch(&mut u, x, m, wu.bytes, wu.ty, hidden, ff);
+        }
+        let mut act = vec![0.0f32; m * ff];
+        for i in 0..m * ff {
+            act[i] = silu(g[i]) * u[i];
+        }
+        let mut dy = vec![0.0f32; m * hidden];
+        if !self.gpu_gemm(&b("ffn_down.weight"), &act, m, ff, hidden, &mut dy) {
+            let wd = self.w(&b("ffn_down.weight"))?;
+            qmatmul_batch(&mut dy, &act, m, wd.bytes, wd.ty, ff, hidden);
+        }
+        for i in 0..m * hidden {
+            h[i] += dy[i];
+        }
+        Ok(())
+    }
+
     fn moe(&self, x: &[f32], il: usize, row: &mut [f32]) -> Result<Vec<f32>> {
         let cfg = &self.cfg;
         let hidden = cfg.hidden;
@@ -1764,10 +1995,38 @@ impl Decoder for Qwen35Model {
             }
             unreachable!()
         }
-        Ok(Logits::new(self.prefill_batch(tokens)?))
+        let logits = self.prefill_batch(tokens)?;
+        // Resident GPU decode: seed the device KV (full-attn layers) + SSM/conv
+        // recurrent state (DeltaNet layers) from the CPU prefill so decode runs
+        // wholly on-device. Prefill itself never touches the iGPU (crash-safe).
+        if self.gpu_decode {
+            let mut accel = self.accel.take();
+            if let Some(a) = accel.as_mut() {
+                for il in 0..self.cfg.n_layer {
+                    if self.cfg.is_recr(il) {
+                        a.seed_qwen35_state(il, &self.ssm[il], &self.conv[il]);
+                    } else {
+                        a.seed_qwen35_kv(il, &self.kc[il], &self.vc[il]);
+                    }
+                }
+            }
+            self.accel = accel;
+        }
+        Ok(Logits::new(logits))
     }
 
     fn decode_one(&mut self, token: u32) -> Result<Logits> {
+        if self.gpu_decode {
+            let emb = self.embed_row(token)?;
+            let pos = self.pos;
+            let mut accel = self.accel.take();
+            let out = accel.as_mut().and_then(|a| a.decode_step_qwen35(&emb, pos));
+            self.accel = accel;
+            self.pos += 1;
+            return out
+                .map(Logits::new)
+                .ok_or_else(|| StrixError::invalid("qwen35 resident GPU decode failed"));
+        }
         Ok(Logits::new(self.forward(token, true)?.unwrap()))
     }
 
