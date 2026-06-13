@@ -41,12 +41,15 @@ this box under sustained load).
     RoPE, V-norm, GeGLU, layer scale, logit softcap.
   - **Gemma-3n-E4B** (Q4_0) — MatFormer, with the GPU lm_head (Q4_K→Q8 repack) fix.
   - **Qwen3-4B-2507** (Q4_0, dense) and **SmolLM3-3B** (Q4_0, dense).
+  - **Qwen3.5-4B** (Q8_0, dense Gated-DeltaNet + full-attn hybrid) — full **resident
+    on-device decode** (DeltaNet recurrence, full attn, dense FFN all on the iGPU,
+    1 sync/token); ~26 tok/s decode (see below).
   - **Mellum2-12B-A2.5B** (Q8_0, MoE + hybrid sliding/full attn + YaRN).
   - **Qwen3.6-35B-A3B** (Q6_K, MoE + Gated-DeltaNet SSM + full-attn) — runs, but
     memory-bound (experts spill past the GTT/UMA budget).
   - Gemma-3 runs incidentally (shares the Gemma code path); Llama/Mistral
     (safetensors) remain the CPU correctness oracle.
-- ✅ **GGUF loading** + dequant (Q4_0/Q4_1/Q8_0/Q4_K/Q6_K) + embedded tokenizer.
+- ✅ **GGUF loading** + dequant (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q4_K/Q5_K/Q6_K) + embedded tokenizer.
   Quantized weights stay in the mmap and are dequantized per matmul — a 12B Q4_0
   model runs in ~7 GB instead of ~48 GB.
 - ✅ **Speculative decoding** — draft-free n-gram lookup (lossless; +27% on Mellum).
@@ -67,6 +70,7 @@ comparison, not peak; expect higher prefill on long warm prompts):
 | Gemma-3n-E4B | Q4_0 | NPU prefill + iGPU decode | 16.2 | 18.4 |
 | Gemma-4-12B-QAT | Q4_0 | iGPU (full forward) | 21.5 | 10.9 |
 | Qwen3.6-35B-A3B | Q6_K | NPU prefill + iGPU decode | 3.1 | 1.66 |
+| Qwen3.5-4B | Q8_0 | CPU prefill + resident iGPU decode (Q4) | 5.7 | **26.0** |
 
 Notes:
 - **NPU dense-projection prefill is the headline win** (~13× on Qwen3, ~4.7× on
@@ -83,6 +87,16 @@ at decode **parity** with `llama.cpp`'s ROCm build (11.4 tok/s) on the same mode
 The prefill GEMM (int8 WMMA, double-buffered, BM=128, split-K for ffn_down) already
 beats llama's pure-matmul `pp512` once SDPA is excluded; the remaining end-to-end gap
 is the scalar prefill attention. CPU oracle is ~0.8 tok/s.
+
+**Qwen3.5-4B resident decode (Gated-DeltaNet hybrid).** The whole per-token forward
+runs on the iGPU — the **Gated-DeltaNet recurrence** (a from-scratch GPU scan kernel:
+1 workgroup/v-head × 128 threads, validated bit-exact vs CPU), full GQA attention with
+output gating + partial RoPE, dense SwiGLU FFN, and the tied lm_head — with one sync per
+token. Prefill stays on CPU/NPU and seeds the device KV + SSM/conv state (the iGPU is
+never used for prefill). Decode arc: CPU **2.5** → per-weight GEMV **~6.6** → resident
+**~11.7** → +coalesced DeltaNet state **~14.5** → **+Q8→Q4 weight repack (`STRIX_Q35_Q4`)
+~26 tok/s** (~10×). The Q4 repack halves the (bandwidth-bound) weight reads; it's
+opt-in/lossy in principle but was token-identical to Q8 on the tested prompt.
 
 ## Build & run
 
@@ -108,6 +122,11 @@ STRIX_ROCM=1 ./target/release/strix generate \
 STRIX_ROCM=1 STRIX_QWEN_IDS="1,2,3,..." \
   ./target/release/strix generate --model models/mellum2-12b-a2.5b \
   --prompt x --raw --gpu --max-tokens 40
+
+# Qwen3.5-4B: resident on-device decode + Q8→Q4 weight repack (fastest decode).
+STRIX_ROCM=1 STRIX_Q35_Q4=1 STRIX_QWEN_IDS="1,2,3,..." \
+  ./target/release/strix generate --model models/qwen3.5-4b/Qwen3.5-4B-Q8_0.gguf \
+  --prompt x --raw --gpu --max-tokens 64
 ```
 
 Drop `--gpu` / `STRIX_ROCM` for the CPU oracle. `STRIX_BENCH=<reps>` gives a
@@ -120,7 +139,10 @@ clock ramps ~30 s, ±3–4 tok/s variance).
 - `STRIX_NPU=1` — enable NPU prefill offload (with `--features ryzen-ai`/`npu-cpu`).
   `STRIX_NPU_COLS=4|8`, `STRIX_NPU_MODE=speed|power`, `STRIX_NPU_DIR=<xclbin dir>`.
 - `STRIX_QWEN_IDS="…"` — raw token IDs for models with a gpt2-BPE vocab
-  (qwen3, smollm3, gemma3n, mellum, qwen35moe).
+  (qwen3, smollm3, gemma3n, mellum, qwen35/qwen35moe).
+- `STRIX_Q35_Q4=1` — repack Qwen3.5-4B's Q8_0 weights to Q4_0 for the resident decode
+  (~1.8× decode, half the weight bandwidth; lossy in principle). `STRIX_Q35_RESIDENT=0`
+  reverts to the per-weight-GEMV decode path.
 - `STRIX_F16_KV=1` — f16 KV cache (−7% prefill / +7% decode / 2× context; default f32).
 - `STRIX_BENCH=<reps>`, `STRIX_NOGRAPH=1` (disable hipGraph), `STRIX_PROF=1`.
 
