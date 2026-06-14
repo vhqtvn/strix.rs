@@ -98,6 +98,34 @@ never used for prefill). Decode arc: CPU **2.5** → per-weight GEMV **~6.6** �
 ~28 tok/s** (~11×). The Q4 repack halves the (bandwidth-bound) weight reads; it's
 opt-in/lossy in principle but was token-identical to Q8 on the tested prompt.
 
+### vs llama.cpp (decode, same box + same GGUFs)
+
+Head-to-head against the system `llama.cpp` (ROCm gfx1150, build 9616). **Decode** is the
+apples-to-apples comparison (both run it on the iGPU). Crucial methodology note: `llama-bench`'s
+default `pp` phase drives the GPU clock high and `tg` then rides it, whereas strix decode starts
+cold (its prefill is on CPU/NPU, leaving the iGPU idle) and decode is memory-bound so it never
+ramps the clock. So the fair comparison is llama **decode-only** (`-p 0 -n 128`, cold) vs strix
+decode:
+
+| Model | strix decode | llama.cpp decode (cold) | |
+|---|---:|---:|---|
+| Qwen3.5-4B (Q8→Q4) | **28.3** | 23.1 | ✅ strix |
+| SmolLM3-3B Q4_0 | **36.5** | 35.0 | ✅ strix |
+| Qwen3-4B Q4_0 | **27.4** | 26.2 | ✅ strix |
+| Gemma-4-12B Q4_0 | **10.1** | 9.55 | ✅ strix |
+| Mellum2-12B-A2.5B Q8_0 | 24.3 | 26.1 | llama +8% |
+| Gemma-3n-E4B Q4_0 | 16.8 | 19.6 | llama +17% |
+
+**strix.rs matches or beats llama.cpp on decode for 4 of 6 models.** The two gaps are kernel-efficiency
+on already-resident paths: Mellum's Q8 MoE GEMV (Q4 experts go incoherent — need Q4_K/QuaRot), and
+Gemma-3n's f32 AltUp/Laurel/PLE matmuls (quantizing them to Q8 would ~tie llama, at a precision risk).
+
+**Prefill**, by contrast, llama is 5–10× faster (pp256: SmolLM3 792, Qwen3 540, Gemma-4 204, Mellum
+345 t/s) — *by design*: llama prefills on the iGPU; strix keeps prefill on the NPU/CPU because sustained
+iGPU load triggers this box's SoC-reset fault and the NPU path is ~6–7× more energy-efficient. strix
+trades prefill throughput for hardware safety + power. (The 35B doesn't fit either engine: 27 GB vs
+~4 GB true VRAM + GTT.)
+
 ## Build & run
 
 ```bash
