@@ -58,6 +58,25 @@ impl ChatTemplate {
         ChatTemplate { src, bos, eos }
     }
 
+    /// Surgically repair known-broken embedded templates without re-authoring them.
+    ///
+    /// SmolLM3's GGUF ships the Unsloth-edited template, which only emits the
+    /// system turn's closing `<|im_end|>` *inside* the `if xml_tools/python_tools`
+    /// block — so a chat with no tools renders a system turn that is never closed
+    /// and bleeds straight into the user turn, producing garbage output. We move
+    /// that single `<|im_end|>` emission out of the tools `if` (still inside the
+    /// non-`/system_override` branch) so the system turn always closes.
+    pub fn repair_arch(arch: &str, src: String) -> String {
+        if arch == "smollm3" {
+            let broken = "    {{- \"\\n\\n\" -}}\n    {{- \"<|im_end|>\\n\" -}}\n  {%- endif -%}\n{%- endif -%}";
+            let fixed = "    {{- \"\\n\\n\" -}}\n  {%- endif -%}\n  {{- \"<|im_end|>\\n\" -}}\n{%- endif -%}";
+            if src.contains(broken) {
+                return src.replace(broken, fixed);
+            }
+        }
+        src
+    }
+
     /// Build directly from a template string (e.g. tokenizer_config.json fallback).
     pub fn from_str(
         src: impl Into<String>,

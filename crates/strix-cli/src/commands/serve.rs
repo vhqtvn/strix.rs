@@ -156,7 +156,12 @@ fn load_model(
             eprintln!("[serve] using chat-template override {}", p.display());
             Some(ChatTemplate::from_gguf_src(&gguf, src))
         }
-        None => ChatTemplate::from_gguf(&gguf),
+        None => ChatTemplate::from_gguf(&gguf).map(|t| {
+            // Surgically repair known-broken embedded templates (e.g. SmolLM3's
+            // unclosed system turn) rather than re-authoring them by hand.
+            let fixed = ChatTemplate::repair_arch(&arch, t.raw().to_string());
+            ChatTemplate::from_gguf_src(&gguf, fixed)
+        }),
     };
     // End-of-generation token ids (+ their string forms) from GGUF metadata.
     let mut eos = Vec::new();
