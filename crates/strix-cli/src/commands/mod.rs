@@ -5,4 +5,5 @@ pub mod bench_matmul;
 pub mod device_info;
 pub mod generate;
 pub mod inspect;
+pub mod serve;
 pub mod stubs;

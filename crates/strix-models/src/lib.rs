@@ -5,6 +5,7 @@
 //! and per-architecture forward passes land in later milestones; this crate
 //! currently provides config normalization and directory inspection.
 
+pub mod chat_template;
 pub mod ggml_quant;
 pub mod gguf;
 pub mod hf_config;
@@ -12,6 +13,7 @@ pub mod inspect;
 pub mod safetensors_loader;
 pub mod tokenizer;
 
+pub use chat_template::ChatTemplate;
 pub use ggml_quant::{dequantize, dequantize_into, quantize_q4_0, GgmlType};
 pub use hf_config::HfConfig;
 pub use inspect::{inspect_model, ModelInspection, WeightFormat};

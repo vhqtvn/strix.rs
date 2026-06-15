@@ -96,7 +96,7 @@ fn attach_gpu(model: &mut GemmaModel) {
 
 /// Locate a GGUF file: the path itself, or the first `*.gguf` in a directory
 /// (ignoring multimodal projector shards).
-fn find_gguf(model: &Path) -> Option<PathBuf> {
+pub(crate) fn find_gguf(model: &Path) -> Option<PathBuf> {
     if model.is_file() && model.extension().and_then(|e| e.to_str()) == Some("gguf") {
         return Some(model.to_path_buf());
     }
@@ -132,7 +132,7 @@ fn find_gguf(model: &Path) -> Option<PathBuf> {
 /// per-weight `gemv` for resident Q4_0/Q6_K weights. `None` if no GPU / not built with a
 /// GPU feature (the model then stays fully on CPU).
 #[allow(unused_mut, unused_assignments, clippy::let_and_return)]
-fn build_weight_accel() -> Option<Box<dyn strix_core::WeightAccel>> {
+pub(crate) fn build_weight_accel() -> Option<Box<dyn strix_core::WeightAccel>> {
     #[cfg(feature = "rocm")]
     if std::env::var("STRIX_ROCM").is_ok() {
         if let Some(a) = strix_backend_rocm::RocmWeightAccel::new() {

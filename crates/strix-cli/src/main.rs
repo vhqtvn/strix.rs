@@ -34,6 +34,14 @@ fn main() -> Result<()> {
             gpu,
         } => commands::generate::run(model, prompt, *max_tokens, !*raw, *gpu),
 
+        Command::Serve {
+            model,
+            host,
+            port,
+            gpu,
+            ctx,
+        } => commands::serve::run(model, host, *port, *gpu, *ctx),
+
         // Stubbed until later milestones.
         Command::Chat { model } => commands::stubs::chat(model),
         Command::Bench {

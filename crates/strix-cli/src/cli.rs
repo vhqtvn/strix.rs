@@ -57,6 +57,25 @@ pub enum Command {
         gpu: bool,
     },
 
+    /// Serve an OpenAI- and Anthropic-compatible HTTP API for a GGUF model.
+    Serve {
+        /// Path to the model directory or .gguf file.
+        #[arg(long)]
+        model: PathBuf,
+        /// Bind host.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Bind port.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Offload decode to the iGPU (requires `--features rocm`/`vulkan` + STRIX_ROCM=1).
+        #[arg(long)]
+        gpu: bool,
+        /// Max sequence length (KV cache / context budget).
+        #[arg(long, default_value_t = 4096)]
+        ctx: usize,
+    },
+
     /// Benchmark real inference (not implemented yet — Milestone 2+).
     Bench {
         /// Path to the model directory.
