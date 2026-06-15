@@ -1938,7 +1938,7 @@ extern "C" __global__ void qkv_post(const float* __restrict__ q, const float* __
                                     float* __restrict__ qout, float* __restrict__ kdst,
                                     float* __restrict__ vdst, int hd, int n_heads, int n_kv,
                                     int pos, float theta, float eps, int norm_v, int kvf16,
-                                    int qk_norm, int do_rope) {
+                                    int qk_norm, int do_rope, int rope_norm) {
     int b = blockIdx.x, t = threadIdx.x, half = hd / 2;
     __shared__ float red[256];
     if (b < n_heads) {
@@ -1954,11 +1954,13 @@ extern "C" __global__ void qkv_post(const float* __restrict__ q, const float* __
         for (int j = t; j < half; j += 256) {
             float sn = 0.f, cs = 1.f;
             if (do_rope) { float inv = __powf(theta, -2.f * j / hd) / ff[j]; float ang = pos * inv; sn = sinf(ang); cs = cosf(ang); }
-            float wj = qk_norm ? qw[j] : 1.f, wjh = qk_norm ? qw[j + half] : 1.f;
-            float x1 = q[base + j] * rs * wj;
-            float x2 = q[base + j + half] * rs * wjh;
-            qout[base + j] = x1 * cs - x2 * sn;
-            qout[base + j + half] = x2 * cs + x1 * sn;
+            // NEOX pairs (j, j+half); NORM (Llama permuted) pairs (2j, 2j+1).
+            int a = rope_norm ? (2 * j) : j, c = rope_norm ? (2 * j + 1) : (j + half);
+            float wj = qk_norm ? qw[a] : 1.f, wjh = qk_norm ? qw[c] : 1.f;
+            float x1 = q[base + a] * rs * wj;
+            float x2 = q[base + c] * rs * wjh;
+            qout[base + a] = x1 * cs - x2 * sn;
+            qout[base + c] = x2 * cs + x1 * sn;
         }
     } else {
         int h = b - n_heads, base = h * hd;
@@ -1974,12 +1976,13 @@ extern "C" __global__ void qkv_post(const float* __restrict__ q, const float* __
         for (int j = t; j < half; j += 256) {
             float sn = 0.f, cs = 1.f;
             if (do_rope) { float inv = __powf(theta, -2.f * j / hd) / ff[j]; float ang = pos * inv; sn = sinf(ang); cs = cosf(ang); }
-            float wj = qk_norm ? kw[j] : 1.f, wjh = qk_norm ? kw[j + half] : 1.f;
-            float x1 = k[base + j] * rs * wj;
-            float x2 = k[base + j + half] * rs * wjh;
+            int a = rope_norm ? (2 * j) : j, c = rope_norm ? (2 * j + 1) : (j + half);
+            float wj = qk_norm ? kw[a] : 1.f, wjh = qk_norm ? kw[c] : 1.f;
+            float x1 = k[base + a] * rs * wj;
+            float x2 = k[base + c] * rs * wjh;
             float ka = x1 * cs - x2 * sn, kb2 = x2 * cs + x1 * sn;
-            if (kvf16) { ((unsigned short*)kdst)[base + j] = f2h(ka); ((unsigned short*)kdst)[base + j + half] = f2h(kb2); }
-            else { kdst[base + j] = ka; kdst[base + j + half] = kb2; }
+            if (kvf16) { ((unsigned short*)kdst)[base + a] = f2h(ka); ((unsigned short*)kdst)[base + c] = f2h(kb2); }
+            else { kdst[base + a] = ka; kdst[base + c] = kb2; }
         }
         if (norm_v) {
             float ss = 0.f;
@@ -2004,7 +2007,8 @@ extern "C" __global__ void qkv_post_pos(const float* __restrict__ q, const float
                                         float* __restrict__ qout, float* __restrict__ kdst,
                                         float* __restrict__ vdst, int hd, int n_heads, int n_kv,
                                         const int* __restrict__ pos_buf, int kv_dim, float theta,
-                                        float eps, int norm_v, int kvf16, int qk_norm, int do_rope) {
+                                        float eps, int norm_v, int kvf16, int qk_norm, int do_rope,
+                                        int rope_norm) {
     int b = blockIdx.x, t = threadIdx.x, half = hd / 2;
     int pos = pos_buf[0];
     long koff = (long)pos * kv_dim; // element offset into the KV cache row
@@ -2022,11 +2026,12 @@ extern "C" __global__ void qkv_post_pos(const float* __restrict__ q, const float
         for (int j = t; j < half; j += 256) {
             float sn = 0.f, cs = 1.f;
             if (do_rope) { float inv = __powf(theta, -2.f * j / hd) / ff[j]; float ang = pos * inv; sn = sinf(ang); cs = cosf(ang); }
-            float wj = qk_norm ? qw[j] : 1.f, wjh = qk_norm ? qw[j + half] : 1.f;
-            float x1 = q[base + j] * rs * wj;
-            float x2 = q[base + j + half] * rs * wjh;
-            qout[base + j] = x1 * cs - x2 * sn;
-            qout[base + j + half] = x2 * cs + x1 * sn;
+            int a = rope_norm ? (2 * j) : j, c = rope_norm ? (2 * j + 1) : (j + half);
+            float wj = qk_norm ? qw[a] : 1.f, wjh = qk_norm ? qw[c] : 1.f;
+            float x1 = q[base + a] * rs * wj;
+            float x2 = q[base + c] * rs * wjh;
+            qout[base + a] = x1 * cs - x2 * sn;
+            qout[base + c] = x2 * cs + x1 * sn;
         }
     } else {
         int h = b - n_heads, base = h * hd;
@@ -2042,12 +2047,13 @@ extern "C" __global__ void qkv_post_pos(const float* __restrict__ q, const float
         for (int j = t; j < half; j += 256) {
             float sn = 0.f, cs = 1.f;
             if (do_rope) { float inv = __powf(theta, -2.f * j / hd) / ff[j]; float ang = pos * inv; sn = sinf(ang); cs = cosf(ang); }
-            float wj = qk_norm ? kw[j] : 1.f, wjh = qk_norm ? kw[j + half] : 1.f;
-            float x1 = k[base + j] * rs * wj;
-            float x2 = k[base + j + half] * rs * wjh;
+            int a = rope_norm ? (2 * j) : j, c = rope_norm ? (2 * j + 1) : (j + half);
+            float wj = qk_norm ? kw[a] : 1.f, wjh = qk_norm ? kw[c] : 1.f;
+            float x1 = k[base + a] * rs * wj;
+            float x2 = k[base + c] * rs * wjh;
             float ka = x1 * cs - x2 * sn, kb2 = x2 * cs + x1 * sn;
-            if (kvf16) { ((unsigned short*)kdst)[koff + base + j] = f2h(ka); ((unsigned short*)kdst)[koff + base + j + half] = f2h(kb2); }
-            else { kdst[koff + base + j] = ka; kdst[koff + base + j + half] = kb2; }
+            if (kvf16) { ((unsigned short*)kdst)[koff + base + a] = f2h(ka); ((unsigned short*)kdst)[koff + base + c] = f2h(kb2); }
+            else { kdst[koff + base + a] = ka; kdst[koff + base + c] = kb2; }
         }
         if (norm_v) {
             float ss = 0.f;

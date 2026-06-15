@@ -687,6 +687,7 @@ impl Qwen3Model {
                 is_local: false,
                 output_scale: 1.0,
                 no_rope: false,
+                rope_norm: false, // Qwen = NEOX rope
             })
             .collect();
         let gpu_cfg = GpuDecodeConfig {

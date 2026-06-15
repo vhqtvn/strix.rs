@@ -4307,7 +4307,8 @@ impl WeightAccel for RocmWeightAccel {
                     .i(1) // norm_v: V rms-normed (no weight)
                     .i(if self.kv_f16 { 1 } else { 0 })
                     .i(1) // qk_norm
-                    .i(1), // do_rope
+                    .i(1) // do_rope
+                    .i(0), // rope_norm: gemma = NEOX
             );
             // SDPA against the source layer's cache (own = self; shared = 18/19)
             let src = if own_kv {
@@ -5304,7 +5305,8 @@ impl WeightAccel for RocmWeightAccel {
                     .i(if cfg.norm_v { 1 } else { 0 })
                     .i(if self.kv_f16 { 1 } else { 0 })
                     .i(if cfg.qk_norm { 1 } else { 0 })
-                    .i(if lc.no_rope { 0 } else { 1 }),
+                    .i(if lc.no_rope { 0 } else { 1 })
+                    .i(if lc.rope_norm { 1 } else { 0 }),
             );
             // sdpa. Local (sliding-window) layers attend only the last `n_swa`
             // keys: offset the K/V base to the window start and shorten `len`

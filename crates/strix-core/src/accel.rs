@@ -31,6 +31,9 @@ pub struct GpuLayerCfg {
     pub output_scale: f32,
     /// False = skip RoPE entirely for this layer (smollm3 NoPE every 4th layer).
     pub no_rope: bool,
+    /// RoPE pairing: false = NEOX (split-half (k, k+half) — qwen/gemma), true =
+    /// NORM (adjacent pairs (2k, 2k+1) — Llama-arch with permuted q/k, e.g. smollm3).
+    pub rope_norm: bool,
 }
 
 /// Whole-model config for the on-device decode forward.

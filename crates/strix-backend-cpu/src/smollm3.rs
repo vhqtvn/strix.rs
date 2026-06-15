@@ -425,6 +425,7 @@ impl SmolLm3Model {
                 is_local: false,
                 output_scale: 1.0,
                 no_rope: (l + 1) % step == 0,
+                rope_norm: true, // Llama-arch permuted q/k → NORM pairing
             })
             .collect();
         let gpu_cfg = GpuDecodeConfig {
@@ -445,13 +446,16 @@ impl SmolLm3Model {
             max_seq: self.max_seq,
             layers,
         };
-        // Resident full-GPU decode would rope the new token on-device with the
-        // shared NEOX kernel, but our CPU prefill now ropes K with NORM (Llama
-        // permuted-weight convention) — mixing the two in one KV cache corrupts
-        // attention. Until the GPU rope kernel grows a NORM mode, keep smollm3 on
-        // the gemv-assisted CPU forward (matmuls still run on the iGPU; rope +
-        // attention stay CPU, all NORM and self-consistent). Opt back in for
-        // experiments via STRIX_SMOLLM3_GPU_DECODE once the kernel supports NORM.
+        // Resident full-GPU decode for smollm3 is kept OFF by default. The GPU rope
+        // kernel now supports NORM pairing (GpuLayerCfg.rope_norm, matches our CPU
+        // NORM rope), but with that fix the resident path STILL produces garbage —
+        // so a second inconsistency beyond rope lives in the resident decode (likely
+        // the seeded-prefill KV layout or the int8 activation path; it was masked
+        // before because CPU+GPU were uniformly NEOX-wrong, and the old GPU==CPU
+        // check used a repetition-robust prompt). Until that's bit-diffed against
+        // CPU, default to the gemv-assisted CPU forward (iGPU matmuls; rope +
+        // attention CPU, all NORM and correct). STRIX_SMOLLM3_GPU_DECODE=1 opts into
+        // the resident path for debugging.
         let allow_resident = std::env::var("STRIX_SMOLLM3_GPU_DECODE").is_ok();
         self.gpu_decode = allow_resident
             && std::env::var("STRIX_GPU_HYBRID").is_err()

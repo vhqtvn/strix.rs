@@ -491,6 +491,7 @@ impl GemmaModel {
                 is_local: lc.is_local,
                 output_scale: nrm.output_scale,
                 no_rope: false,
+                rope_norm: false, // Gemma = NEOX rope
             })
             .collect();
         let gpu_cfg = GpuDecodeConfig {
