@@ -272,7 +272,7 @@ fn sample_token(logits: &[f32], p: &GenParams, rng: &mut Rng) -> u32 {
 // always a valid JSON prefix (response_format json). Stateless full-reparse per check —
 // JSON outputs are short, so this is cheap.
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum JsonState {
     Invalid,
     Incomplete,
@@ -817,6 +817,10 @@ fn consume_cnum(
     max: Option<f64>,
     integer: bool,
 ) -> Option<bool> {
+    if integer {
+        return consume_cint(b, i, min, max);
+    }
+    // Float path: structural validation + coarse range check at completion.
     let start = *i;
     if b[*i] == b'-' {
         *i += 1;
@@ -826,14 +830,14 @@ fn consume_cnum(
         *i += 1;
     }
     let mut had_dot = false;
-    if !integer && *i < b.len() && b[*i] == b'.' {
+    if *i < b.len() && b[*i] == b'.' {
         had_dot = true;
         *i += 1;
         while *i < b.len() && b[*i].is_ascii_digit() {
             *i += 1;
         }
     }
-    if !integer && *i < b.len() && (b[*i] == b'e' || b[*i] == b'E') {
+    if *i < b.len() && (b[*i] == b'e' || b[*i] == b'E') {
         *i += 1;
         if *i < b.len() && (b[*i] == b'+' || b[*i] == b'-') {
             *i += 1;
@@ -847,22 +851,107 @@ fn consume_cnum(
     }
     let txt = std::str::from_utf8(&b[start..*i]).ok()?;
     let val: f64 = txt.parse().ok()?;
-    // Upper-bound prefix check for non-negative integers (digits only grow the value).
-    if integer && !txt.contains('-') {
-        if let Some(mx) = max {
-            if val > mx {
-                return None;
-            }
-        }
-    }
     if *i >= b.len() {
         return Some(false); // could still be extended
     }
-    // Completed (a delimiter follows): enforce full range.
     if min.is_some_and(|mn| val < mn) || max.is_some_and(|mx| val > mx) {
         return None;
     }
     Some(true)
+}
+
+/// Char-level digit-DP range constraint for JSON integers. Each digit is masked
+/// to only those that can still reach an integer in `[lo, hi]`, so the decode can
+/// never paint itself into an out-of-range corner (e.g. type "1" when the range is
+/// 50..99 — rejected immediately, not only at completion).
+fn consume_cint(b: &[u8], i: &mut usize, min: Option<f64>, max: Option<f64>) -> Option<bool> {
+    // Generous finite defaults so checked arithmetic below never overflows i128.
+    const HUGE: i128 = 1_000_000_000_000_000_000_000_000_000_000; // 1e30
+    let lo: i128 = min.map(|m| m.ceil() as i128).unwrap_or(-HUGE);
+    let hi: i128 = max.map(|m| m.floor() as i128).unwrap_or(HUGE);
+
+    let blen = b.len();
+    let mut j = *i;
+    let neg = j < blen && b[j] == b'-';
+    if neg {
+        j += 1;
+    }
+    // Sign reduces the problem to a non-negative *magnitude* range [mlo, mhi].
+    let (mlo, mhi) = if neg {
+        ((-hi).max(0), -lo)
+    } else {
+        (lo.max(0), hi)
+    };
+
+    let dstart = j;
+    while j < blen && b[j].is_ascii_digit() {
+        j += 1;
+    }
+    let d = std::str::from_utf8(&b[dstart..j]).ok()?;
+
+    if d.is_empty() {
+        // "-" with no digits yet: ok only if a negative value is still reachable.
+        if neg && j >= blen && mhi >= mlo {
+            *i = j;
+            return Some(false);
+        }
+        return None;
+    }
+    // JSON forbids leading zeros ("01"); bare "0" is allowed.
+    if d.len() > 1 && d.as_bytes()[0] == b'0' {
+        return None;
+    }
+    if !mag_prefix_feasible(d, mlo, mhi) {
+        return None;
+    }
+    *i = j;
+    if j >= blen {
+        return Some(false); // valid prefix; more digits may follow
+    }
+    // A delimiter follows — the integer is final, enforce exact membership.
+    let m: i128 = d.parse().ok()?;
+    if mlo <= m && m <= mhi {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Does some non-negative integer whose decimal magnitude *starts with* `d`
+/// (then 0+ further digits) land in `[mlo, mhi]`? `d` has no leading zero unless
+/// it is exactly "0". Iterates over the count of trailing digits `k`: the span of
+/// values with prefix `p` and `k` extra digits is `[p·10^k, p·10^k + 10^k − 1]`.
+fn mag_prefix_feasible(d: &str, mlo: i128, mhi: i128) -> bool {
+    if mhi < mlo || mhi < 0 {
+        return false;
+    }
+    let p: i128 = match d.parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    // "0" is a terminal representation — it can only ever be the number 0.
+    if d == "0" {
+        return mlo <= 0 && 0 <= mhi;
+    }
+    let mut k = 0u32;
+    loop {
+        let pow = match 10i128.checked_pow(k) {
+            Some(x) => x,
+            None => return false,
+        };
+        let lo_n = match p.checked_mul(pow) {
+            Some(x) => x,
+            None => return false,
+        };
+        if lo_n > mhi {
+            return false; // larger k only grows the lower edge
+        }
+        let hi_n = lo_n + (pow - 1);
+        if lo_n.max(mlo) <= hi_n.min(mhi) {
+            return true;
+        }
+        k += 1;
+    }
 }
 
 /// What the decode is constrained to.
@@ -1858,4 +1947,62 @@ fn stream_anthropic(
                 "usage": {"output_tokens": n_gen}}),
     );
     let _ = sse_event(tx, "message_stop", &json!({"type":"message_stop"}));
+}
+
+#[cfg(test)]
+mod cint_tests {
+    use super::*;
+
+    // Bare integer never "Completes" (more digits might follow); a trailing
+    // delimiter (here a space, which skip_ws consumes) marks the value final.
+    fn st(s: &str, min: Option<f64>, max: Option<f64>) -> JsonState {
+        cstate(s, &CSchema::Int { min, max })
+    }
+
+    #[test]
+    fn range_50_99() {
+        let (mn, mx) = (Some(50.0), Some(99.0));
+        assert_eq!(st("1", mn, mx), JsonState::Invalid);
+        assert_eq!(st("4", mn, mx), JsonState::Invalid);
+        assert_eq!(st("5", mn, mx), JsonState::Incomplete);
+        assert_eq!(st("9", mn, mx), JsonState::Incomplete);
+        assert_eq!(st("50 ", mn, mx), JsonState::Complete);
+        assert_eq!(st("99 ", mn, mx), JsonState::Complete);
+        assert_eq!(st("5 ", mn, mx), JsonState::Invalid); // 5 not in [50,99]
+        assert_eq!(st("100", mn, mx), JsonState::Invalid);
+        assert_eq!(st("0", mn, mx), JsonState::Invalid);
+    }
+
+    #[test]
+    fn range_0_120() {
+        let (mn, mx) = (Some(0.0), Some(120.0));
+        assert_eq!(st("0 ", mn, mx), JsonState::Complete);
+        assert_eq!(st("120 ", mn, mx), JsonState::Complete);
+        assert_eq!(st("12", mn, mx), JsonState::Incomplete);
+        assert_eq!(st("121", mn, mx), JsonState::Invalid);
+        assert_eq!(st("9 ", mn, mx), JsonState::Complete);
+        assert_eq!(st("13", mn, mx), JsonState::Incomplete); // 13 itself in range
+        assert_eq!(st("130", mn, mx), JsonState::Invalid);
+        assert_eq!(st("01", mn, mx), JsonState::Invalid); // leading zero
+    }
+
+    #[test]
+    fn negatives() {
+        let (mn, mx) = (Some(-50.0), Some(-10.0));
+        assert_eq!(st("-", mn, mx), JsonState::Incomplete);
+        assert_eq!(st("-1", mn, mx), JsonState::Incomplete);
+        assert_eq!(st("-10 ", mn, mx), JsonState::Complete);
+        assert_eq!(st("-50 ", mn, mx), JsonState::Complete);
+        assert_eq!(st("-9 ", mn, mx), JsonState::Invalid);
+        assert_eq!(st("-51", mn, mx), JsonState::Invalid);
+        assert_eq!(st("5", mn, mx), JsonState::Invalid); // positive not allowed
+    }
+
+    #[test]
+    fn unbounded() {
+        assert_eq!(st("7", None, None), JsonState::Incomplete);
+        assert_eq!(st("7 ", None, None), JsonState::Complete);
+        assert_eq!(st("-7 ", None, None), JsonState::Complete);
+        assert_eq!(st("007", None, None), JsonState::Invalid);
+    }
 }
