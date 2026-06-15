@@ -118,30 +118,35 @@ fn rmsnorm(out: &mut [f32], x: &[f32], w: &[f32], eps: f32) {
     }
 }
 
-/// NEOX RoPE on a head vector (plain: freq_scale=1, no yarn).
+/// NORM RoPE on a head vector (plain: freq_scale=1, no yarn). SmolLM3 is a
+/// Llama-arch model: its GGUF q/k weights are permuted at conversion so that
+/// llama.cpp's NORM rope (rotating *adjacent* dim pairs (2k, 2k+1)) reproduces
+/// HF's split-half rope. Applying NEOX (split-half) pairing here would be wrong —
+/// near-identity at low positions but diverging badly as positions grow.
 fn rope_neox(vec: &mut [f32], pos: usize, n_dims: usize, freq_base: f32) {
     let half = n_dims / 2;
     let theta_scale = freq_base.powf(-2.0 / n_dims as f32);
     let mut theta = pos as f32;
     for k in 0..half {
         let (s, c) = theta.sin_cos();
-        let x0 = vec[k];
-        let x1 = vec[k + half];
-        vec[k] = x0 * c - x1 * s;
-        vec[k + half] = x0 * s + x1 * c;
+        let x0 = vec[2 * k];
+        let x1 = vec[2 * k + 1];
+        vec[2 * k] = x0 * c - x1 * s;
+        vec[2 * k + 1] = x0 * s + x1 * c;
         theta *= theta_scale;
     }
 }
 
-/// NEOX RoPE from a precomputed per-position cos/sin table (no per-call transcendentals).
+/// NORM RoPE from a precomputed per-position cos/sin table (no per-call
+/// transcendentals). Pair index `k` rotates adjacent dims (2k, 2k+1).
 #[inline]
 fn rope_apply(vec: &mut [f32], cs: &[f32], sn: &[f32], half: usize) {
     for k in 0..half {
         let (c, s) = (cs[k], sn[k]);
-        let x0 = vec[k];
-        let x1 = vec[k + half];
-        vec[k] = x0 * c - x1 * s;
-        vec[k + half] = x0 * s + x1 * c;
+        let x0 = vec[2 * k];
+        let x1 = vec[2 * k + 1];
+        vec[2 * k] = x0 * c - x1 * s;
+        vec[2 * k + 1] = x0 * s + x1 * c;
     }
 }
 
@@ -244,10 +249,11 @@ impl SmolLm3Model {
         for li in 0..self.cfg.n_layers {
             let b = |s: &str| format!("blk.{li}.{s}");
             let l = li as u64;
-            let stage = |sh: &mut crate::mellum_npu::NpuShape, slot: u64, name: &str| -> Result<()> {
-                let (bytes, ty, _, _) = self.w(name)?;
-                sh.stage_q8(slot, bytes, ty)
-            };
+            let stage =
+                |sh: &mut crate::mellum_npu::NpuShape, slot: u64, name: &str| -> Result<()> {
+                    let (bytes, ty, _, _) = self.w(name)?;
+                    sh.stage_q8(slot, bytes, ty)
+                };
             stage(&mut npu.qo, 2 * l + 1, &b("attn_output.weight"))?;
             stage(&mut npu.down, l, &b("ffn_down.weight"))?;
             n += 2;
@@ -450,8 +456,12 @@ impl SmolLm3Model {
         let (eb, ety, ein, _) = self.w("token_embd.weight")?;
         let bpr = (ein / ety.block_elems()) * ety.block_bytes();
         let mut h = vec![0.0f32; self.cfg.hidden];
-        dequantize_into(ety, &eb[token as usize * bpr..token as usize * bpr + bpr], &mut h)
-            .map_err(|e| StrixError::invalid(format!("smollm3 embd: {e}")))?;
+        dequantize_into(
+            ety,
+            &eb[token as usize * bpr..token as usize * bpr + bpr],
+            &mut h,
+        )
+        .map_err(|e| StrixError::invalid(format!("smollm3 embd: {e}")))?;
         Ok(h)
     }
 
@@ -459,7 +469,9 @@ impl SmolLm3Model {
     /// accelerator (~1 submit). Appends to the device KV cache at `self.pos`.
     fn gpu_decode_step(&mut self, token: u32) -> Result<Vec<f32>> {
         if token as usize >= self.cfg.vocab {
-            return Err(StrixError::invalid("smollm3 gpu decode: token out of range"));
+            return Err(StrixError::invalid(
+                "smollm3 gpu decode: token out of range",
+            ));
         }
         let h = self.embed(token)?;
         let pos = self.pos;
@@ -747,9 +759,33 @@ impl SmolLm3Model {
                 }
             }
             if !qkv_done {
-                self.bmm(&bnm("attn_q.weight"), NpuW::Q, &nrm, m, hidden, q_dim, &mut q)?;
-                self.bmm(&bnm("attn_k.weight"), NpuW::K, &nrm, m, hidden, kv_dim, &mut k)?;
-                self.bmm(&bnm("attn_v.weight"), NpuW::V, &nrm, m, hidden, kv_dim, &mut v)?;
+                self.bmm(
+                    &bnm("attn_q.weight"),
+                    NpuW::Q,
+                    &nrm,
+                    m,
+                    hidden,
+                    q_dim,
+                    &mut q,
+                )?;
+                self.bmm(
+                    &bnm("attn_k.weight"),
+                    NpuW::K,
+                    &nrm,
+                    m,
+                    hidden,
+                    kv_dim,
+                    &mut k,
+                )?;
+                self.bmm(
+                    &bnm("attn_v.weight"),
+                    NpuW::V,
+                    &nrm,
+                    m,
+                    hidden,
+                    kv_dim,
+                    &mut v,
+                )?;
             }
             // NoPE: skip rope on every nope_step-th layer. Table-driven + parallel.
             if (il + 1) % cfg.nope_step != 0 {
@@ -791,41 +827,41 @@ impl SmolLm3Model {
                 }
             }
             if !npu_attn_done {
-            attn.par_chunks_mut(q_dim)
-                .enumerate()
-                .for_each(|(t, arow)| {
-                    let len = t + 1; // causal: token t attends keys 0..=t
-                    for hh in 0..nh {
-                        let kvh = hh / groups;
-                        let qh = &q[t * q_dim + hh * hd..t * q_dim + hh * hd + hd];
-                        let mut sc = vec![0.0f32; len];
-                        for j in 0..len {
-                            let kk = &kc[(j * nkv + kvh) * hd..(j * nkv + kvh) * hd + hd];
-                            sc[j] = dot_f32(qh, kk) * scale;
-                        }
-                        let mx = sc.iter().cloned().fold(f32::MIN, f32::max);
-                        let mut sum = 0.0f32;
-                        for s in sc.iter_mut() {
-                            *s = (*s - mx).exp();
-                            sum += *s;
-                        }
-                        let inv = 1.0 / sum;
-                        let oh = &mut arow[hh * hd..hh * hd + hd];
-                        for x in oh.iter_mut() {
-                            *x = 0.0;
-                        }
-                        for j in 0..len {
-                            let w = sc[j];
-                            let vrow = &vc[(j * nkv + kvh) * hd..(j * nkv + kvh) * hd + hd];
-                            for d in 0..hd {
-                                oh[d] += w * vrow[d];
+                attn.par_chunks_mut(q_dim)
+                    .enumerate()
+                    .for_each(|(t, arow)| {
+                        let len = t + 1; // causal: token t attends keys 0..=t
+                        for hh in 0..nh {
+                            let kvh = hh / groups;
+                            let qh = &q[t * q_dim + hh * hd..t * q_dim + hh * hd + hd];
+                            let mut sc = vec![0.0f32; len];
+                            for j in 0..len {
+                                let kk = &kc[(j * nkv + kvh) * hd..(j * nkv + kvh) * hd + hd];
+                                sc[j] = dot_f32(qh, kk) * scale;
+                            }
+                            let mx = sc.iter().cloned().fold(f32::MIN, f32::max);
+                            let mut sum = 0.0f32;
+                            for s in sc.iter_mut() {
+                                *s = (*s - mx).exp();
+                                sum += *s;
+                            }
+                            let inv = 1.0 / sum;
+                            let oh = &mut arow[hh * hd..hh * hd + hd];
+                            for x in oh.iter_mut() {
+                                *x = 0.0;
+                            }
+                            for j in 0..len {
+                                let w = sc[j];
+                                let vrow = &vc[(j * nkv + kvh) * hd..(j * nkv + kvh) * hd + hd];
+                                for d in 0..hd {
+                                    oh[d] += w * vrow[d];
+                                }
+                            }
+                            for x in oh.iter_mut() {
+                                *x *= inv;
                             }
                         }
-                        for x in oh.iter_mut() {
-                            *x *= inv;
-                        }
-                    }
-                });
+                    });
             } // end !npu_attn_done (CPU SDPA fallback)
             let mut o = vec![0.0f32; m * hidden];
             self.bmm(
@@ -837,7 +873,9 @@ impl SmolLm3Model {
                 hidden,
                 &mut o,
             )?;
-            h.par_iter_mut().zip(o.par_iter()).for_each(|(hh, oo)| *hh += *oo);
+            h.par_iter_mut()
+                .zip(o.par_iter())
+                .for_each(|(hh, oo)| *hh += *oo);
             nrm.par_chunks_mut(hidden)
                 .zip(h.par_chunks(hidden))
                 .for_each(|(nr, hr)| rmsnorm(nr, hr, &self.norms[il].ffn_norm, cfg.eps));
@@ -852,8 +890,24 @@ impl SmolLm3Model {
                 }
             }
             if !gu_done {
-                self.bmm(&bnm("ffn_gate.weight"), NpuW::Gate, &nrm, m, hidden, ffn, &mut gate)?;
-                self.bmm(&bnm("ffn_up.weight"), NpuW::Up, &nrm, m, hidden, ffn, &mut up)?;
+                self.bmm(
+                    &bnm("ffn_gate.weight"),
+                    NpuW::Gate,
+                    &nrm,
+                    m,
+                    hidden,
+                    ffn,
+                    &mut gate,
+                )?;
+                self.bmm(
+                    &bnm("ffn_up.weight"),
+                    NpuW::Up,
+                    &nrm,
+                    m,
+                    hidden,
+                    ffn,
+                    &mut up,
+                )?;
             }
             gate.par_iter_mut()
                 .zip(up.par_iter())
@@ -867,7 +921,9 @@ impl SmolLm3Model {
                 hidden,
                 &mut o,
             )?;
-            h.par_iter_mut().zip(o.par_iter()).for_each(|(hh, oo)| *hh += *oo);
+            h.par_iter_mut()
+                .zip(o.par_iter())
+                .for_each(|(hh, oo)| *hh += *oo);
         }
         self.pos = m;
         // last token → logits
