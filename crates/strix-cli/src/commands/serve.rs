@@ -459,6 +459,202 @@ fn parse_arr(b: &[u8], i: &mut usize) -> Option<bool> {
     }
 }
 
+// ===== schema-aware JSON constraint (response_format json_schema) =====
+// Same prefix-validator idea as json_state, but driven by a JSON Schema: enforces
+// object keys (declaration order), value types, enums, arrays(items). Over-constrains
+// objects to emit ALL `properties` in order (good for structured extraction); ranges /
+// patterns / optional-key branching are not enforced (MVP).
+
+fn schema_prefix(s: &str, schema: &Value) -> JsonState {
+    let b = s.as_bytes();
+    let mut i = 0;
+    skip_ws(b, &mut i);
+    if i >= b.len() {
+        return JsonState::Incomplete;
+    }
+    match consume_schema(b, &mut i, schema) {
+        None => JsonState::Invalid,
+        Some(false) => JsonState::Incomplete,
+        Some(true) => {
+            skip_ws(b, &mut i);
+            if i >= b.len() {
+                JsonState::Complete
+            } else {
+                JsonState::Invalid
+            }
+        }
+    }
+}
+
+fn consume_schema(b: &[u8], i: &mut usize, schema: &Value) -> Option<bool> {
+    skip_ws(b, i);
+    if *i >= b.len() {
+        return Some(false);
+    }
+    if let Some(en) = schema.get("enum").and_then(|e| e.as_array()) {
+        return consume_enum(b, i, en);
+    }
+    match schema.get("type").and_then(|t| t.as_str()) {
+        Some("object") => consume_obj_schema(b, i, schema),
+        Some("array") => consume_arr_schema(b, i, schema),
+        Some("string") => parse_str(b, i),
+        Some("integer") => parse_int(b, i),
+        Some("number") => parse_num(b, i),
+        Some("boolean") => match b[*i] {
+            b't' => parse_lit(b, i, b"true"),
+            b'f' => parse_lit(b, i, b"false"),
+            _ => None,
+        },
+        Some("null") => parse_lit(b, i, b"null"),
+        _ => parse_value(b, i), // unknown/missing type → any JSON
+    }
+}
+
+fn parse_int(b: &[u8], i: &mut usize) -> Option<bool> {
+    if *i < b.len() && b[*i] == b'-' {
+        *i += 1;
+    }
+    let ds = *i;
+    while *i < b.len() && b[*i].is_ascii_digit() {
+        *i += 1;
+    }
+    if *i == ds {
+        return if *i >= b.len() { Some(false) } else { None }; // "-"@end ok, "-x" invalid
+    }
+    Some(*i < b.len())
+}
+
+fn consume_enum(b: &[u8], i: &mut usize, vals: &[Value]) -> Option<bool> {
+    let rem = &b[*i..];
+    let mut any_prefix = false;
+    for v in vals {
+        let s = v.to_string();
+        let sb = s.as_bytes();
+        if rem.len() >= sb.len() {
+            if &rem[..sb.len()] == sb {
+                *i += sb.len();
+                return Some(true);
+            }
+        } else if sb.starts_with(rem) {
+            any_prefix = true;
+        }
+    }
+    if any_prefix {
+        *i = b.len();
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn consume_obj_schema(b: &[u8], i: &mut usize, schema: &Value) -> Option<bool> {
+    if b[*i] != b'{' {
+        return None;
+    }
+    *i += 1;
+    let props: Vec<(&String, &Value)> = schema
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .map(|o| o.iter().collect())
+        .unwrap_or_default();
+    for (idx, (name, sub)) in props.iter().enumerate() {
+        skip_ws(b, i);
+        if *i >= b.len() {
+            return Some(false);
+        }
+        if idx > 0 {
+            if b[*i] != b',' {
+                return None;
+            }
+            *i += 1;
+            skip_ws(b, i);
+            if *i >= b.len() {
+                return Some(false);
+            }
+        }
+        let key = format!("\"{name}\"");
+        match parse_lit(b, i, key.as_bytes())? {
+            false => return Some(false),
+            true => {}
+        }
+        skip_ws(b, i);
+        if *i >= b.len() {
+            return Some(false);
+        }
+        if b[*i] != b':' {
+            return None;
+        }
+        *i += 1;
+        match consume_schema(b, i, sub)? {
+            false => return Some(false),
+            true => {}
+        }
+    }
+    skip_ws(b, i);
+    if *i >= b.len() {
+        return Some(false);
+    }
+    if b[*i] != b'}' {
+        return None;
+    }
+    *i += 1;
+    Some(true)
+}
+
+fn consume_arr_schema(b: &[u8], i: &mut usize, schema: &Value) -> Option<bool> {
+    if b[*i] != b'[' {
+        return None;
+    }
+    *i += 1;
+    let items = schema.get("items");
+    loop {
+        skip_ws(b, i);
+        if *i >= b.len() {
+            return Some(false);
+        }
+        if b[*i] == b']' {
+            *i += 1;
+            return Some(true);
+        }
+        let r = match items {
+            Some(it) => consume_schema(b, i, it)?,
+            None => parse_value(b, i)?,
+        };
+        if !r {
+            return Some(false);
+        }
+        skip_ws(b, i);
+        if *i >= b.len() {
+            return Some(false);
+        }
+        match b[*i] {
+            b',' => *i += 1,
+            b']' => {
+                *i += 1;
+                return Some(true);
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// What the decode is constrained to.
+enum Constrain<'a> {
+    None,
+    Json,
+    Schema(&'a Value),
+}
+
+impl Constrain<'_> {
+    fn state(&self, s: &str) -> JsonState {
+        match self {
+            Constrain::Json => json_state(s),
+            Constrain::Schema(sc) => schema_prefix(s, sc),
+            Constrain::None => JsonState::Incomplete,
+        }
+    }
+}
+
 /// Top-`k` token ids by logit, descending.
 fn top_k_desc(logits: &[f32], k: usize) -> Vec<u32> {
     let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
@@ -471,8 +667,9 @@ fn top_k_desc(logits: &[f32], k: usize) -> Vec<u32> {
     idx
 }
 
-/// Pick the highest-logit token that keeps the decoded output a valid JSON prefix.
-fn pick_json_token(tok: &StrixTokenizer, logits: &[f32], out_ids: &[u32]) -> u32 {
+/// Pick the highest-logit token that keeps the decoded output a valid (JSON / schema)
+/// prefix per `con`.
+fn pick_constrained(tok: &StrixTokenizer, logits: &[f32], out_ids: &[u32], con: &Constrain) -> u32 {
     let committed = tok.decode(out_ids, true).unwrap_or_default();
     let cands = top_k_desc(logits, 48);
     for &c in &cands {
@@ -485,7 +682,7 @@ fn pick_json_token(tok: &StrixTokenizer, logits: &[f32], out_ids: &[u32]) -> u32
         if full.len() < committed.len() {
             continue;
         }
-        if json_state(&full) != JsonState::Invalid {
+        if con.state(&full) != JsonState::Invalid {
             return c;
         }
     }
@@ -499,19 +696,20 @@ fn generate(
     m: &mut Model,
     prompt_ids: &[u32],
     p: &GenParams,
-    json: bool,
+    con: &Constrain,
     mut on_token: impl FnMut(&str),
 ) -> Result<(String, &'static str, usize)> {
     m.decoder.reset();
     let mut rng = Rng::new();
     let mut logits = m.decoder.prefill(prompt_ids).context("prefill")?;
 
+    let constrained = !matches!(con, Constrain::None);
     let mut out_ids: Vec<u32> = Vec::new();
     let mut emitted = String::new(); // text already sent to on_token
     let mut finish = "length";
     for step in 0..p.max_tokens {
-        let next = if json {
-            pick_json_token(&m.tok, &logits.0, &out_ids)
+        let next = if constrained {
+            pick_constrained(&m.tok, &logits.0, &out_ids, con)
         } else {
             sample_token(&logits.0, p, &mut rng)
         };
@@ -533,7 +731,7 @@ fn generate(
             finish = "stop";
             break;
         }
-        if json && json_state(&full) == JsonState::Complete {
+        if constrained && con.state(&full) == JsonState::Complete {
             finish = "stop";
             break;
         }
@@ -685,6 +883,13 @@ fn handle(mut req: tiny_http::Request, route: Route, shared: &Arc<Mutex<Model>>,
         .and_then(|r| r.get("type"))
         .and_then(|t| t.as_str())
         .is_some_and(|t| t == "json_object" || t == "json_schema");
+    // json_schema → the schema to constrain to (None for plain json_object).
+    let schema = v
+        .get("response_format")
+        .filter(|r| r.get("type").and_then(|t| t.as_str()) == Some("json_schema"))
+        .and_then(|r| r.get("json_schema"))
+        .and_then(|j| j.get("schema"))
+        .cloned();
     if stream {
         stream_response(
             req,
@@ -695,11 +900,26 @@ fn handle(mut req: tiny_http::Request, route: Route, shared: &Arc<Mutex<Model>>,
             model_id.to_string(),
             want_tools,
             want_json,
+            schema,
         );
     } else {
         blocking_response(
-            req, route, shared, prompt_ids, params, model_id, want_tools, want_json,
+            req, route, shared, prompt_ids, params, model_id, want_tools, want_json, schema,
         );
+    }
+}
+
+/// Build the decode constraint: tools disable it; else schema → schema-constrained;
+/// else json → valid-JSON-constrained; else unconstrained sampling.
+fn constrain_of<'a>(want_json: bool, want_tools: bool, schema: &'a Option<Value>) -> Constrain<'a> {
+    if want_tools {
+        Constrain::None
+    } else if let Some(s) = schema {
+        Constrain::Schema(s)
+    } else if want_json {
+        Constrain::Json
+    } else {
+        Constrain::None
     }
 }
 
@@ -712,16 +932,12 @@ fn blocking_response(
     model_id: &str,
     want_tools: bool,
     want_json: bool,
+    schema: Option<Value>,
 ) {
     let mut m = shared.lock().unwrap();
     let n_prompt = prompt_ids.len();
-    let res = generate(
-        &mut m,
-        &prompt_ids,
-        &params,
-        want_json && !want_tools,
-        |_| {},
-    );
+    let con = constrain_of(want_json, want_tools, &schema);
+    let res = generate(&mut m, &prompt_ids, &params, &con, |_| {});
     drop(m);
     match res {
         Ok((raw, finish, n_gen)) => {
@@ -1159,6 +1375,7 @@ fn stream_response(
     model_id: String,
     want_tools: bool,
     want_json: bool,
+    schema: Option<Value>,
 ) {
     let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
     // Generation runs in a worker thread that pushes SSE chunks; this thread
@@ -1176,6 +1393,7 @@ fn stream_response(
                 n_prompt,
                 want_tools,
                 want_json,
+                &schema,
             ),
             _ => stream_openai(
                 &mut m,
@@ -1186,6 +1404,7 @@ fn stream_response(
                 route,
                 want_tools,
                 want_json,
+                &schema,
             ),
         }
     });
@@ -1217,6 +1436,7 @@ fn stream_openai(
     route: Route,
     want_tools: bool,
     want_json: bool,
+    schema: &Option<Value>,
 ) {
     let id = format!("chatcmpl-{}", now_secs());
     let obj = match route {
@@ -1235,8 +1455,11 @@ fn stream_openai(
     // Tool calling: buffer, then emit the parsed tool calls as delta.tool_calls
     // (incremental token-level tool parsing is overkill; one delta is spec-valid).
     if want_tools && matches!(route, Route::OpenAiChat) {
-        let (raw, _f, _) =
-            generate(m, prompt_ids, params, false, |_| {}).unwrap_or((String::new(), "stop", 0));
+        let (raw, _f, _) = generate(m, prompt_ids, params, &Constrain::None, |_| {}).unwrap_or((
+            String::new(),
+            "stop",
+            0,
+        ));
         let (text, calls) = parse_tool_calls(&raw, true);
         if calls.is_empty() {
             if !text.is_empty() {
@@ -1271,7 +1494,8 @@ fn stream_openai(
         return;
     }
     let is_text = matches!(route, Route::OpenAiText);
-    let res = generate(m, prompt_ids, params, want_json, |piece| {
+    let con = constrain_of(want_json, want_tools, schema);
+    let res = generate(m, prompt_ids, params, &con, |piece| {
         let chunk = if is_text {
             json!({"id": id, "object": obj, "created": now_secs(), "model": model_id,
                    "choices": [{"index":0, "text": piece, "finish_reason": null}]})
@@ -1302,6 +1526,7 @@ fn stream_anthropic(
     n_prompt: usize,
     want_tools: bool,
     want_json: bool,
+    schema: &Option<Value>,
 ) {
     let id = format!("msg_{}", now_secs());
     let _ = sse_event(
@@ -1314,8 +1539,8 @@ fn stream_anthropic(
     );
     // Tool calling: buffer, then emit text + tool_use blocks.
     if want_tools {
-        let (raw, _f, n_gen) =
-            generate(m, prompt_ids, params, false, |_| {}).unwrap_or((String::new(), "stop", 0));
+        let (raw, _f, n_gen) = generate(m, prompt_ids, params, &Constrain::None, |_| {})
+            .unwrap_or((String::new(), "stop", 0));
         let (text, calls) = parse_tool_calls(&raw, true);
         let mut idx = 0;
         if !text.is_empty() {
@@ -1375,7 +1600,8 @@ fn stream_anthropic(
         "content_block_start",
         &json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
     );
-    let res = generate(m, prompt_ids, params, want_json, |piece| {
+    let con = constrain_of(want_json, want_tools, schema);
+    let res = generate(m, prompt_ids, params, &con, |piece| {
         let _ = sse_event(
             tx,
             "content_block_delta",
