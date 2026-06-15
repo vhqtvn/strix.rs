@@ -445,8 +445,17 @@ impl SmolLm3Model {
             max_seq: self.max_seq,
             layers,
         };
-        self.gpu_decode =
-            std::env::var("STRIX_GPU_HYBRID").is_err() && accel.configure_decode(gpu_cfg);
+        // Resident full-GPU decode would rope the new token on-device with the
+        // shared NEOX kernel, but our CPU prefill now ropes K with NORM (Llama
+        // permuted-weight convention) — mixing the two in one KV cache corrupts
+        // attention. Until the GPU rope kernel grows a NORM mode, keep smollm3 on
+        // the gemv-assisted CPU forward (matmuls still run on the iGPU; rope +
+        // attention stay CPU, all NORM and self-consistent). Opt back in for
+        // experiments via STRIX_SMOLLM3_GPU_DECODE once the kernel supports NORM.
+        let allow_resident = std::env::var("STRIX_SMOLLM3_GPU_DECODE").is_ok();
+        self.gpu_decode = allow_resident
+            && std::env::var("STRIX_GPU_HYBRID").is_err()
+            && accel.configure_decode(gpu_cfg);
         self.accel = Some(accel);
         n
     }
