@@ -2133,7 +2133,7 @@ impl RocmWeightAccel {
         if let Some(e) = self.q6.get("token_embd.weight") {
             self.launch(
                 "q6_gemv",
-                e.out_dim.div_ceil(16) as u32,
+                e.out_dim.div_ceil(8) as u32, // q6_gemv: 8 rows/block
                 256,
                 0,
                 Args::new()
@@ -3837,7 +3837,7 @@ impl WeightAccel for RocmWeightAccel {
             self.gemv_x.upload(x).ok()?;
             self.launch(
                 "q6_gemv",
-                e.out_dim.div_ceil(16) as u32,
+                e.out_dim.div_ceil(8) as u32, // q6_gemv: 8 rows/block
                 256,
                 0,
                 Args::new()
@@ -4144,7 +4144,7 @@ impl WeightAccel for RocmWeightAccel {
             } else if let Some(w) = self.q6.get(name) {
                 self.launch(
                     "q6_gemv",
-                    w.out_dim.div_ceil(16) as u32,
+                    w.out_dim.div_ceil(8) as u32, // q6_gemv: 8 rows/block
                     256,
                     0,
                     Args::new()
@@ -4755,7 +4755,7 @@ impl WeightAccel for RocmWeightAccel {
             } else if let Some(w) = self.q6.get(wkey) {
                 self.launch(
                     "q6_gemv",
-                    w.out_dim.div_ceil(16) as u32,
+                    w.out_dim.div_ceil(8) as u32, // q6_gemv: 8 rows/block
                     256,
                     0,
                     Args::new()

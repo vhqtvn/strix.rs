@@ -13,7 +13,7 @@ use strix_core::accel::{GpuDecodeConfig, GpuLayerCfg, WeightAccel};
 use strix_core::backend::Decoder;
 use strix_core::error::{Result, StrixError};
 use strix_core::sampler::Logits;
-use strix_models::ggml_quant::{dequantize, dequantize_into, quantize_q8_0, GgmlType};
+use strix_models::ggml_quant::{dequantize_into, GgmlType};
 use strix_models::gguf::GgufFile;
 
 fn meta_u32(g: &GgufFile, k: &str) -> Result<usize> {
@@ -398,17 +398,6 @@ impl SmolLm3Model {
                 continue;
             };
             let ok = match ty {
-                // token_embd is the tied lm_head. Its Q6_K gemv on the iGPU is
-                // inaccurate (maxabsdiff ~30 vs CPU dequant on the SAME Q6_K data),
-                // which flips near-tie argmaxes → garbage on hard/chat prompts.
-                // Repack Q6_K→Q8_0 once (8-bit ≥ 6.5-bit, so no precision loss) so
-                // the accurate q8_0_gemv runs the lm_head — same fix gemma3n uses.
-                _ if name == "token_embd.weight" && ty != GgmlType::Q8_0 => {
-                    match dequantize(ty, bytes, in_dim * out_dim) {
-                        Ok(f) => accel.upload_q8_0(name, &quantize_q8_0(&f), in_dim, out_dim),
-                        Err(_) => false,
-                    }
-                }
                 GgmlType::Q4_0 => accel.upload_q4_0(name, bytes, in_dim, out_dim),
                 GgmlType::Q4_1 => accel.upload_q4_1(name, bytes, in_dim, out_dim),
                 GgmlType::Q6K => accel.upload_q6_k(name, bytes, in_dim, out_dim),
@@ -457,20 +446,13 @@ impl SmolLm3Model {
             max_seq: self.max_seq,
             layers,
         };
-        // Resident full-GPU decode for smollm3 is kept OFF by default. The GPU rope
-        // kernel now supports NORM pairing (GpuLayerCfg.rope_norm, matches our CPU
-        // NORM rope), but with that fix the resident path STILL produces garbage —
-        // so a second inconsistency beyond rope lives in the resident decode (likely
-        // the seeded-prefill KV layout or the int8 activation path; it was masked
-        // before because CPU+GPU were uniformly NEOX-wrong, and the old GPU==CPU
-        // check used a repetition-robust prompt). Until that's bit-diffed against
-        // CPU, default to the gemv-assisted CPU forward (iGPU matmuls; rope +
-        // attention CPU, all NORM and correct). STRIX_SMOLLM3_GPU_DECODE=1 opts into
-        // the resident path for debugging.
-        let allow_resident = std::env::var("STRIX_SMOLLM3_GPU_DECODE").is_ok();
-        self.gpu_decode = allow_resident
-            && std::env::var("STRIX_GPU_HYBRID").is_err()
-            && accel.configure_decode(gpu_cfg);
+        // Resident full-GPU decode (validated coherent == CPU). It needs both the
+        // GPU NORM-rope mode (GpuLayerCfg.rope_norm, matching the CPU NORM prefill)
+        // and the q6_gemv grid fix (div_ceil(8) for the 8-rows/block lm_head kernel)
+        // — without the grid fix the lm_head's upper half was uncomputed, garbaging
+        // chat/near-tie prompts. STRIX_GPU_HYBRID=1 forces the per-gemv path instead.
+        self.gpu_decode =
+            std::env::var("STRIX_GPU_HYBRID").is_err() && accel.configure_decode(gpu_cfg);
         self.accel = Some(accel);
         n
     }
