@@ -34,6 +34,12 @@ struct Model {
     template: Option<ChatTemplate>,
     /// Token ids that end generation (eos / end-of-turn).
     eos: Vec<u32>,
+    /// String forms of the end-of-turn markers (e.g. "<|im_end|>"). Used as a
+    /// stop-sequence safety net for Q4 decode that emits the marker as literal
+    /// text instead of the special token id.
+    eos_str: Vec<String>,
+    /// Context window (KV capacity) the decoder was built with.
+    ctx: usize,
     arch: String,
     name: String,
 }
@@ -152,13 +158,23 @@ fn load_model(
         }
         None => ChatTemplate::from_gguf(&gguf),
     };
-    // End-of-generation token ids from GGUF metadata.
+    // End-of-generation token ids (+ their string forms) from GGUF metadata.
     let mut eos = Vec::new();
+    let mut eos_str = Vec::new();
     {
         let md = gguf.metadata();
+        let tokens = md.get("tokenizer.ggml.tokens").and_then(|v| v.as_array());
         for k in ["tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"] {
             if let Some(v) = md.get(k).and_then(|v| v.as_u64()) {
                 eos.push(v as u32);
+                if let Some(s) = tokens
+                    .and_then(|t| t.get(v as usize))
+                    .and_then(|s| s.as_str())
+                {
+                    if !s.is_empty() {
+                        eos_str.push(s.to_string());
+                    }
+                }
             }
         }
     }
@@ -170,11 +186,14 @@ fn load_model(
         .to_string();
     let decoder = build_decoder(&arch, gguf, gpu, ctx)?;
     eos.dedup();
+    eos_str.dedup();
     Ok(Model {
         decoder,
         tok,
         template,
         eos,
+        eos_str,
+        ctx,
         arch,
         name,
     })
@@ -1179,7 +1198,7 @@ fn handle(mut req: tiny_http::Request, route: Route, shared: &Arc<Mutex<Model>>,
         }
     };
     let stream = v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
-    let params = parse_params(&v, route);
+    let mut params = parse_params(&v, route);
 
     // Build the prompt ids (needs the model lock for the tokenizer/template).
     let prompt_ids = {
@@ -1211,6 +1230,29 @@ fn handle(mut req: tiny_http::Request, route: Route, shared: &Arc<Mutex<Model>>,
             respond_json(req, 400, &json!({"error": e.to_string()}));
             return;
         }
+    };
+
+    // Window guard: keep prompt + generation within the KV cache, and arm the
+    // turn-end stop-string safety net for chat routes.
+    let prompt_ids = {
+        let m = shared.lock().unwrap();
+        let (ids, max_tokens) = match fit_window(prompt_ids, m.ctx, params.max_tokens, route) {
+            Ok(x) => x,
+            Err(e) => {
+                drop(m);
+                respond_json(req, 413, &json!({"error": e}));
+                return;
+            }
+        };
+        params.max_tokens = max_tokens;
+        if matches!(route, Route::OpenAiChat | Route::Anthropic) {
+            for s in &m.eos_str {
+                if !params.stop.iter().any(|x| x == s) {
+                    params.stop.push(s.clone());
+                }
+            }
+        }
+        ids
     };
 
     let want_tools = v
@@ -1403,6 +1445,38 @@ fn parse_one_call(body: &str) -> Option<ToolCall> {
         None => "{}".to_string(),
     };
     Some(ToolCall { name, arguments })
+}
+
+/// Keep prompt + generation within the KV window (`ctx`). Returns the (possibly
+/// tail-truncated) prompt ids and a `max_tokens` clamped so decode can't overflow.
+/// Raw `/completions` prompts are tail-truncated (keep the most recent tokens);
+/// chat/anthropic prompts are rejected (413) instead, since blindly dropping head
+/// tokens would corrupt the rendered template structure.
+fn fit_window(
+    prompt_ids: Vec<u32>,
+    ctx: usize,
+    max_tokens: usize,
+    route: Route,
+) -> std::result::Result<(Vec<u32>, usize), String> {
+    if prompt_ids.len() < ctx {
+        let room = ctx - prompt_ids.len();
+        return Ok((prompt_ids, max_tokens.min(room).max(1)));
+    }
+    match route {
+        Route::OpenAiText => {
+            // Reserve room to generate (at most half the window), keep the tail.
+            let reserve = max_tokens.clamp(1, (ctx / 2).max(1));
+            let keep = ctx.saturating_sub(reserve).max(1);
+            let start = prompt_ids.len().saturating_sub(keep);
+            let truncated = prompt_ids[start..].to_vec();
+            let room = ctx - truncated.len();
+            Ok((truncated, max_tokens.min(room).max(1)))
+        }
+        _ => Err(format!(
+            "prompt ({} tokens) exceeds context window ({ctx}); increase --ctx or send fewer/shorter messages",
+            prompt_ids.len()
+        )),
+    }
 }
 
 fn parse_params(v: &Value, route: Route) -> GenParams {
