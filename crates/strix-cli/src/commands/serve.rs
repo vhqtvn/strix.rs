@@ -460,19 +460,104 @@ fn parse_arr(b: &[u8], i: &mut usize) -> Option<bool> {
 }
 
 // ===== schema-aware JSON constraint (response_format json_schema) =====
-// Same prefix-validator idea as json_state, but driven by a JSON Schema: enforces
-// object keys (declaration order), value types, enums, arrays(items). Over-constrains
-// objects to emit ALL `properties` in order (good for structured extraction); ranges /
-// patterns / optional-key branching are not enforced (MVP).
+// A JSON Schema is compiled ONCE (CSchema) — caching parsed bounds + regexes — then a
+// prefix-validator masks the decode so the output conforms: object keys (any order,
+// required vs optional), value types, enums, arrays (min/max items), string
+// (minLength/maxLength/pattern), numeric (minimum/maximum).
 
-fn schema_prefix(s: &str, schema: &Value) -> JsonState {
+/// A compiled JSON Schema node.
+enum CSchema {
+    Object {
+        props: Vec<(String, CSchema)>,
+        required: Vec<String>,
+    },
+    Array {
+        items: Option<Box<CSchema>>,
+        min_items: usize,
+        max_items: Option<usize>,
+    },
+    Str {
+        min_len: Option<usize>,
+        max_len: Option<usize>,
+        pattern: Option<regex::Regex>,
+    },
+    Int {
+        min: Option<f64>,
+        max: Option<f64>,
+    },
+    Num {
+        min: Option<f64>,
+        max: Option<f64>,
+    },
+    Bool,
+    Null,
+    Enum(Vec<Value>),
+    Any,
+}
+
+/// Compile a JSON-Schema `Value` into a `CSchema` (parses bounds, compiles patterns).
+fn compile_schema(s: &Value) -> CSchema {
+    if let Some(en) = s.get("enum").and_then(|e| e.as_array()) {
+        return CSchema::Enum(en.clone());
+    }
+    let num = |k: &str| s.get(k).and_then(|v| v.as_f64());
+    match s.get("type").and_then(|t| t.as_str()) {
+        Some("object") => {
+            let props = s
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .map(|o| {
+                    o.iter()
+                        .map(|(k, v)| (k.clone(), compile_schema(v)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let required = s
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            CSchema::Object { props, required }
+        }
+        Some("array") => CSchema::Array {
+            items: s.get("items").map(|it| Box::new(compile_schema(it))),
+            min_items: num("minItems").map(|v| v as usize).unwrap_or(0),
+            max_items: num("maxItems").map(|v| v as usize),
+        },
+        Some("string") => CSchema::Str {
+            min_len: num("minLength").map(|v| v as usize),
+            max_len: num("maxLength").map(|v| v as usize),
+            pattern: s
+                .get("pattern")
+                .and_then(|p| p.as_str())
+                .and_then(|p| regex::Regex::new(p).ok()),
+        },
+        Some("integer") => CSchema::Int {
+            min: num("minimum"),
+            max: num("maximum"),
+        },
+        Some("number") => CSchema::Num {
+            min: num("minimum"),
+            max: num("maximum"),
+        },
+        Some("boolean") => CSchema::Bool,
+        Some("null") => CSchema::Null,
+        _ => CSchema::Any,
+    }
+}
+
+fn cstate(s: &str, sc: &CSchema) -> JsonState {
     let b = s.as_bytes();
     let mut i = 0;
     skip_ws(b, &mut i);
     if i >= b.len() {
         return JsonState::Incomplete;
     }
-    match consume_schema(b, &mut i, schema) {
+    match consume_c(b, &mut i, sc) {
         None => JsonState::Invalid,
         Some(false) => JsonState::Incomplete,
         Some(true) => {
@@ -486,50 +571,43 @@ fn schema_prefix(s: &str, schema: &Value) -> JsonState {
     }
 }
 
-fn consume_schema(b: &[u8], i: &mut usize, schema: &Value) -> Option<bool> {
+/// None = invalid, Some(false) = valid-but-incomplete, Some(true) = complete. Advances i.
+fn consume_c(b: &[u8], i: &mut usize, sc: &CSchema) -> Option<bool> {
     skip_ws(b, i);
     if *i >= b.len() {
         return Some(false);
     }
-    if let Some(en) = schema.get("enum").and_then(|e| e.as_array()) {
-        return consume_enum(b, i, en);
-    }
-    match schema.get("type").and_then(|t| t.as_str()) {
-        Some("object") => consume_obj_schema(b, i, schema),
-        Some("array") => consume_arr_schema(b, i, schema),
-        Some("string") => parse_str(b, i),
-        Some("integer") => parse_int(b, i),
-        Some("number") => parse_num(b, i),
-        Some("boolean") => match b[*i] {
+    match sc {
+        CSchema::Object { props, required } => consume_cobj(b, i, props, required),
+        CSchema::Array {
+            items,
+            min_items,
+            max_items,
+        } => consume_carr(b, i, items.as_deref(), *min_items, *max_items),
+        CSchema::Str {
+            min_len,
+            max_len,
+            pattern,
+        } => consume_cstr(b, i, *min_len, *max_len, pattern.as_ref()),
+        CSchema::Int { min, max } => consume_cnum(b, i, *min, *max, true),
+        CSchema::Num { min, max } => consume_cnum(b, i, *min, *max, false),
+        CSchema::Bool => match b[*i] {
             b't' => parse_lit(b, i, b"true"),
             b'f' => parse_lit(b, i, b"false"),
             _ => None,
         },
-        Some("null") => parse_lit(b, i, b"null"),
-        _ => parse_value(b, i), // unknown/missing type → any JSON
+        CSchema::Null => parse_lit(b, i, b"null"),
+        CSchema::Enum(vals) => consume_enum(b, i, vals),
+        CSchema::Any => parse_value(b, i),
     }
-}
-
-fn parse_int(b: &[u8], i: &mut usize) -> Option<bool> {
-    if *i < b.len() && b[*i] == b'-' {
-        *i += 1;
-    }
-    let ds = *i;
-    while *i < b.len() && b[*i].is_ascii_digit() {
-        *i += 1;
-    }
-    if *i == ds {
-        return if *i >= b.len() { Some(false) } else { None }; // "-"@end ok, "-x" invalid
-    }
-    Some(*i < b.len())
 }
 
 fn consume_enum(b: &[u8], i: &mut usize, vals: &[Value]) -> Option<bool> {
     let rem = &b[*i..];
     let mut any_prefix = false;
     for v in vals {
-        let s = v.to_string();
-        let sb = s.as_bytes();
+        let sb = v.to_string();
+        let sb = sb.as_bytes();
         if rem.len() >= sb.len() {
             if &rem[..sb.len()] == sb {
                 *i += sb.len();
@@ -547,22 +625,55 @@ fn consume_enum(b: &[u8], i: &mut usize, vals: &[Value]) -> Option<bool> {
     }
 }
 
-fn consume_obj_schema(b: &[u8], i: &mut usize, schema: &Value) -> Option<bool> {
+/// Match a quoted object key against the not-yet-seen property names. Returns
+/// (complete?, matched_name).
+fn consume_key<'a>(b: &[u8], i: &mut usize, names: &[&'a str]) -> Option<(bool, Option<&'a str>)> {
+    let rem = &b[*i..];
+    let mut any_prefix = false;
+    for &name in names {
+        let q = format!("\"{name}\"");
+        let qb = q.as_bytes();
+        if rem.len() >= qb.len() {
+            if &rem[..qb.len()] == qb {
+                *i += qb.len();
+                return Some((true, Some(name)));
+            }
+        } else if qb.starts_with(rem) {
+            any_prefix = true;
+        }
+    }
+    if any_prefix {
+        *i = b.len();
+        Some((false, None))
+    } else {
+        None
+    }
+}
+
+fn consume_cobj(
+    b: &[u8],
+    i: &mut usize,
+    props: &[(String, CSchema)],
+    required: &[String],
+) -> Option<bool> {
     if b[*i] != b'{' {
         return None;
     }
     *i += 1;
-    let props: Vec<(&String, &Value)> = schema
-        .get("properties")
-        .and_then(|p| p.as_object())
-        .map(|o| o.iter().collect())
-        .unwrap_or_default();
-    for (idx, (name, sub)) in props.iter().enumerate() {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut first = true;
+    loop {
         skip_ws(b, i);
         if *i >= b.len() {
             return Some(false);
         }
-        if idx > 0 {
+        if b[*i] == b'}' {
+            // Valid close only once every required key has appeared.
+            let ok = required.iter().all(|r| seen.iter().any(|s| s == r));
+            *i += 1;
+            return if ok { Some(true) } else { None };
+        }
+        if !first {
             if b[*i] != b',' {
                 return None;
             }
@@ -572,41 +683,51 @@ fn consume_obj_schema(b: &[u8], i: &mut usize, schema: &Value) -> Option<bool> {
                 return Some(false);
             }
         }
-        let key = format!("\"{name}\"");
-        match parse_lit(b, i, key.as_bytes())? {
-            false => return Some(false),
-            true => {}
-        }
-        skip_ws(b, i);
-        if *i >= b.len() {
-            return Some(false);
-        }
-        if b[*i] != b':' {
-            return None;
-        }
-        *i += 1;
-        match consume_schema(b, i, sub)? {
-            false => return Some(false),
-            true => {}
+        first = false;
+        let names: Vec<&str> = props
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .filter(|k| !seen.contains(k))
+            .collect();
+        match consume_key(b, i, &names)? {
+            (false, _) => return Some(false),
+            (true, Some(name)) => {
+                seen.push(name);
+                skip_ws(b, i);
+                if *i >= b.len() {
+                    return Some(false);
+                }
+                if b[*i] != b':' {
+                    return None;
+                }
+                *i += 1;
+                let sub = props
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, s)| s)
+                    .unwrap();
+                match consume_c(b, i, sub)? {
+                    false => return Some(false),
+                    true => {}
+                }
+            }
+            (true, None) => return None,
         }
     }
-    skip_ws(b, i);
-    if *i >= b.len() {
-        return Some(false);
-    }
-    if b[*i] != b'}' {
-        return None;
-    }
-    *i += 1;
-    Some(true)
 }
 
-fn consume_arr_schema(b: &[u8], i: &mut usize, schema: &Value) -> Option<bool> {
+fn consume_carr(
+    b: &[u8],
+    i: &mut usize,
+    items: Option<&CSchema>,
+    min_items: usize,
+    max_items: Option<usize>,
+) -> Option<bool> {
     if b[*i] != b'[' {
         return None;
     }
     *i += 1;
-    let items = schema.get("items");
+    let mut n = 0usize;
     loop {
         skip_ws(b, i);
         if *i >= b.len() {
@@ -614,42 +735,148 @@ fn consume_arr_schema(b: &[u8], i: &mut usize, schema: &Value) -> Option<bool> {
         }
         if b[*i] == b']' {
             *i += 1;
-            return Some(true);
+            return if n >= min_items { Some(true) } else { None };
+        }
+        if n > 0 {
+            if b[*i] != b',' {
+                return None;
+            }
+            *i += 1;
+            skip_ws(b, i);
+            if *i >= b.len() {
+                return Some(false);
+            }
+        }
+        if max_items.is_some_and(|mx| n >= mx) {
+            return None; // already at max, no more items allowed
         }
         let r = match items {
-            Some(it) => consume_schema(b, i, it)?,
+            Some(it) => consume_c(b, i, it)?,
             None => parse_value(b, i)?,
         };
         if !r {
             return Some(false);
         }
-        skip_ws(b, i);
-        if *i >= b.len() {
-            return Some(false);
-        }
+        n += 1;
+    }
+}
+
+fn consume_cstr(
+    b: &[u8],
+    i: &mut usize,
+    min_len: Option<usize>,
+    max_len: Option<usize>,
+    pattern: Option<&regex::Regex>,
+) -> Option<bool> {
+    if b[*i] != b'"' {
+        return None;
+    }
+    *i += 1;
+    let mut content = String::new();
+    while *i < b.len() {
         match b[*i] {
-            b',' => *i += 1,
-            b']' => {
+            b'"' => {
+                let n = content.chars().count();
+                if min_len.is_some_and(|mn| n < mn) {
+                    return None;
+                }
+                if let Some(re) = pattern {
+                    if !re.is_match(&content) {
+                        return None;
+                    }
+                }
                 *i += 1;
                 return Some(true);
             }
-            _ => return None,
+            b'\\' => {
+                *i += 1;
+                if *i >= b.len() {
+                    return Some(false);
+                }
+                content.push(b[*i] as char);
+                *i += 1;
+            }
+            c => {
+                content.push(c as char);
+                if max_len.is_some_and(|mx| content.chars().count() > mx) {
+                    return None;
+                }
+                *i += 1;
+            }
         }
     }
+    Some(false)
+}
+
+/// Number/integer with optional min/max. Range is enforced as a prefix where sound:
+/// reject when a non-negative prefix already exceeds `max`; check min/max at completion.
+fn consume_cnum(
+    b: &[u8],
+    i: &mut usize,
+    min: Option<f64>,
+    max: Option<f64>,
+    integer: bool,
+) -> Option<bool> {
+    let start = *i;
+    if b[*i] == b'-' {
+        *i += 1;
+    }
+    let ds = *i;
+    while *i < b.len() && b[*i].is_ascii_digit() {
+        *i += 1;
+    }
+    let mut had_dot = false;
+    if !integer && *i < b.len() && b[*i] == b'.' {
+        had_dot = true;
+        *i += 1;
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+    }
+    if !integer && *i < b.len() && (b[*i] == b'e' || b[*i] == b'E') {
+        *i += 1;
+        if *i < b.len() && (b[*i] == b'+' || b[*i] == b'-') {
+            *i += 1;
+        }
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+    }
+    if *i == ds && !had_dot {
+        return if *i >= b.len() { Some(false) } else { None };
+    }
+    let txt = std::str::from_utf8(&b[start..*i]).ok()?;
+    let val: f64 = txt.parse().ok()?;
+    // Upper-bound prefix check for non-negative integers (digits only grow the value).
+    if integer && !txt.contains('-') {
+        if let Some(mx) = max {
+            if val > mx {
+                return None;
+            }
+        }
+    }
+    if *i >= b.len() {
+        return Some(false); // could still be extended
+    }
+    // Completed (a delimiter follows): enforce full range.
+    if min.is_some_and(|mn| val < mn) || max.is_some_and(|mx| val > mx) {
+        return None;
+    }
+    Some(true)
 }
 
 /// What the decode is constrained to.
 enum Constrain<'a> {
     None,
     Json,
-    Schema(&'a Value),
+    Schema(&'a CSchema),
 }
 
 impl Constrain<'_> {
     fn state(&self, s: &str) -> JsonState {
         match self {
             Constrain::Json => json_state(s),
-            Constrain::Schema(sc) => schema_prefix(s, sc),
+            Constrain::Schema(sc) => cstate(s, sc),
             Constrain::None => JsonState::Incomplete,
         }
     }
@@ -883,13 +1110,13 @@ fn handle(mut req: tiny_http::Request, route: Route, shared: &Arc<Mutex<Model>>,
         .and_then(|r| r.get("type"))
         .and_then(|t| t.as_str())
         .is_some_and(|t| t == "json_object" || t == "json_schema");
-    // json_schema → the schema to constrain to (None for plain json_object).
+    // json_schema → compile the schema once (cached bounds + regexes) to constrain to.
     let schema = v
         .get("response_format")
         .filter(|r| r.get("type").and_then(|t| t.as_str()) == Some("json_schema"))
         .and_then(|r| r.get("json_schema"))
         .and_then(|j| j.get("schema"))
-        .cloned();
+        .map(compile_schema);
     if stream {
         stream_response(
             req,
@@ -911,7 +1138,11 @@ fn handle(mut req: tiny_http::Request, route: Route, shared: &Arc<Mutex<Model>>,
 
 /// Build the decode constraint: tools disable it; else schema → schema-constrained;
 /// else json → valid-JSON-constrained; else unconstrained sampling.
-fn constrain_of<'a>(want_json: bool, want_tools: bool, schema: &'a Option<Value>) -> Constrain<'a> {
+fn constrain_of<'a>(
+    want_json: bool,
+    want_tools: bool,
+    schema: &'a Option<CSchema>,
+) -> Constrain<'a> {
     if want_tools {
         Constrain::None
     } else if let Some(s) = schema {
@@ -932,7 +1163,7 @@ fn blocking_response(
     model_id: &str,
     want_tools: bool,
     want_json: bool,
-    schema: Option<Value>,
+    schema: Option<CSchema>,
 ) {
     let mut m = shared.lock().unwrap();
     let n_prompt = prompt_ids.len();
@@ -1375,7 +1606,7 @@ fn stream_response(
     model_id: String,
     want_tools: bool,
     want_json: bool,
-    schema: Option<Value>,
+    schema: Option<CSchema>,
 ) {
     let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
     // Generation runs in a worker thread that pushes SSE chunks; this thread
@@ -1436,7 +1667,7 @@ fn stream_openai(
     route: Route,
     want_tools: bool,
     want_json: bool,
-    schema: &Option<Value>,
+    schema: &Option<CSchema>,
 ) {
     let id = format!("chatcmpl-{}", now_secs());
     let obj = match route {
@@ -1526,7 +1757,7 @@ fn stream_anthropic(
     n_prompt: usize,
     want_tools: bool,
     want_json: bool,
-    schema: &Option<Value>,
+    schema: &Option<CSchema>,
 ) {
     let id = format!("msg_{}", now_secs());
     let _ = sse_event(
