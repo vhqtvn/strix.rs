@@ -118,7 +118,17 @@ decode:
 
 **strix.rs matches or beats llama.cpp on decode for 4 of 6 models.** The two gaps are kernel-efficiency
 on already-resident paths: Mellum's Q8 MoE GEMV (Q4 experts go incoherent — need Q4_K/QuaRot), and
-Gemma-3n's f32 AltUp/Laurel/PLE matmuls (quantizing them to Q8 would ~tie llama, at a precision risk).
+Gemma-3n's resident-but-f32 AltUp/Laurel/PLE matmuls (quantizing them to Q8 would ~tie llama, at a
+precision risk).
+
+Decode numbers re-confirmed 2026-06-16 (qwen3 27.1, smollm3 36.5, gemma3n 17.4, qwen3.5 27.1 — within
+clock noise of the above). These speeds were unchanged by a round of **GPU decode correctness fixes**: a
+`q6_gemv` launch-grid bug (`div_ceil(16)` vs the kernel's 8-rows/block → the upper half of the tied
+lm_head's output rows went uncomputed) was corrupting high-id-token logits, which surfaced as garbage on
+chat/near-tie prompts (and Qwen3's stray-emoji rambling). Plus SmolLM3 was using NEOX RoPE where its
+Llama-permuted weights need NORM. With both fixed, the resident GPU decode is now verified **bit-exact
+vs the CPU forward** on q6_k lm_heads (and SmolLM3 resident decode is coherent == CPU at 36.5 tok/s) — the
+decode wins above are now backed by correct output, not just throughput.
 
 **Prefill**, by contrast, llama is 5–10× faster (pp256: SmolLM3 792, Qwen3 540, Gemma-4 204, Mellum
 345 t/s) — *by design*: llama prefills on the iGPU; strix keeps prefill on the NPU/CPU because sustained
