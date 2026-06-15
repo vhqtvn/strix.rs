@@ -267,51 +267,281 @@ fn sample_token(logits: &[f32], p: &GenParams, rng: &mut Rng) -> u32 {
 
 // ============================== generation ==============================
 
+// ============================== constrained JSON decoding ==============================
+// A character-level JSON *prefix* validator: lets us mask the decode so the output is
+// always a valid JSON prefix (response_format json). Stateless full-reparse per check —
+// JSON outputs are short, so this is cheap.
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum JsonState {
+    Invalid,
+    Incomplete,
+    Complete,
+}
+
+fn json_state(s: &str) -> JsonState {
+    let b = s.as_bytes();
+    let mut i = 0;
+    skip_ws(b, &mut i);
+    if i >= b.len() {
+        return JsonState::Incomplete; // empty / whitespace is a valid prefix
+    }
+    match parse_value(b, &mut i) {
+        None => JsonState::Invalid,
+        Some(false) => JsonState::Incomplete,
+        Some(true) => {
+            skip_ws(b, &mut i);
+            if i >= b.len() {
+                JsonState::Complete
+            } else {
+                JsonState::Invalid
+            }
+        }
+    }
+}
+
+fn skip_ws(b: &[u8], i: &mut usize) {
+    while *i < b.len() && matches!(b[*i], b' ' | b'\t' | b'\n' | b'\r') {
+        *i += 1;
+    }
+}
+
+/// None = invalid, Some(false) = valid but incomplete (ran out), Some(true) = complete.
+fn parse_value(b: &[u8], i: &mut usize) -> Option<bool> {
+    skip_ws(b, i);
+    if *i >= b.len() {
+        return Some(false);
+    }
+    match b[*i] {
+        b'{' => parse_obj(b, i),
+        b'[' => parse_arr(b, i),
+        b'"' => parse_str(b, i),
+        b't' => parse_lit(b, i, b"true"),
+        b'f' => parse_lit(b, i, b"false"),
+        b'n' => parse_lit(b, i, b"null"),
+        b'-' | b'0'..=b'9' => parse_num(b, i),
+        _ => None,
+    }
+}
+
+fn parse_lit(b: &[u8], i: &mut usize, word: &[u8]) -> Option<bool> {
+    let mut k = 0;
+    while *i < b.len() && k < word.len() {
+        if b[*i] != word[k] {
+            return None;
+        }
+        *i += 1;
+        k += 1;
+    }
+    Some(k == word.len())
+}
+
+fn parse_str(b: &[u8], i: &mut usize) -> Option<bool> {
+    *i += 1; // opening quote
+    while *i < b.len() {
+        match b[*i] {
+            b'"' => {
+                *i += 1;
+                return Some(true);
+            }
+            b'\\' => {
+                *i += 1;
+                if *i >= b.len() {
+                    return Some(false);
+                }
+                *i += 1;
+            }
+            _ => *i += 1,
+        }
+    }
+    Some(false)
+}
+
+fn parse_num(b: &[u8], i: &mut usize) -> Option<bool> {
+    let start = *i;
+    if *i < b.len() && b[*i] == b'-' {
+        *i += 1;
+    }
+    while *i < b.len() && b[*i].is_ascii_digit() {
+        *i += 1;
+    }
+    if *i < b.len() && b[*i] == b'.' {
+        *i += 1;
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+    }
+    if *i < b.len() && (b[*i] == b'e' || b[*i] == b'E') {
+        *i += 1;
+        if *i < b.len() && (b[*i] == b'+' || b[*i] == b'-') {
+            *i += 1;
+        }
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+    }
+    if *i == start {
+        return None;
+    }
+    // At end → could still be extended (incomplete); otherwise a delimiter bounds it.
+    Some(*i < b.len())
+}
+
+fn parse_obj(b: &[u8], i: &mut usize) -> Option<bool> {
+    *i += 1;
+    loop {
+        skip_ws(b, i);
+        if *i >= b.len() {
+            return Some(false);
+        }
+        if b[*i] == b'}' {
+            *i += 1;
+            return Some(true);
+        }
+        if b[*i] != b'"' {
+            return None;
+        }
+        if !parse_str(b, i)? {
+            return Some(false);
+        }
+        skip_ws(b, i);
+        if *i >= b.len() {
+            return Some(false);
+        }
+        if b[*i] != b':' {
+            return None;
+        }
+        *i += 1;
+        if !parse_value(b, i)? {
+            return Some(false);
+        }
+        skip_ws(b, i);
+        if *i >= b.len() {
+            return Some(false);
+        }
+        match b[*i] {
+            b',' => *i += 1,
+            b'}' => {
+                *i += 1;
+                return Some(true);
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn parse_arr(b: &[u8], i: &mut usize) -> Option<bool> {
+    *i += 1;
+    loop {
+        skip_ws(b, i);
+        if *i >= b.len() {
+            return Some(false);
+        }
+        if b[*i] == b']' {
+            *i += 1;
+            return Some(true);
+        }
+        if !parse_value(b, i)? {
+            return Some(false);
+        }
+        skip_ws(b, i);
+        if *i >= b.len() {
+            return Some(false);
+        }
+        match b[*i] {
+            b',' => *i += 1,
+            b']' => {
+                *i += 1;
+                return Some(true);
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Top-`k` token ids by logit, descending.
+fn top_k_desc(logits: &[f32], k: usize) -> Vec<u32> {
+    let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
+    idx.sort_unstable_by(|&a, &c| {
+        logits[c as usize]
+            .partial_cmp(&logits[a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    idx.truncate(k);
+    idx
+}
+
+/// Pick the highest-logit token that keeps the decoded output a valid JSON prefix.
+fn pick_json_token(tok: &StrixTokenizer, logits: &[f32], out_ids: &[u32]) -> u32 {
+    let committed = tok.decode(out_ids, true).unwrap_or_default();
+    let cands = top_k_desc(logits, 48);
+    for &c in &cands {
+        let mut ids = out_ids.to_vec();
+        ids.push(c);
+        let full = match tok.decode(&ids, true) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        if full.len() < committed.len() {
+            continue;
+        }
+        if json_state(&full) != JsonState::Invalid {
+            return c;
+        }
+    }
+    cands.first().copied().unwrap_or(0)
+}
+
 /// Drive prefill + decode. Calls `on_token(piece)` for each new decoded text piece
-/// (incremental detokenization). Returns (full_text, finish_reason, n_gen).
+/// (incremental detokenization). When `json`, the decode is constrained so the output
+/// is always a valid JSON value (response_format). Returns (text, finish_reason, n_gen).
 fn generate(
     m: &mut Model,
     prompt_ids: &[u32],
     p: &GenParams,
+    json: bool,
     mut on_token: impl FnMut(&str),
 ) -> Result<(String, &'static str, usize)> {
     m.decoder.reset();
     let mut rng = Rng::new();
-    let logits = m.decoder.prefill(prompt_ids).context("prefill")?;
-    let mut next = sample_token(&logits.0, p, &mut rng);
+    let mut logits = m.decoder.prefill(prompt_ids).context("prefill")?;
 
     let mut out_ids: Vec<u32> = Vec::new();
     let mut emitted = String::new(); // text already sent to on_token
     let mut finish = "length";
     for step in 0..p.max_tokens {
+        let next = if json {
+            pick_json_token(&m.tok, &logits.0, &out_ids)
+        } else {
+            sample_token(&logits.0, p, &mut rng)
+        };
         if m.eos.contains(&next) {
             finish = "stop";
             break;
         }
         out_ids.push(next);
         // Incremental detokenize: decode the whole sequence, emit the new suffix.
-        // (Robust across BPE merges that span tokens.)
-        if let Ok(full) = m.tok.decode(&out_ids, true) {
-            if full.len() > emitted.len() && full.is_char_boundary(emitted.len()) {
-                let piece = full[emitted.len()..].to_string();
-                if !piece.is_empty() {
-                    on_token(&piece);
-                    emitted = full;
-                }
+        let full = m.tok.decode(&out_ids, true).unwrap_or_default();
+        if full.len() > emitted.len() && full.is_char_boundary(emitted.len()) {
+            let piece = full[emitted.len()..].to_string();
+            if !piece.is_empty() {
+                on_token(&piece);
+                emitted = full.clone();
             }
         }
-        // stop sequences
-        if !p.stop.is_empty() && p.stop.iter().any(|s| emitted.contains(s.as_str())) {
+        if !p.stop.is_empty() && p.stop.iter().any(|s| full.contains(s.as_str())) {
+            finish = "stop";
+            break;
+        }
+        if json && json_state(&full) == JsonState::Complete {
             finish = "stop";
             break;
         }
         if step + 1 >= p.max_tokens {
             break;
         }
-        let logits = m.decoder.decode_one(next).context("decode")?;
-        next = sample_token(&logits.0, p, &mut rng);
+        logits = m.decoder.decode_one(next).context("decode")?;
     }
-    // trim at the earliest stop sequence
     let mut text = m.tok.decode(&out_ids, true).unwrap_or_default();
     for s in &p.stop {
         if let Some(idx) = text.find(s.as_str()) {
@@ -463,6 +693,8 @@ fn handle(mut req: tiny_http::Request, route: Route, shared: &Arc<Mutex<Model>>,
             prompt_ids,
             params,
             model_id.to_string(),
+            want_tools,
+            want_json,
         );
     } else {
         blocking_response(
@@ -483,7 +715,13 @@ fn blocking_response(
 ) {
     let mut m = shared.lock().unwrap();
     let n_prompt = prompt_ids.len();
-    let res = generate(&mut m, &prompt_ids, &params, |_| {});
+    let res = generate(
+        &mut m,
+        &prompt_ids,
+        &params,
+        want_json && !want_tools,
+        |_| {},
+    );
     drop(m);
     match res {
         Ok((raw, finish, n_gen)) => {
@@ -911,6 +1149,7 @@ fn sse_event(tx: &Sender<Vec<u8>>, event: &str, payload: &Value) -> bool {
         .is_ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stream_response(
     req: tiny_http::Request,
     route: Route,
@@ -918,6 +1157,8 @@ fn stream_response(
     prompt_ids: Vec<u32>,
     params: GenParams,
     model_id: String,
+    want_tools: bool,
+    want_json: bool,
 ) {
     let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
     // Generation runs in a worker thread that pushes SSE chunks; this thread
@@ -926,10 +1167,26 @@ fn stream_response(
         let mut m = shared.lock().unwrap();
         let n_prompt = prompt_ids.len();
         match route {
-            Route::Anthropic => {
-                stream_anthropic(&mut m, &prompt_ids, &params, &tx, &model_id, n_prompt)
-            }
-            _ => stream_openai(&mut m, &prompt_ids, &params, &tx, &model_id, route),
+            Route::Anthropic => stream_anthropic(
+                &mut m,
+                &prompt_ids,
+                &params,
+                &tx,
+                &model_id,
+                n_prompt,
+                want_tools,
+                want_json,
+            ),
+            _ => stream_openai(
+                &mut m,
+                &prompt_ids,
+                &params,
+                &tx,
+                &model_id,
+                route,
+                want_tools,
+                want_json,
+            ),
         }
     });
     let reader = ChanReader {
@@ -950,6 +1207,7 @@ fn stream_response(
     let _ = req.respond(resp);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stream_openai(
     m: &mut Model,
     prompt_ids: &[u32],
@@ -957,45 +1215,84 @@ fn stream_openai(
     tx: &Sender<Vec<u8>>,
     model_id: &str,
     route: Route,
+    want_tools: bool,
+    want_json: bool,
 ) {
     let id = format!("chatcmpl-{}", now_secs());
-    let (obj, first) = match route {
-        Route::OpenAiText => ("text_completion", json!({})),
-        _ => (
-            "chat.completion.chunk",
-            json!({"role": "assistant", "content": ""}),
-        ),
+    let obj = match route {
+        Route::OpenAiText => "text_completion",
+        _ => "chat.completion.chunk",
     };
     // OpenAI chat: first chunk carries the role.
     if matches!(route, Route::OpenAiChat) {
         let _ = sse(
             tx,
             &json!({"id": id, "object": obj, "created": now_secs(), "model": model_id,
-                    "choices": [{"index":0, "delta": first, "finish_reason": null}]})
+                    "choices": [{"index":0, "delta": {"role":"assistant","content":""}, "finish_reason": null}]})
             .to_string(),
         );
     }
-    let res = generate(m, prompt_ids, params, |piece| {
-        let delta = match route {
-            Route::OpenAiText => json!({"text": piece}),
-            _ => json!({"content": piece}),
-        };
-        let chunk = if matches!(route, Route::OpenAiText) {
+    // Tool calling: buffer, then emit the parsed tool calls as delta.tool_calls
+    // (incremental token-level tool parsing is overkill; one delta is spec-valid).
+    if want_tools && matches!(route, Route::OpenAiChat) {
+        let (raw, _f, _) =
+            generate(m, prompt_ids, params, false, |_| {}).unwrap_or((String::new(), "stop", 0));
+        let (text, calls) = parse_tool_calls(&raw, true);
+        if calls.is_empty() {
+            if !text.is_empty() {
+                let _ = sse(
+                    tx,
+                    &json!({"id": id, "object": obj, "created": now_secs(), "model": model_id,
+                    "choices": [{"index":0, "delta": {"content": text}, "finish_reason": null}]})
+                    .to_string(),
+                );
+            }
+            emit_finish(tx, &id, obj, model_id, "stop");
+        } else {
+            let arr: Vec<Value> = calls
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    json!({
+                        "index": i, "id": format!("call_{}_{i}", now_secs()), "type": "function",
+                        "function": {"name": c.name, "arguments": c.arguments}
+                    })
+                })
+                .collect();
+            let _ = sse(
+                tx,
+                &json!({"id": id, "object": obj, "created": now_secs(), "model": model_id,
+                "choices": [{"index":0, "delta": {"tool_calls": arr}, "finish_reason": null}]})
+                .to_string(),
+            );
+            emit_finish(tx, &id, obj, model_id, "tool_calls");
+        }
+        let _ = sse(tx, "[DONE]");
+        return;
+    }
+    let is_text = matches!(route, Route::OpenAiText);
+    let res = generate(m, prompt_ids, params, want_json, |piece| {
+        let chunk = if is_text {
             json!({"id": id, "object": obj, "created": now_secs(), "model": model_id,
                    "choices": [{"index":0, "text": piece, "finish_reason": null}]})
         } else {
             json!({"id": id, "object": obj, "created": now_secs(), "model": model_id,
-                   "choices": [{"index":0, "delta": delta, "finish_reason": null}]})
+                   "choices": [{"index":0, "delta": {"content": piece}, "finish_reason": null}]})
         };
         let _ = sse(tx, &chunk.to_string());
     });
     let finish = res.map(|(_, f, _)| f).unwrap_or("stop");
-    let last = json!({"id": id, "object": obj, "created": now_secs(), "model": model_id,
-        "choices": [{"index":0, "delta": {}, "finish_reason": finish}]});
-    let _ = sse(tx, &last.to_string());
+    emit_finish(tx, &id, obj, model_id, finish);
     let _ = sse(tx, "[DONE]");
 }
 
+fn emit_finish(tx: &Sender<Vec<u8>>, id: &str, obj: &str, model_id: &str, finish: &str) {
+    let last = json!({"id": id, "object": obj, "created": now_secs(), "model": model_id,
+        "choices": [{"index":0, "delta": {}, "finish_reason": finish}]});
+    let _ = sse(tx, &last.to_string());
+}
+
+#[allow(clippy::too_many_arguments)]
 fn stream_anthropic(
     m: &mut Model,
     prompt_ids: &[u32],
@@ -1003,6 +1300,8 @@ fn stream_anthropic(
     tx: &Sender<Vec<u8>>,
     model_id: &str,
     n_prompt: usize,
+    want_tools: bool,
+    want_json: bool,
 ) {
     let id = format!("msg_{}", now_secs());
     let _ = sse_event(
@@ -1013,12 +1312,70 @@ fn stream_anthropic(
             "content": [], "stop_reason": null, "stop_sequence": null,
             "usage": {"input_tokens": n_prompt, "output_tokens": 0}}}),
     );
+    // Tool calling: buffer, then emit text + tool_use blocks.
+    if want_tools {
+        let (raw, _f, n_gen) =
+            generate(m, prompt_ids, params, false, |_| {}).unwrap_or((String::new(), "stop", 0));
+        let (text, calls) = parse_tool_calls(&raw, true);
+        let mut idx = 0;
+        if !text.is_empty() {
+            let _ = sse_event(
+                tx,
+                "content_block_start",
+                &json!({"type":"content_block_start","index":idx,"content_block":{"type":"text","text":""}}),
+            );
+            let _ = sse_event(
+                tx,
+                "content_block_delta",
+                &json!({"type":"content_block_delta","index":idx,"delta":{"type":"text_delta","text":text}}),
+            );
+            let _ = sse_event(
+                tx,
+                "content_block_stop",
+                &json!({"type":"content_block_stop","index":idx}),
+            );
+            idx += 1;
+        }
+        for c in &calls {
+            let input: Value = serde_json::from_str(&c.arguments).unwrap_or_else(|_| json!({}));
+            let _ = sse_event(
+                tx,
+                "content_block_start",
+                &json!({"type":"content_block_start","index":idx,
+                "content_block":{"type":"tool_use","id":format!("toolu_{}_{idx}",now_secs()),"name":c.name,"input":{}}}),
+            );
+            let _ = sse_event(
+                tx,
+                "content_block_delta",
+                &json!({"type":"content_block_delta","index":idx,
+                "delta":{"type":"input_json_delta","partial_json": input.to_string()}}),
+            );
+            let _ = sse_event(
+                tx,
+                "content_block_stop",
+                &json!({"type":"content_block_stop","index":idx}),
+            );
+            idx += 1;
+        }
+        let reason = if calls.is_empty() {
+            "end_turn"
+        } else {
+            "tool_use"
+        };
+        let _ = sse_event(
+            tx,
+            "message_delta",
+            &json!({"type":"message_delta","delta":{"stop_reason":reason,"stop_sequence":null},"usage":{"output_tokens":n_gen}}),
+        );
+        let _ = sse_event(tx, "message_stop", &json!({"type":"message_stop"}));
+        return;
+    }
     let _ = sse_event(
         tx,
         "content_block_start",
         &json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
     );
-    let res = generate(m, prompt_ids, params, |piece| {
+    let res = generate(m, prompt_ids, params, want_json, |piece| {
         let _ = sse_event(
             tx,
             "content_block_delta",
