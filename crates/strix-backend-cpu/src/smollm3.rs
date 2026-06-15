@@ -13,7 +13,7 @@ use strix_core::accel::{GpuDecodeConfig, GpuLayerCfg, WeightAccel};
 use strix_core::backend::Decoder;
 use strix_core::error::{Result, StrixError};
 use strix_core::sampler::Logits;
-use strix_models::ggml_quant::{dequantize_into, GgmlType};
+use strix_models::ggml_quant::{dequantize, dequantize_into, quantize_q8_0, GgmlType};
 use strix_models::gguf::GgufFile;
 
 fn meta_u32(g: &GgufFile, k: &str) -> Result<usize> {
@@ -398,6 +398,17 @@ impl SmolLm3Model {
                 continue;
             };
             let ok = match ty {
+                // token_embd is the tied lm_head. Its Q6_K gemv on the iGPU is
+                // inaccurate (maxabsdiff ~30 vs CPU dequant on the SAME Q6_K data),
+                // which flips near-tie argmaxes → garbage on hard/chat prompts.
+                // Repack Q6_K→Q8_0 once (8-bit ≥ 6.5-bit, so no precision loss) so
+                // the accurate q8_0_gemv runs the lm_head — same fix gemma3n uses.
+                _ if name == "token_embd.weight" && ty != GgmlType::Q8_0 => {
+                    match dequantize(ty, bytes, in_dim * out_dim) {
+                        Ok(f) => accel.upload_q8_0(name, &quantize_q8_0(&f), in_dim, out_dim),
+                        Err(_) => false,
+                    }
+                }
                 GgmlType::Q4_0 => accel.upload_q4_0(name, bytes, in_dim, out_dim),
                 GgmlType::Q4_1 => accel.upload_q4_1(name, bytes, in_dim, out_dim),
                 GgmlType::Q6K => accel.upload_q6_k(name, bytes, in_dim, out_dim),
@@ -523,6 +534,35 @@ impl SmolLm3Model {
     fn mm(&self, name: &str, x: &[f32]) -> Result<Vec<f32>> {
         if let Some(a) = &self.accel {
             if let Some(y) = a.gemv(name, x) {
+                // STRIX_MM_VERIFY: cross-check the GPU gemv against the CPU dequant
+                // matmul and report the worst per-element divergence per call (used
+                // to localize the smollm3 GPU-chat garbage to a specific projection).
+                if std::env::var("STRIX_MM_VERIFY").is_ok() {
+                    if let Ok((bytes, ty, in_dim, _)) = self.w(name) {
+                        let mut yc = vec![0.0f32; y.len()];
+                        qmatmul(&mut yc, x, bytes, ty, in_dim);
+                        let mut maxabs = 0f32;
+                        let (mut gi, mut ci) = (0usize, 0usize);
+                        for i in 0..y.len() {
+                            let d = (y[i] - yc[i]).abs();
+                            if d > maxabs {
+                                maxabs = d;
+                            }
+                            if y[i] > y[gi] {
+                                gi = i;
+                            }
+                            if yc[i] > yc[ci] {
+                                ci = i;
+                            }
+                        }
+                        let xmax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+                        if maxabs > 1.0 || gi != ci {
+                            eprintln!(
+                                "[mm-verify] {name}: maxabsdiff={maxabs:.3} argmax g={gi} c={ci} xmax={xmax:.2}"
+                            );
+                        }
+                    }
+                }
                 return Ok(y);
             }
         }
