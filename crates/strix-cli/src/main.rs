@@ -40,7 +40,8 @@ fn main() -> Result<()> {
             port,
             gpu,
             ctx,
-        } => commands::serve::run(model, host, *port, *gpu, *ctx),
+            chat_template,
+        } => commands::serve::run(model, host, *port, *gpu, *ctx, chat_template.as_deref()),
 
         // Stubbed until later milestones.
         Command::Chat { model } => commands::stubs::chat(model),

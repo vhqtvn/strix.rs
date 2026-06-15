@@ -19,13 +19,10 @@ pub struct ChatTemplate {
 }
 
 impl ChatTemplate {
-    /// Pull the Jinja chat template (and bos/eos token strings) from GGUF metadata.
-    /// Returns `None` if the model has no embedded template (e.g. a base model).
-    pub fn from_gguf(g: &GgufFile) -> Option<ChatTemplate> {
+    /// Resolve bos/eos token *strings* from the GGUF id + token table (templates that
+    /// reference `bos_token`/`eos_token` want the literal text, e.g. "<|im_end|>").
+    fn bos_eos(g: &GgufFile) -> (String, String) {
         let md = g.metadata();
-        let src = md.get("tokenizer.chat_template")?.as_str()?.to_string();
-        // Resolve bos/eos token *strings* from the id + token table (templates that
-        // reference `bos_token`/`eos_token` want the literal text, e.g. "<|im_end|>").
         let tokens = md.get("tokenizer.ggml.tokens").and_then(|v| v.as_array());
         let tok_str = |key: &str| -> String {
             let id = md.get(key).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -35,13 +32,38 @@ impl ChatTemplate {
                 .unwrap_or("")
                 .to_string()
         };
-        let bos = tok_str("tokenizer.ggml.bos_token_id");
-        let eos = tok_str("tokenizer.ggml.eos_token_id");
+        (
+            tok_str("tokenizer.ggml.bos_token_id"),
+            tok_str("tokenizer.ggml.eos_token_id"),
+        )
+    }
+
+    /// Pull the Jinja chat template (and bos/eos token strings) from GGUF metadata.
+    /// Returns `None` if the model has no embedded template (e.g. a base model).
+    pub fn from_gguf(g: &GgufFile) -> Option<ChatTemplate> {
+        let src = g
+            .metadata()
+            .get("tokenizer.chat_template")?
+            .as_str()?
+            .to_string();
+        let (bos, eos) = Self::bos_eos(g);
         Some(ChatTemplate { src, bos, eos })
     }
 
+    /// Use a caller-supplied template source (e.g. a community override file) but
+    /// resolve bos/eos from the GGUF — for models whose embedded template handles
+    /// tools poorly.
+    pub fn from_gguf_src(g: &GgufFile, src: String) -> ChatTemplate {
+        let (bos, eos) = Self::bos_eos(g);
+        ChatTemplate { src, bos, eos }
+    }
+
     /// Build directly from a template string (e.g. tokenizer_config.json fallback).
-    pub fn from_str(src: impl Into<String>, bos: impl Into<String>, eos: impl Into<String>) -> Self {
+    pub fn from_str(
+        src: impl Into<String>,
+        bos: impl Into<String>,
+        eos: impl Into<String>,
+    ) -> Self {
         ChatTemplate {
             src: src.into(),
             bos: bos.into(),
@@ -67,9 +89,12 @@ impl ChatTemplate {
         // HF templates use Python string methods (.strip/.split/.startswith/...).
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         // `raise_exception(msg)` — templates call this to reject bad message orders.
-        env.add_function("raise_exception", |msg: String| -> std::result::Result<Value, JErr> {
-            Err(JErr::new(ErrorKind::InvalidOperation, msg))
-        });
+        env.add_function(
+            "raise_exception",
+            |msg: String| -> std::result::Result<Value, JErr> {
+                Err(JErr::new(ErrorKind::InvalidOperation, msg))
+            },
+        );
         // `strftime_now(fmt)` — Llama-3.x date stamping. We don't pull in a clock
         // dep; return a stable placeholder (the date rarely affects generation).
         env.add_function("strftime_now", |_fmt: String| -> String { String::new() });

@@ -6,14 +6,20 @@ use strix_models::ggml_quant::GgmlType;
 use strix_models::gguf::GgufFile;
 
 fn uploadable(t: GgmlType) -> bool {
-    matches!(t, GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q6K | GgmlType::Q8_0 | GgmlType::F32)
+    matches!(
+        t,
+        GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q6K | GgmlType::Q8_0 | GgmlType::F32
+    )
 }
 
 fn main() {
     for path in std::env::args().skip(1) {
         let g = match GgufFile::open(Path::new(&path)) {
             Ok(g) => g,
-            Err(e) => { eprintln!("{path}: {e}"); continue; }
+            Err(e) => {
+                eprintln!("{path}: {e}");
+                continue;
+            }
         };
         let mut hist: BTreeMap<String, usize> = BTreeMap::new();
         let mut fallbacks: Vec<(String, String, usize)> = vec![];
@@ -24,7 +30,11 @@ fn main() {
                 fallbacks.push((name.clone(), ty, t.numel()));
             }
         }
-        println!("\n=== {} (arch {}) ===", path, g.architecture().unwrap_or("?"));
+        println!(
+            "\n=== {} (arch {}) ===",
+            path,
+            g.architecture().unwrap_or("?")
+        );
         println!("  types: {hist:?}");
         if fallbacks.is_empty() {
             println!("  CPU-fallback tensors: NONE (all GPU-uploadable)");

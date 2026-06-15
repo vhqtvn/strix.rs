@@ -133,11 +133,25 @@ fn build_decoder(arch: &str, gguf: GgufFile, gpu: bool, ctx: usize) -> Result<Bo
     }
 }
 
-fn load_model(path: &Path, gpu: bool, ctx: usize) -> Result<Model> {
-    let gguf_path = find_gguf(path).ok_or_else(|| anyhow!("no .gguf found at {}", path.display()))?;
+fn load_model(
+    path: &Path,
+    gpu: bool,
+    ctx: usize,
+    template_override: Option<&Path>,
+) -> Result<Model> {
+    let gguf_path =
+        find_gguf(path).ok_or_else(|| anyhow!("no .gguf found at {}", path.display()))?;
     let gguf = GgufFile::open(&gguf_path).context("open gguf")?;
     let arch = gguf.architecture().unwrap_or("?").to_string();
-    let template = ChatTemplate::from_gguf(&gguf);
+    let template = match template_override {
+        Some(p) => {
+            let src = std::fs::read_to_string(p)
+                .with_context(|| format!("read chat template {}", p.display()))?;
+            eprintln!("[serve] using chat-template override {}", p.display());
+            Some(ChatTemplate::from_gguf_src(&gguf, src))
+        }
+        None => ChatTemplate::from_gguf(&gguf),
+    };
     // End-of-generation token ids from GGUF metadata.
     let mut eos = Vec::new();
     {
@@ -214,7 +228,10 @@ fn sample_token(logits: &[f32], p: &GenParams, rng: &mut Rng) -> u32 {
     idx.truncate(k);
     let max = logits[idx[0]];
     let inv_t = 1.0 / p.temperature;
-    let mut probs: Vec<f32> = idx.iter().map(|&i| ((logits[i] - max) * inv_t).exp()).collect();
+    let mut probs: Vec<f32> = idx
+        .iter()
+        .map(|&i| ((logits[i] - max) * inv_t).exp())
+        .collect();
     let sum: f32 = probs.iter().sum();
     for x in probs.iter_mut() {
         *x /= sum;
@@ -318,13 +335,24 @@ fn encode_chat(m: &Model, messages: &[Value], tools: Option<&Value>) -> Result<V
 
 // ============================== HTTP server ==============================
 
-pub fn run(path: &Path, host: &str, port: u16, gpu: bool, ctx: usize) -> Result<()> {
-    let model = load_model(path, gpu, ctx)?;
+pub fn run(
+    path: &Path,
+    host: &str,
+    port: u16,
+    gpu: bool,
+    ctx: usize,
+    chat_template: Option<&Path>,
+) -> Result<()> {
+    let model = load_model(path, gpu, ctx, chat_template)?;
     eprintln!(
         "[serve] loaded `{}` (arch {}), chat_template: {}, eos ids: {:?}",
         model.name,
         model.arch,
-        if model.template.is_some() { "yes" } else { "NONE" },
+        if model.template.is_some() {
+            "yes"
+        } else {
+            "NONE"
+        },
         model.eos,
     );
     let model_id = model.name.clone();
@@ -396,7 +424,10 @@ fn handle(mut req: tiny_http::Request, route: Route, shared: &Arc<Mutex<Model>>,
                 .map(|s| m.tok.encode(s, true).map_err(|e| anyhow!("{e}")))
                 .unwrap_or_else(|| Err(anyhow!("missing prompt"))),
             Route::OpenAiChat => match v.get("messages").and_then(|x| x.as_array()) {
-                Some(msgs) => encode_chat(&m, msgs, v.get("tools")),
+                Some(msgs) => {
+                    let msgs = apply_response_format(msgs, &v);
+                    encode_chat(&m, &msgs, v.get("tools"))
+                }
                 None => Err(anyhow!("missing messages")),
             },
             Route::Anthropic => encode_anthropic(&m, &v),
@@ -415,10 +446,28 @@ fn handle(mut req: tiny_http::Request, route: Route, shared: &Arc<Mutex<Model>>,
         }
     };
 
+    let want_tools = v
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .is_some_and(|a| !a.is_empty());
+    let want_json = v
+        .get("response_format")
+        .and_then(|r| r.get("type"))
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t == "json_object" || t == "json_schema");
     if stream {
-        stream_response(req, route, shared.clone(), prompt_ids, params, model_id.to_string());
+        stream_response(
+            req,
+            route,
+            shared.clone(),
+            prompt_ids,
+            params,
+            model_id.to_string(),
+        );
     } else {
-        blocking_response(req, route, shared, prompt_ids, params, model_id);
+        blocking_response(
+            req, route, shared, prompt_ids, params, model_id, want_tools, want_json,
+        );
     }
 }
 
@@ -429,17 +478,29 @@ fn blocking_response(
     prompt_ids: Vec<u32>,
     params: GenParams,
     model_id: &str,
+    want_tools: bool,
+    want_json: bool,
 ) {
     let mut m = shared.lock().unwrap();
     let n_prompt = prompt_ids.len();
     let res = generate(&mut m, &prompt_ids, &params, |_| {});
     drop(m);
     match res {
-        Ok((text, finish, n_gen)) => {
+        Ok((raw, finish, n_gen)) => {
+            // Pull any `<tool_call>{json}</tool_call>` blocks out of the output.
+            let (mut text, calls) = parse_tool_calls(&raw, want_tools);
+            // response_format json: return just the first balanced JSON object.
+            if want_json && calls.is_empty() {
+                if let Some((s, e)) = first_json_object(&text) {
+                    text = text[s..e].to_string();
+                }
+            }
             let body = match route {
-                Route::Anthropic => anthropic_message(&text, finish, model_id, n_prompt, n_gen),
-                Route::OpenAiText => openai_text(&text, finish, model_id, n_prompt, n_gen),
-                Route::OpenAiChat => openai_chat(&text, finish, model_id, n_prompt, n_gen),
+                Route::Anthropic => {
+                    anthropic_message(&text, finish, model_id, n_prompt, n_gen, &calls)
+                }
+                Route::OpenAiText => openai_text(&raw, finish, model_id, n_prompt, n_gen),
+                Route::OpenAiChat => openai_chat(&text, finish, model_id, n_prompt, n_gen, &calls),
             };
             respond_json(req, 200, &body);
         }
@@ -447,8 +508,113 @@ fn blocking_response(
     }
 }
 
+/// A tool call parsed from the model's text output (OpenAI-shaped: arguments are a
+/// JSON *string*).
+struct ToolCall {
+    name: String,
+    arguments: String,
+}
+
+/// Extract `<tool_call>…</tool_call>` blocks (the Qwen/Hermes/Nous de-facto
+/// standard) from the model output. Returns (text_without_calls, calls). Tolerates
+/// an unterminated final block (truncation) and ```json fences inside the block.
+fn parse_tool_calls(text: &str, want_tools: bool) -> (String, Vec<ToolCall>) {
+    let mut calls = Vec::new();
+    let mut clean = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<tool_call>") {
+        clean.push_str(&rest[..start]);
+        let after = &rest[start + "<tool_call>".len()..];
+        let (body, tail) = match after.find("</tool_call>") {
+            Some(end) => (&after[..end], &after[end + "</tool_call>".len()..]),
+            None => (after, ""),
+        };
+        if let Some(tc) = parse_one_call(body) {
+            calls.push(tc);
+        }
+        rest = tail;
+    }
+    clean.push_str(rest);
+    if !calls.is_empty() || !want_tools {
+        return (clean.trim().to_string(), calls);
+    }
+    // Fallback: some models emit the tool-call JSON *bare* (no <tool_call> wrapper).
+    // When tools were requested, scan for a top-level {"name":..,"arguments":..} object.
+    if let Some((s, e)) = first_json_object(text) {
+        if let Some(tc) = parse_strict_call(&text[s..e]) {
+            let around = format!("{}{}", text[..s].trim_end(), text[e..].trim_start());
+            return (around.trim().to_string(), vec![tc]);
+        }
+    }
+    (clean.trim().to_string(), calls)
+}
+
+/// Byte range of the first balanced `{...}` object (string-aware brace matching).
+fn first_json_object(s: &str) -> Option<(usize, usize)> {
+    let b = s.as_bytes();
+    let start = s.find('{')?;
+    let (mut depth, mut in_str, mut esc) = (0i32, false, false);
+    for i in start..b.len() {
+        let c = b[i];
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == b'\\' {
+                esc = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((start, i + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Like `parse_one_call` but requires both `name` and `arguments`/`parameters` —
+/// used for the bare-JSON fallback to avoid treating ordinary JSON as a tool call.
+fn parse_strict_call(body: &str) -> Option<ToolCall> {
+    let v: Value = serde_json::from_str(body.trim()).ok()?;
+    if v.get("name").is_none() || (v.get("arguments").is_none() && v.get("parameters").is_none()) {
+        return None;
+    }
+    parse_one_call(body)
+}
+
+fn parse_one_call(body: &str) -> Option<ToolCall> {
+    let b = body
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    let v: Value = serde_json::from_str(b).ok()?;
+    let name = v.get("name")?.as_str()?.to_string();
+    let arguments = match v.get("arguments").or_else(|| v.get("parameters")) {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => "{}".to_string(),
+    };
+    Some(ToolCall { name, arguments })
+}
+
 fn parse_params(v: &Value, route: Route) -> GenParams {
-    let f = |k: &str, d: f32| v.get(k).and_then(|x| x.as_f64()).map(|x| x as f32).unwrap_or(d);
+    let f = |k: &str, d: f32| {
+        v.get(k)
+            .and_then(|x| x.as_f64())
+            .map(|x| x as f32)
+            .unwrap_or(d)
+    };
     let max_key = match route {
         Route::Anthropic => "max_tokens",
         _ => "max_tokens",
@@ -474,27 +640,126 @@ fn parse_params(v: &Value, route: Route) -> GenParams {
     }
 }
 
-// ---- Anthropic request mapping (system + messages → chat messages) ----
+// ---- Anthropic request mapping (system + messages + tools → chat messages) ----
 fn encode_anthropic(m: &Model, v: &Value) -> Result<Vec<u32>> {
     let mut msgs: Vec<Value> = Vec::new();
     if let Some(sys) = v.get("system").and_then(|s| s.as_str()) {
         msgs.push(json!({"role": "system", "content": sys}));
     }
-    for msg in v.get("messages").and_then(|x| x.as_array()).into_iter().flatten() {
+    for msg in v
+        .get("messages")
+        .and_then(|x| x.as_array())
+        .into_iter()
+        .flatten()
+    {
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-        // Anthropic content is a string or an array of {type:text,text}.
-        let content = match msg.get("content") {
-            Some(Value::String(s)) => s.clone(),
-            Some(Value::Array(parts)) => parts
-                .iter()
-                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                .collect::<Vec<_>>()
-                .join(""),
-            _ => String::new(),
-        };
-        msgs.push(json!({"role": role, "content": content}));
+        match msg.get("content") {
+            Some(Value::String(s)) => msgs.push(json!({"role": role, "content": s})),
+            Some(Value::Array(parts)) => {
+                // Anthropic content blocks: text / tool_use (assistant) / tool_result (user).
+                let mut text = String::new();
+                let mut tool_calls: Vec<Value> = Vec::new();
+                for p in parts {
+                    match p.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => {
+                            if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
+                                text.push_str(t);
+                            }
+                        }
+                        Some("tool_use") => tool_calls.push(json!({
+                            "id": p.get("id").cloned().unwrap_or(Value::Null),
+                            "type": "function",
+                            "function": {
+                                "name": p.get("name").cloned().unwrap_or(Value::Null),
+                                "arguments": p.get("input").map(|i| i.to_string()).unwrap_or_else(|| "{}".into())
+                            }
+                        })),
+                        Some("tool_result") => {
+                            let c = match p.get("content") {
+                                Some(Value::String(s)) => s.clone(),
+                                Some(Value::Array(a)) => a
+                                    .iter()
+                                    .filter_map(|x| x.get("text").and_then(|t| t.as_str()))
+                                    .collect::<Vec<_>>()
+                                    .join(""),
+                                Some(o) => o.to_string(),
+                                None => String::new(),
+                            };
+                            msgs.push(json!({"role": "tool", "content": c}));
+                        }
+                        _ => {}
+                    }
+                }
+                if !tool_calls.is_empty() {
+                    msgs.push(json!({"role": role, "content": text, "tool_calls": tool_calls}));
+                } else if !text.is_empty() {
+                    msgs.push(json!({"role": role, "content": text}));
+                }
+            }
+            _ => {}
+        }
     }
-    encode_chat(m, &msgs, None)
+    let tools = v.get("tools").map(anthropic_tools_to_openai);
+    encode_chat(m, &msgs, tools.as_ref())
+}
+
+/// Anthropic tools `[{name,description,input_schema}]` → OpenAI
+/// `[{type:function,function:{name,description,parameters}}]` (the shape chat
+/// templates expect).
+fn anthropic_tools_to_openai(tools: &Value) -> Value {
+    let arr: Vec<Value> = tools
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|t| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.get("name").cloned().unwrap_or(Value::Null),
+                            "description": t.get("description").cloned().unwrap_or(Value::Null),
+                            "parameters": t.get("input_schema").cloned().unwrap_or_else(|| json!({"type":"object"}))
+                        }
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!(arr)
+}
+
+/// `response_format` (OpenAI structured output): append a JSON instruction to the
+/// last user message. MVP — prompt-guided, not grammar-constrained decoding.
+fn apply_response_format(messages: &[Value], v: &Value) -> Vec<Value> {
+    let rf = v.get("response_format");
+    let instr = match rf.and_then(|r| r.get("type")).and_then(|t| t.as_str()) {
+        Some("json_object") => Some(
+            "Respond ONLY with a single valid JSON object — no prose, no code fences.".to_string(),
+        ),
+        Some("json_schema") => {
+            let schema = rf
+                .and_then(|r| r.get("json_schema"))
+                .and_then(|j| j.get("schema"))
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            Some(format!(
+                "Respond ONLY with a single valid JSON object matching this JSON Schema — no prose, no code fences:\n{schema}"
+            ))
+        }
+        _ => None,
+    };
+    let mut msgs = messages.to_vec();
+    if let Some(instr) = instr {
+        if let Some(last) = msgs
+            .iter_mut()
+            .rev()
+            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        {
+            if let Some(c) = last.get("content").and_then(|c| c.as_str()) {
+                last["content"] = json!(format!("{c}\n\n{instr}"));
+            }
+        }
+    }
+    msgs
 }
 
 // ============================== response bodies ==============================
@@ -506,17 +771,42 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn openai_chat(text: &str, finish: &str, model: &str, n_prompt: usize, n_gen: usize) -> Value {
+fn openai_chat(
+    text: &str,
+    finish: &str,
+    model: &str,
+    n_prompt: usize,
+    n_gen: usize,
+    calls: &[ToolCall],
+) -> Value {
+    let mut message = json!({"role": "assistant", "content": text});
+    let mut finish_reason = finish;
+    if !calls.is_empty() {
+        let arr: Vec<Value> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                json!({
+                    "id": format!("call_{}_{i}", now_secs()),
+                    "type": "function",
+                    "function": {"name": c.name, "arguments": c.arguments}
+                })
+            })
+            .collect();
+        message["content"] = if text.is_empty() {
+            Value::Null
+        } else {
+            json!(text)
+        };
+        message["tool_calls"] = json!(arr);
+        finish_reason = "tool_calls";
+    }
     json!({
         "id": format!("chatcmpl-{}", now_secs()),
         "object": "chat.completion",
         "created": now_secs(),
         "model": model,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": text},
-            "finish_reason": finish
-        }],
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
         "usage": {"prompt_tokens": n_prompt, "completion_tokens": n_gen, "total_tokens": n_prompt + n_gen}
     })
 }
@@ -532,14 +822,43 @@ fn openai_text(text: &str, finish: &str, model: &str, n_prompt: usize, n_gen: us
     })
 }
 
-fn anthropic_message(text: &str, finish: &str, model: &str, n_prompt: usize, n_gen: usize) -> Value {
-    let reason = if finish == "stop" { "end_turn" } else { "max_tokens" };
+fn anthropic_message(
+    text: &str,
+    finish: &str,
+    model: &str,
+    n_prompt: usize,
+    n_gen: usize,
+    calls: &[ToolCall],
+) -> Value {
+    let mut content: Vec<Value> = Vec::new();
+    if !text.is_empty() {
+        content.push(json!({"type": "text", "text": text}));
+    }
+    for (i, c) in calls.iter().enumerate() {
+        let input: Value = serde_json::from_str(&c.arguments).unwrap_or_else(|_| json!({}));
+        content.push(json!({
+            "type": "tool_use",
+            "id": format!("toolu_{}_{i}", now_secs()),
+            "name": c.name,
+            "input": input
+        }));
+    }
+    if content.is_empty() {
+        content.push(json!({"type": "text", "text": ""}));
+    }
+    let reason = if !calls.is_empty() {
+        "tool_use"
+    } else if finish == "stop" {
+        "end_turn"
+    } else {
+        "max_tokens"
+    };
     json!({
         "id": format!("msg_{}", now_secs()),
         "type": "message",
         "role": "assistant",
         "model": model,
-        "content": [{"type": "text", "text": text}],
+        "content": content,
         "stop_reason": reason,
         "stop_sequence": null,
         "usage": {"input_tokens": n_prompt, "output_tokens": n_gen}
@@ -552,7 +871,9 @@ fn json_header() -> Header {
 
 fn respond_json(req: tiny_http::Request, status: u16, body: &Value) {
     let data = serde_json::to_vec(body).unwrap_or_default();
-    let resp = Response::from_data(data).with_status_code(status).with_header(json_header());
+    let resp = Response::from_data(data)
+        .with_status_code(status)
+        .with_header(json_header());
     let _ = req.respond(resp);
 }
 
@@ -605,7 +926,9 @@ fn stream_response(
         let mut m = shared.lock().unwrap();
         let n_prompt = prompt_ids.len();
         match route {
-            Route::Anthropic => stream_anthropic(&mut m, &prompt_ids, &params, &tx, &model_id, n_prompt),
+            Route::Anthropic => {
+                stream_anthropic(&mut m, &prompt_ids, &params, &tx, &model_id, n_prompt)
+            }
             _ => stream_openai(&mut m, &prompt_ids, &params, &tx, &model_id, route),
         }
     });
@@ -704,8 +1027,16 @@ fn stream_anthropic(
         );
     });
     let (finish, n_gen) = res.map(|(_, f, n)| (f, n)).unwrap_or(("stop", 0));
-    let reason = if finish == "stop" { "end_turn" } else { "max_tokens" };
-    let _ = sse_event(tx, "content_block_stop", &json!({"type":"content_block_stop","index":0}));
+    let reason = if finish == "stop" {
+        "end_turn"
+    } else {
+        "max_tokens"
+    };
+    let _ = sse_event(
+        tx,
+        "content_block_stop",
+        &json!({"type":"content_block_stop","index":0}),
+    );
     let _ = sse_event(
         tx,
         "message_delta",

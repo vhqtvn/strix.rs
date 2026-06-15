@@ -74,6 +74,10 @@ pub enum Command {
         /// Max sequence length (KV cache / context budget).
         #[arg(long, default_value_t = 4096)]
         ctx: usize,
+        /// Override the model's embedded chat template with a Jinja file (e.g. a
+        /// community template with better tool/function-call formatting).
+        #[arg(long)]
+        chat_template: Option<PathBuf>,
     },
 
     /// Benchmark real inference (not implemented yet — Milestone 2+).
