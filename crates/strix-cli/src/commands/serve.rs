@@ -984,11 +984,34 @@ fn top_k_desc(logits: &[f32], k: usize) -> Vec<u32> {
 }
 
 /// Pick the highest-logit token that keeps the decoded output a valid (JSON / schema)
-/// prefix per `con`.
-fn pick_constrained(tok: &StrixTokenizer, logits: &[f32], out_ids: &[u32], con: &Constrain) -> u32 {
+/// prefix per `con`. Scans logits in descending order: the first valid token wins.
+///
+/// The pool is widened in stages (48 → 1024 → full vocab) rather than fixed at a small
+/// top-K. This matters when the model *fights* the constraint — e.g. under an integer
+/// range 50..99 it emits "7" (a legal prefix of 70-79) then wants to close with "}",
+/// putting no digit token in the top-48. A fixed-K loop would find nothing valid and
+/// fall back to an INVALID token; widening finds the (lower-logit but valid) digit so
+/// the constraint is actually honored.
+fn pick_constrained(
+    tok: &StrixTokenizer,
+    logits: &[f32],
+    out_ids: &[u32],
+    con: &Constrain,
+    eos: &[u32],
+) -> u32 {
     let committed = tok.decode(out_ids, true).unwrap_or_default();
-    let cands = top_k_desc(logits, 48);
-    for &c in &cands {
+    // eos is only acceptable once the document already satisfies the constraint —
+    // otherwise its empty decode trivially "keeps the prefix valid" and the model
+    // would end mid-value (e.g. `{"score": 7` under a 50..99 range).
+    let allow_eos = con.state(&committed) == JsonState::Complete;
+    let order = top_k_desc(logits, logits.len());
+    for &c in &order {
+        if eos.contains(&c) {
+            if allow_eos {
+                return c;
+            }
+            continue;
+        }
         let mut ids = out_ids.to_vec();
         ids.push(c);
         let full = match tok.decode(&ids, true) {
@@ -1002,7 +1025,7 @@ fn pick_constrained(tok: &StrixTokenizer, logits: &[f32], out_ids: &[u32], con: 
             return c;
         }
     }
-    cands.first().copied().unwrap_or(0)
+    order.first().copied().unwrap_or(0)
 }
 
 /// Drive prefill + decode. Calls `on_token(piece)` for each new decoded text piece
@@ -1025,7 +1048,7 @@ fn generate(
     let mut finish = "length";
     for step in 0..p.max_tokens {
         let next = if constrained {
-            pick_constrained(&m.tok, &logits.0, &out_ids, con)
+            pick_constrained(&m.tok, &logits.0, &out_ids, con, &m.eos)
         } else {
             sample_token(&logits.0, p, &mut rng)
         };
